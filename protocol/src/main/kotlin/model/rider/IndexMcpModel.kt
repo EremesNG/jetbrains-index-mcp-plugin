@@ -110,6 +110,17 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
         field("symbol", string)
     }
 
+    private val RdResolveSymbolIndexedRequest = structdef {
+        field("language", string)
+        field("symbol", string)
+    }
+
+    private val RdResolveSymbolIndexedResult = structdef {
+        field("status", string)
+        field("message", string.nullable)
+        field("symbolInfo", RdSymbolInfo.nullable)
+    }
+
     // ── Type Hierarchy ──────────────────────────────────────────────────────
 
     private val RdTypeHierarchyRequest = structdef {
@@ -128,6 +139,7 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
     private val RdImplementationsRequest = structdef {
         field("position", RdSourcePosition)
         field("scope", string)
+        field("limit", int)
     }
 
     private val RdImplementationsResult = structdef {
@@ -141,6 +153,7 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
         field("direction", string)
         field("depth", int)
         field("scope", string)
+        field("limit", int)
     }
 
     private val RdCallHierarchyResult = structdef {
@@ -212,6 +225,7 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
         call("findDefinition", RdFindDefinitionRequest, RdDefinitionResult.nullable)
         call("findReferences", RdFindReferencesRequest, RdFindReferencesResult)
         call("resolveSymbol", RdResolveSymbolRequest, RdSymbolInfo.nullable)
+        call("resolveSymbolIndexed", RdResolveSymbolIndexedRequest, RdResolveSymbolIndexedResult)
         call("getTypeHierarchy", RdTypeHierarchyRequest, RdTypeHierarchyResult.nullable)
         call("findImplementations", RdImplementationsRequest, RdImplementationsResult.nullable)
         call("getCallHierarchy", RdCallHierarchyRequest, RdCallHierarchyResult.nullable)

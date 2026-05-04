@@ -71,6 +71,7 @@ public class IndexMcpBackendHost
         model.FindDefinition.SetAsync(HandleFindDefinition);
         model.FindReferences.SetAsync(HandleFindReferences);
         model.ResolveSymbol.SetAsync(HandleResolveSymbol);
+        model.ResolveSymbolIndexed.SetAsync(HandleResolveSymbolIndexed);
         model.GetTypeHierarchy.SetAsync(HandleGetTypeHierarchy);
         model.FindImplementations.SetAsync(HandleFindImplementations);
         model.GetCallHierarchy.SetAsync(HandleGetCallHierarchy);
@@ -290,6 +291,11 @@ public class IndexMcpBackendHost
             var element = ResolveSymbol(request.Language, request.Symbol);
             return element == null ? null : ToSymbolInfo(element);
         });
+    }
+
+    private Task<RdResolveSymbolIndexedResult> HandleResolveSymbolIndexed(Lifetime lt, RdResolveSymbolIndexedRequest request)
+    {
+        return Task.Run(() => ResolveSymbolIndexed(request.Language, request.Symbol).ToRdResult());
     }
 
     // ── Rename Symbol ───────────────────────────────────────────────────────
@@ -661,6 +667,7 @@ public class IndexMcpBackendHost
     {
         return Task.Run(() =>
         {
+            var effectiveLimit = GetEffectiveResultLimit(request.Limit);
             var element = ResolveDeclaredElementAt(request.Position);
             if (element == null) return null;
 
@@ -682,14 +689,23 @@ public class IndexMcpBackendHost
                         implementations.Add(ToSymbolInfo(implType));
                     else if (implType is IStruct)
                         implementations.Add(ToSymbolInfo(implType));
-                    return implementations.Count < MaxResults
-                        ? FindExecution.Continue
-                        : FindExecution.Stop;
+                    return FindExecution.Continue;
                 },
                 searchDomain,
                 NoOpProgressIndicator.Instance);
 
-            return (RdImplementationsResult?)new RdImplementationsResult(implementations);
+            var orderedImplementations = implementations
+                .GroupBy(symbol => $"{symbol.QualifiedName}:{symbol.FilePath}:{symbol.Line}:{symbol.Column}")
+                .Select(group => group.First())
+                .OrderBy(symbol => symbol.QualifiedName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(symbol => symbol.Signature ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(symbol => symbol.FilePath ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(symbol => symbol.Line ?? int.MaxValue)
+                .ThenBy(symbol => symbol.Column ?? int.MaxValue)
+                .Take(effectiveLimit)
+                .ToList();
+
+            return (RdImplementationsResult?)new RdImplementationsResult(orderedImplementations);
         });
     }
 
@@ -701,10 +717,13 @@ public class IndexMcpBackendHost
         return Task.Run(() =>
         {
             var element = ResolveTarget(request.Target);
-            if (element is not IMethod method) return null;
+            var callableTarget = ResolveCallableTarget(element);
+            if (callableTarget == null) return null;
 
-            var root = ToSymbolInfo(method);
-            var calls = new List<RdSymbolInfo>();
+            var effectiveLimit = GetEffectiveResultLimit(request.Limit);
+
+            var root = ToSymbolInfo(callableTarget.Element);
+            var callElements = new List<IDeclaredElement>();
 
             if (request.Direction == "callers")
             {
@@ -716,52 +735,43 @@ public class IndexMcpBackendHost
                     results =>
                     {
                         foreach (var result in results)
-                        {
                             referenceResults.Add(result);
-                            if (referenceResults.Count >= MaxResults)
-                                return FindExecution.Stop;
-                        }
                         return FindExecution.Continue;
                     });
                 _solution.GetPsiServices().Finder.FindReferences(
-                    method,
+                    callableTarget.Element,
                     searchDomain,
                     consumer,
                     NoOpProgressIndicator.Instance,
                     false);
 
-                var seen = new HashSet<string>();
                 foreach (var result in referenceResults)
                 {
                     if (result is not FindResultReference referenceResult) continue;
-                    var containingMethod = referenceResult.Reference.GetTreeNode()
-                        .GetContainingNode<IMethodDeclaration>()?.DeclaredElement;
-                    if (containingMethod == null) continue;
-                    var key = GetQualifiedName(containingMethod);
-                    if (seen.Add(key))
-                        calls.Add(ToSymbolInfo(containingMethod));
+                    var containingCallable = ResolveContainingCallableElement(referenceResult.Reference.GetTreeNode());
+                    if (containingCallable != null)
+                        callElements.Add(containingCallable);
                 }
             }
             else if (request.Direction == "callees")
             {
-                var methodDecl = method.GetDeclarations().FirstOrDefault() as IMethodDeclaration;
-                if (methodDecl?.Body != null)
+                foreach (var node in EnumerateTreeNodes(callableTarget.TraversalRoot))
                 {
-                    var seen = new HashSet<string>();
-                    foreach (var invocation in methodDecl.Body.Descendants<IInvocationExpression>())
+                    foreach (var reference in node.GetReferences())
                     {
-                        var invokedMethod = invocation.Reference?.Resolve().DeclaredElement as IMethod;
-                        if (invokedMethod != null)
-                        {
-                            var key = GetQualifiedName(invokedMethod);
-                            if (seen.Add(key) && calls.Count < MaxResults)
-                                calls.Add(ToSymbolInfo(invokedMethod));
-                        }
+                        var invokedCallable = ResolveCallableTarget(reference.Resolve().DeclaredElement)?.Element;
+                        if (invokedCallable != null && !Equals(invokedCallable, callableTarget.Element))
+                            callElements.Add(invokedCallable);
                     }
                 }
             }
 
-            return (RdCallHierarchyResult?)new RdCallHierarchyResult(root, calls);
+            var orderedCalls = OrderDeclaredElementsDeterministically(callElements)
+                .Take(effectiveLimit)
+                .Select(ToSymbolInfo)
+                .ToList();
+
+            return (RdCallHierarchyResult?)new RdCallHierarchyResult(root, orderedCalls);
         });
     }
 
@@ -837,22 +847,577 @@ public class IndexMcpBackendHost
         return null;
     }
 
+    private static int GetEffectiveResultLimit(int requestedLimit)
+    {
+        if (requestedLimit <= 0)
+            return MaxResults;
+
+        return Math.Min(requestedLimit, MaxResults);
+    }
+
+    private static IEnumerable<IDeclaredElement> OrderDeclaredElementsDeterministically(
+        IEnumerable<IDeclaredElement> elements)
+    {
+        return elements
+            .GroupBy(element => $"{GetQualifiedName(element)}:{GetMemberSignatureSortKey(element)}:{GetDeclarationPath(element)}")
+            .Select(group => group.First())
+            .OrderBy(BestDeclarationRank)
+            .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetMemberSignatureSortKey, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static CallableTarget? ResolveCallableTarget(IDeclaredElement? element)
+    {
+        if (element == null || !IsSupportedCallableElement(element))
+            return null;
+
+        if (element is IMethod method)
+        {
+            var methodDeclaration = method.GetDeclarations().OfType<IMethodDeclaration>().FirstOrDefault();
+            if (methodDeclaration != null)
+                return new CallableTarget(method, methodDeclaration.Body as ITreeNode ?? methodDeclaration);
+        }
+
+        var declaration = element.GetDeclarations().FirstOrDefault();
+        if (declaration == null || !IsSupportedCallableDeclaration(declaration, element))
+            return null;
+
+        return new CallableTarget(element, declaration);
+    }
+
+    private static bool IsSupportedCallableElement(IDeclaredElement element)
+    {
+        if (element is IMethod || element is IFunction)
+            return true;
+
+        return element is IParametersOwner &&
+               element is not IProperty &&
+               element is not IField &&
+               element is not IEvent;
+    }
+
+    private static bool IsSupportedCallableDeclaration(IDeclaration declaration, IDeclaredElement element)
+    {
+        return declaration is IMethodDeclaration ||
+               declaration is IFunctionDeclaration ||
+               IsSupportedCallableElement(element);
+    }
+
+    private static IDeclaredElement? ResolveContainingCallableElement(ITreeNode node)
+    {
+        for (var current = node; current != null; current = current.Parent)
+        {
+            if (current is IMethodDeclaration methodDeclaration && methodDeclaration.DeclaredElement != null)
+                return methodDeclaration.DeclaredElement;
+
+            if (current is IFunctionDeclaration functionDeclaration)
+            {
+                var declaredElement = ((IDeclaration)functionDeclaration).DeclaredElement;
+                if (declaredElement != null && IsSupportedCallableElement(declaredElement))
+                    return declaredElement;
+            }
+
+            if (current is IDeclaration declaration && declaration.DeclaredElement != null &&
+                IsSupportedCallableElement(declaration.DeclaredElement))
+            {
+                return declaration.DeclaredElement;
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<ITreeNode> EnumerateTreeNodes(ITreeNode root)
+    {
+        yield return root;
+
+        foreach (var child in root.Children())
+        {
+            foreach (var descendant in EnumerateTreeNodes(child))
+                yield return descendant;
+        }
+    }
+
     private IDeclaredElement? ResolveSymbol(string? language, string symbol)
     {
-        var normalized = NormalizeSymbolName(symbol);
-        return EnumerateDeclaredElements()
-            .Where(element => MatchesLanguage(element, language))
-            .Where(element =>
-                NormalizeSymbolName(GetQualifiedName(element)).Equals(normalized, StringComparison.OrdinalIgnoreCase) ||
-                NormalizeSymbolName(element.ShortName).Equals(normalized, StringComparison.OrdinalIgnoreCase))
-            // Prefer partials whose primary declaration lives in a real hand-written
-            // .cs/.fs file over source-generator output (obj/, *.g.cs) and over
-            // synthetic XAML/AXAML partials whose source file may have an empty
-            // location. Without this, AXAML-paired classes resolve to the
-            // generator partial and HandleFindDefinition returns file:"".
-            .OrderBy(BestDeclarationRank)
-            .FirstOrDefault();
+        return ResolveSymbolIndexed(language, symbol).TryGetElement();
     }
+
+    private IndexedSymbolResolution ResolveSymbolIndexed(string? language, string symbol)
+    {
+        var parseResult = ParseIndexedSymbol(language, symbol);
+        if (!parseResult.IsSuccess)
+            return parseResult.ToResolution();
+
+        var parsed = parseResult.Symbol!;
+        var containers = ResolveContainerCandidates(parsed.Language, parsed.ContainerQualifiedName);
+        if (containers.Count == 0)
+        {
+            return IndexedSymbolResolution.Unresolved(
+                $"No Rider declaration matches container '{parsed.ContainerQualifiedName}'.");
+        }
+
+        if (parsed.MemberName == null)
+        {
+            return ResolveSingleMatch(
+                containers,
+                $"Multiple Rider declarations match container '{parsed.ContainerQualifiedName}'.",
+                $"No Rider declaration matches container '{parsed.ContainerQualifiedName}'.");
+        }
+
+        var supportedContainers = containers
+            .OfType<ITypeElement>()
+            .ToList();
+
+        if (supportedContainers.Count == 0)
+        {
+            return IndexedSymbolResolution.Unsupported(
+                $"Container '{parsed.ContainerQualifiedName}' does not support member lookup.");
+        }
+
+        var members = supportedContainers
+            .SelectMany(container => ResolveMemberCandidates(container, parsed))
+            .Distinct()
+            .OrderBy(BestDeclarationRank)
+            .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetMemberSignatureSortKey, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return ResolveSingleMatch(
+            members,
+            $"Multiple Rider declarations match symbol '{symbol}'.",
+            $"No Rider declaration matches symbol '{symbol}'.");
+    }
+
+    private List<IDeclaredElement> ResolveContainerCandidates(string language, string containerQualifiedName)
+    {
+        var normalizedContainer = NormalizeQualifiedName(containerQualifiedName);
+        var projectMatches = EnumerateProjectPsiModules()
+            .Distinct()
+            .SelectMany(module => ResolveContainerCandidatesFromScope(
+                _solution.GetPsiServices().Symbols.GetSymbolScope(module, true, false),
+                normalizedContainer,
+                language))
+            .Distinct()
+            .OrderBy(BestDeclarationRank)
+            .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (projectMatches.Count > 0)
+            return projectMatches;
+
+        return new[] { LibrarySymbolScope.REFERENCED, LibrarySymbolScope.TRANSITIVE, LibrarySymbolScope.FULL }
+            .SelectMany(scopeKind => ResolveContainerCandidatesFromScope(
+                _solution.GetPsiServices().Symbols.GetSymbolScope(scopeKind, false),
+                normalizedContainer,
+                language))
+            .Distinct()
+            .OrderBy(BestDeclarationRank)
+            .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private IEnumerable<IDeclaredElement> ResolveContainerCandidatesFromScope(
+        ISymbolScope symbolScope,
+        string normalizedContainer,
+        string language)
+    {
+        foreach (var candidate in EnumerateQualifiedNameCandidates(normalizedContainer)
+                     .SelectMany(symbolScope.GetElementsByQualifiedName)
+                     .Where(element => MatchesLanguage(element, language))
+                     .Where(element => NormalizeQualifiedName(GetQualifiedName(element))
+                         .Equals(normalizedContainer, StringComparison.OrdinalIgnoreCase)))
+        {
+            yield return candidate;
+        }
+    }
+
+    private static IEnumerable<string> EnumerateQualifiedNameCandidates(string normalizedQualifiedName)
+    {
+        yield return normalizedQualifiedName;
+
+        var lastDot = normalizedQualifiedName.LastIndexOf('.');
+        if (lastDot > 0)
+        {
+            yield return normalizedQualifiedName.Substring(0, lastDot) + "+" + normalizedQualifiedName[(lastDot + 1)..];
+        }
+    }
+
+    private static IndexedSymbolResolution ResolveSingleMatch(
+        IReadOnlyList<IDeclaredElement> candidates,
+        string ambiguousMessage,
+        string unresolvedMessage)
+    {
+        if (candidates.Count == 0)
+            return IndexedSymbolResolution.Unresolved(unresolvedMessage);
+
+        var preferredTypeCandidates = candidates
+            .OfType<ITypeElement>()
+            .Cast<IDeclaredElement>()
+            .ToList();
+
+        if (preferredTypeCandidates.Count > 0)
+        {
+            if (preferredTypeCandidates.Count == 1)
+                return IndexedSymbolResolution.Success(preferredTypeCandidates[0]);
+
+            return IndexedSymbolResolution.Ambiguous(ambiguousMessage);
+        }
+
+        if (candidates.All(candidate => candidate is INamespace))
+            return IndexedSymbolResolution.Unresolved(unresolvedMessage);
+
+        if (candidates.Count == 1)
+            return IndexedSymbolResolution.Success(candidates[0]);
+
+        return IndexedSymbolResolution.Ambiguous(ambiguousMessage);
+    }
+
+    private static IEnumerable<IDeclaredElement> ResolveMemberCandidates(ITypeElement container, ParsedRiderSymbol parsed)
+    {
+        foreach (var member in container.GetMembers())
+        {
+            if (!MatchesMemberName(member, parsed))
+                continue;
+
+            if (!MatchesParameterContract(member, parsed.ParameterTypes))
+                continue;
+
+            yield return member;
+        }
+    }
+
+    private static bool MatchesMemberName(ITypeMember member, ParsedRiderSymbol parsed)
+    {
+        if (parsed.IsConstructor)
+            return member is IConstructor;
+
+        return NormalizeSimpleName(member.ShortName)
+            .Equals(NormalizeSimpleName(parsed.MemberName!), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool MatchesParameterContract(IDeclaredElement element, IReadOnlyList<string>? parameterTypes)
+    {
+        if (parameterTypes == null)
+            return true;
+
+        if (element is not IParametersOwner parametersOwner)
+            return false;
+
+        var parameters = parametersOwner.Parameters;
+        if (parameters.Count != parameterTypes.Count)
+            return false;
+
+        for (var i = 0; i < parameters.Count; i++)
+        {
+            var parameter = parameters[i];
+            if (!ParameterTypeMatches(parameter.Type, parameterTypes[i], element.PresentationLanguage?.Name))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool ParameterTypeMatches(IType declaredType, string requestedType, string? languageName)
+    {
+        var normalizedRequested = CanonicalizeTypeName(requestedType);
+        if (string.IsNullOrEmpty(normalizedRequested))
+            return false;
+
+        foreach (var candidate in GetParameterComparisonNames(declaredType, languageName))
+        {
+            if (CanonicalizeTypeName(candidate).Equals(normalizedRequested, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<string> GetParameterComparisonNames(IType declaredType, string? languageName)
+    {
+        yield return declaredType.GetPresentableName(CSharpLanguage.Instance!);
+
+        if (declaredType is IDeclaredType namedType && namedType.GetTypeElement() is { } typeElement)
+        {
+            yield return typeElement.ShortName;
+            yield return typeElement.GetClrName().FullName;
+        }
+    }
+
+    private static IndexedSymbolParseResult ParseIndexedSymbol(string? language, string symbol)
+    {
+        if (!IsSupportedRiderLanguage(language))
+        {
+            return IndexedSymbolParseResult.Unsupported(
+                $"Rider indexed symbol resolution supports only C# and F#, got '{language ?? "<null>"}'.");
+        }
+
+        if (string.IsNullOrWhiteSpace(symbol))
+            return IndexedSymbolParseResult.Invalid("Rider symbol cannot be empty.");
+
+        var trimmed = symbol.Trim();
+        if (!TrySplitMemberPart(trimmed, out var containerPart, out var memberPart, out var splitError))
+            return IndexedSymbolParseResult.Invalid(splitError!);
+
+        containerPart = NormalizeQualifiedName(containerPart);
+        if (string.IsNullOrWhiteSpace(containerPart))
+            return IndexedSymbolParseResult.Invalid("Rider symbol must include a container name.");
+
+        if (memberPart == null)
+            return IndexedSymbolParseResult.Success(new ParsedRiderSymbol(language!, containerPart, null, null, false));
+
+        if (!TryParseMemberPart(containerPart, memberPart, out var parsedMemberName, out var parameterTypes, out var isConstructor, out var memberError))
+            return IndexedSymbolParseResult.Invalid(memberError!);
+
+        return IndexedSymbolParseResult.Success(new ParsedRiderSymbol(language!, containerPart, parsedMemberName, parameterTypes, isConstructor));
+    }
+
+    private static bool TrySplitMemberPart(string symbol, out string containerPart, out string? memberPart, out string? error)
+    {
+        containerPart = string.Empty;
+        memberPart = null;
+        error = null;
+
+        var separatorIndex = symbol.IndexOf('#');
+        if (separatorIndex < 0)
+        {
+            if (symbol.Contains('(') || symbol.Contains(')'))
+            {
+                error = "Type-only Rider symbols cannot contain a parameter list.";
+                return false;
+            }
+
+            containerPart = symbol;
+            return true;
+        }
+
+        if (symbol.IndexOf('#', separatorIndex + 1) >= 0)
+        {
+            error = "Rider symbols may contain at most one '#' separator.";
+            return false;
+        }
+
+        containerPart = symbol[..separatorIndex];
+        memberPart = symbol[(separatorIndex + 1)..];
+        if (string.IsNullOrWhiteSpace(containerPart) || string.IsNullOrWhiteSpace(memberPart))
+        {
+            error = "Rider member symbols must include both container and member names.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryParseMemberPart(
+        string containerPart,
+        string memberPart,
+        out string memberName,
+        out IReadOnlyList<string>? parameterTypes,
+        out bool isConstructor,
+        out string? error)
+    {
+        memberName = string.Empty;
+        parameterTypes = null;
+        isConstructor = false;
+        error = null;
+
+        var openParenIndex = memberPart.IndexOf('(');
+        if (openParenIndex < 0)
+        {
+            memberName = memberPart.Trim();
+        }
+        else
+        {
+            var closeParenIndex = memberPart.LastIndexOf(')');
+            if (closeParenIndex != memberPart.Length - 1 || closeParenIndex < openParenIndex)
+            {
+                error = "Rider symbol parameter list must end at the final ')'.";
+                return false;
+            }
+
+            memberName = memberPart[..openParenIndex].Trim();
+            var rawParameters = memberPart.Substring(openParenIndex + 1, closeParenIndex - openParenIndex - 1);
+            if (!TryParseParameterList(rawParameters, out var parsedParameters, out error))
+                return false;
+            parameterTypes = parsedParameters;
+        }
+
+        if (string.IsNullOrWhiteSpace(memberName))
+        {
+            error = "Rider member symbol is missing the member name.";
+            return false;
+        }
+
+        var normalizedMemberName = NormalizeSimpleName(memberName);
+        var normalizedContainerLeaf = NormalizeSimpleName(GetContainerLeafName(containerPart));
+        isConstructor = normalizedMemberName.Equals(".ctor", StringComparison.OrdinalIgnoreCase) ||
+                        normalizedMemberName.Equals(normalizedContainerLeaf, StringComparison.OrdinalIgnoreCase);
+        memberName = isConstructor ? ".ctor" : memberName;
+        return true;
+    }
+
+    private static bool TryParseParameterList(string rawParameters, out IReadOnlyList<string> parameterTypes, out string? error)
+    {
+        parameterTypes = Array.Empty<string>();
+        error = null;
+
+        if (string.IsNullOrWhiteSpace(rawParameters))
+            return true;
+
+        var parts = new List<string>();
+        var start = 0;
+        var angleDepth = 0;
+        var bracketDepth = 0;
+
+        for (var i = 0; i < rawParameters.Length; i++)
+        {
+            switch (rawParameters[i])
+            {
+                case '<': angleDepth++; break;
+                case '>': angleDepth--; break;
+                case '[': bracketDepth++; break;
+                case ']': bracketDepth--; break;
+                case ',' when angleDepth == 0 && bracketDepth == 0:
+                    var segment = rawParameters.Substring(start, i - start).Trim();
+                    if (string.IsNullOrWhiteSpace(segment))
+                    {
+                        error = "Rider symbol parameter list contains an empty parameter type.";
+                        return false;
+                    }
+                    parts.Add(segment);
+                    start = i + 1;
+                    break;
+            }
+
+            if (angleDepth < 0 || bracketDepth < 0)
+            {
+                error = "Rider symbol parameter list is malformed.";
+                return false;
+            }
+        }
+
+        if (angleDepth != 0 || bracketDepth != 0)
+        {
+            error = "Rider symbol parameter list is malformed.";
+            return false;
+        }
+
+        var lastSegment = rawParameters[start..].Trim();
+        if (string.IsNullOrWhiteSpace(lastSegment))
+        {
+            error = "Rider symbol parameter list contains an empty parameter type.";
+            return false;
+        }
+
+        parts.Add(lastSegment);
+        parameterTypes = parts;
+        return true;
+    }
+
+    private static bool IsSupportedRiderLanguage(string? language)
+    {
+        return language != null &&
+               (language.Equals("C#", StringComparison.OrdinalIgnoreCase) ||
+                language.Equals("F#", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string GetContainerLeafName(string containerQualifiedName)
+    {
+        var normalized = NormalizeQualifiedName(containerQualifiedName);
+        var separatorIndex = Math.Max(normalized.LastIndexOf('.'), normalized.LastIndexOf('+'));
+        return separatorIndex >= 0 ? normalized[(separatorIndex + 1)..] : normalized;
+    }
+
+    private static string NormalizeQualifiedName(string value)
+    {
+        var withoutGlobalPrefix = value.Trim()
+            .Replace("global::", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Replace("global.", string.Empty, StringComparison.OrdinalIgnoreCase);
+        return CanonicalizeTypeName(withoutGlobalPrefix);
+    }
+
+    private static string NormalizeSimpleName(string value)
+    {
+        var normalized = RemoveGenericPayload(value)
+            .Replace("::", ".", StringComparison.Ordinal)
+            .Replace(" ", string.Empty, StringComparison.Ordinal)
+            .Trim();
+        return Regex.Replace(normalized, @"`\d+", string.Empty);
+    }
+
+    private static string CanonicalizeTypeName(string value)
+    {
+        var normalized = NormalizeSimpleName(value)
+            .Replace("+", ".", StringComparison.Ordinal);
+
+        return BuiltInTypeAliases.TryGetValue(normalized, out var canonical)
+            ? canonical
+            : normalized;
+    }
+
+    private static string RemoveGenericPayload(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return string.Empty;
+
+        var result = new System.Text.StringBuilder(value.Length);
+        var depth = 0;
+        foreach (var ch in value)
+        {
+            switch (ch)
+            {
+                case '<':
+                    depth++;
+                    break;
+                case '>':
+                    if (depth > 0) depth--;
+                    break;
+                default:
+                    if (depth == 0)
+                        result.Append(ch);
+                    break;
+            }
+        }
+
+        return result.ToString();
+    }
+
+    private static string GetMemberSignatureSortKey(IDeclaredElement element)
+    {
+        if (element is not IParametersOwner parametersOwner)
+            return element.ShortName;
+
+        var parameterNames = parametersOwner.Parameters
+            .Select(parameter => CanonicalizeTypeName(parameter.Type.GetPresentableName(CSharpLanguage.Instance!)));
+        return $"{element.ShortName}({string.Join(",", parameterNames)})";
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> BuiltInTypeAliases =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["bool"] = "System.Boolean",
+            ["byte"] = "System.Byte",
+            ["sbyte"] = "System.SByte",
+            ["short"] = "System.Int16",
+            ["ushort"] = "System.UInt16",
+            ["int"] = "System.Int32",
+            ["uint"] = "System.UInt32",
+            ["long"] = "System.Int64",
+            ["ulong"] = "System.UInt64",
+            ["float"] = "System.Single",
+            ["double"] = "System.Double",
+            ["decimal"] = "System.Decimal",
+            ["char"] = "System.Char",
+            ["string"] = "System.String",
+            ["object"] = "System.Object",
+            ["unit"] = "Microsoft.FSharp.Core.Unit",
+            ["nativeint"] = "System.IntPtr",
+            ["unativeint"] = "System.UIntPtr"
+        };
 
     private IEnumerable<IDeclaredElement> EnumerateDeclaredElements()
     {
@@ -1425,7 +1990,7 @@ public class IndexMcpBackendHost
         return false;
     }
 
-    private static RdSymbolInfo ToSymbolInfo(IDeclaredElement element)
+    internal static RdSymbolInfo ToSymbolInfo(IDeclaredElement element)
     {
         var declaration = PickPreferredDeclaration(element);
 
@@ -1483,6 +2048,7 @@ public class IndexMcpBackendHost
         IClass cls => cls.IsAbstract ? "ABSTRACT_CLASS" : "CLASS",
         IConstructor => "CONSTRUCTOR",
         IMethod => "METHOD",
+        IFunction => "METHOD",
         IProperty => "PROPERTY",
         IField => "FIELD",
         IEvent => "EVENT",
@@ -1558,6 +2124,100 @@ public class IndexMcpBackendHost
             CollectStructureNodes(child, nodes, TryGetDeclaredElement(node, out _) ? depth + 1 : depth);
         }
     }
+}
+
+internal sealed class CallableTarget
+{
+    public CallableTarget(IDeclaredElement element, ITreeNode traversalRoot)
+    {
+        Element = element;
+        TraversalRoot = traversalRoot;
+    }
+
+    public IDeclaredElement Element { get; }
+    public ITreeNode TraversalRoot { get; }
+}
+
+internal sealed class ParsedRiderSymbol
+{
+    public ParsedRiderSymbol(
+        string language,
+        string containerQualifiedName,
+        string? memberName,
+        IReadOnlyList<string>? parameterTypes,
+        bool isConstructor)
+    {
+        Language = language;
+        ContainerQualifiedName = containerQualifiedName;
+        MemberName = memberName;
+        ParameterTypes = parameterTypes;
+        IsConstructor = isConstructor;
+    }
+
+    public string Language { get; }
+    public string ContainerQualifiedName { get; }
+    public string? MemberName { get; }
+    public IReadOnlyList<string>? ParameterTypes { get; }
+    public bool IsConstructor { get; }
+}
+
+internal sealed class IndexedSymbolResolution
+{
+    private IndexedSymbolResolution(string status, string? message, IDeclaredElement? element)
+    {
+        Status = status;
+        Message = message;
+        Element = element;
+    }
+
+    public string Status { get; }
+    public string? Message { get; }
+    public IDeclaredElement? Element { get; }
+
+    public static IndexedSymbolResolution Success(IDeclaredElement element) =>
+        new("success", null, element);
+
+    public static IndexedSymbolResolution Invalid(string message) =>
+        new("invalid_symbol", message, null);
+
+    public static IndexedSymbolResolution Unresolved(string message) =>
+        new("unresolved_symbol", message, null);
+
+    public static IndexedSymbolResolution Ambiguous(string message) =>
+        new("ambiguous_match", message, null);
+
+    public static IndexedSymbolResolution Unsupported(string message) =>
+        new("unsupported_target", message, null);
+
+    public IDeclaredElement? TryGetElement() => Status == "success" ? Element : null;
+
+    public RdResolveSymbolIndexedResult ToRdResult() =>
+        new(Status, Message, Element == null ? null : IndexMcpBackendHost.ToSymbolInfo(Element));
+}
+
+internal sealed class IndexedSymbolParseResult
+{
+    private IndexedSymbolParseResult(bool isSuccess, ParsedRiderSymbol? symbol, IndexedSymbolResolution? failure)
+    {
+        IsSuccess = isSuccess;
+        Symbol = symbol;
+        Failure = failure;
+    }
+
+    public bool IsSuccess { get; }
+    public ParsedRiderSymbol? Symbol { get; }
+    public IndexedSymbolResolution? Failure { get; }
+
+    public static IndexedSymbolParseResult Success(ParsedRiderSymbol symbol) =>
+        new(true, symbol, null);
+
+    public static IndexedSymbolParseResult Invalid(string message) =>
+        new(false, null, IndexedSymbolResolution.Invalid(message));
+
+    public static IndexedSymbolParseResult Unsupported(string message) =>
+        new(false, null, IndexedSymbolResolution.Unsupported(message));
+
+    public IndexedSymbolResolution ToResolution() => Failure ?? IndexedSymbolResolution.Invalid("Rider symbol parsing failed.");
 }
 
 /// <summary>

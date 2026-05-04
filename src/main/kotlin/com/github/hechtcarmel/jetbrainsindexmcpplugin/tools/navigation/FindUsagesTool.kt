@@ -44,6 +44,7 @@ class FindUsagesTool : AbstractMcpTool() {
         private val LOG = logger<FindUsagesTool>()
         private const val DEFAULT_MAX_RESULTS = 100
         private const val MAX_PAGE_SIZE = PaginationService.MAX_PAGE_SIZE
+        private const val RIDER_SYMBOL_MODE_UNSUPPORTED = "Rider C#/F# symbol-mode references require the Rider backend-native path and are unsupported when that backend is unavailable."
 
         internal fun searchInfrastructureErrorMessage(error: Throwable): String {
             val detail = error.message?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""
@@ -63,7 +64,7 @@ class FindUsagesTool : AbstractMcpTool() {
 
         Target (mutually exclusive):
         - file + line + column: position-based lookup (necessary for fresh search, ignored when cursor is provided)
-        - language + symbol: fully qualified symbol reference (currently supported for Java only; necessary for fresh search, ignored when cursor is provided)
+        - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#; necessary for fresh search, ignored when cursor is provided)
         - cursor: pagination cursor from a previous response
 
         Parameters: scope (optional, default: "project_files"; supported: project_files, project_and_libraries, project_production_files, project_test_files), pageSize (optional, default: 100, max: 500).
@@ -112,6 +113,10 @@ class FindUsagesTool : AbstractMcpTool() {
         } catch (_: IllegalStateException) {
             return createInvalidScopeError(rawScope)
         }
+        val requestedLanguage = optionalStringArg(arguments, ParamNames.LANGUAGE)
+        val isRiderSymbolMode = resolveLookupMode(arguments) == LookupModeState.SYMBOL &&
+            requestedLanguage in setOf("C#", "F#") &&
+            optionalStringArg(arguments, ParamNames.SYMBOL) != null
         requireSmartMode(project)
 
         val riderReferences = RiderBackendSemanticService.findReferences(
@@ -119,7 +124,9 @@ class FindUsagesTool : AbstractMcpTool() {
             file = arguments[ParamNames.FILE]?.jsonPrimitive?.content,
             line = arguments[ParamNames.LINE]?.jsonPrimitive?.content?.toIntOrNull(),
             column = arguments[ParamNames.COLUMN]?.jsonPrimitive?.content?.toIntOrNull(),
+            // language = arguments[ParamNames.LANGUAGE]
             language = arguments[ParamNames.LANGUAGE]?.jsonPrimitive?.content,
+            // symbol = arguments[ParamNames.SYMBOL]
             symbol = arguments[ParamNames.SYMBOL]?.jsonPrimitive?.content,
             scope = scope,
             limit = collectLimit
@@ -154,6 +161,9 @@ class FindUsagesTool : AbstractMcpTool() {
                     stale = page.stale
                 )
             }
+        }
+        if (isRiderSymbolMode) {
+            return createErrorResult(RIDER_SYMBOL_MODE_UNSUPPORTED)
         }
 
         val cursorToken = suspendingReadAction {

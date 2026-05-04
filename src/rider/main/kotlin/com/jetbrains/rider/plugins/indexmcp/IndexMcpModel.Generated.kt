@@ -24,6 +24,7 @@ class IndexMcpModel private constructor(
     private val _findDefinition: RdCall<RdFindDefinitionRequest, RdDefinitionResult?>,
     private val _findReferences: RdCall<RdFindReferencesRequest, RdFindReferencesResult>,
     private val _resolveSymbol: RdCall<RdResolveSymbolRequest, RdSymbolInfo?>,
+    private val _resolveSymbolIndexed: RdCall<RdResolveSymbolIndexedRequest, RdResolveSymbolIndexedResult>,
     private val _getTypeHierarchy: RdCall<RdTypeHierarchyRequest, RdTypeHierarchyResult?>,
     private val _findImplementations: RdCall<RdImplementationsRequest, RdImplementationsResult?>,
     private val _getCallHierarchy: RdCall<RdCallHierarchyRequest, RdCallHierarchyResult?>,
@@ -49,6 +50,8 @@ class IndexMcpModel private constructor(
             serializers.register(LazyCompanionMarshaller(RdId(7995059252749119881), classLoader, "com.jetbrains.rd.ide.model.RdFindReferencesRequest"))
             serializers.register(LazyCompanionMarshaller(RdId(7993636522934682083), classLoader, "com.jetbrains.rd.ide.model.RdFindReferencesResult"))
             serializers.register(LazyCompanionMarshaller(RdId(8323260431033600144), classLoader, "com.jetbrains.rd.ide.model.RdResolveSymbolRequest"))
+            serializers.register(LazyCompanionMarshaller(RdId(-7597324494782965955), classLoader, "com.jetbrains.rd.ide.model.RdResolveSymbolIndexedRequest"))
+            serializers.register(LazyCompanionMarshaller(RdId(-5005525067240565329), classLoader, "com.jetbrains.rd.ide.model.RdResolveSymbolIndexedResult"))
             serializers.register(LazyCompanionMarshaller(RdId(-1227020239591611591), classLoader, "com.jetbrains.rd.ide.model.RdTypeHierarchyRequest"))
             serializers.register(LazyCompanionMarshaller(RdId(4720868785486666291), classLoader, "com.jetbrains.rd.ide.model.RdTypeHierarchyResult"))
             serializers.register(LazyCompanionMarshaller(RdId(4312643375883653203), classLoader, "com.jetbrains.rd.ide.model.RdImplementationsRequest"))
@@ -77,7 +80,7 @@ class IndexMcpModel private constructor(
         private val __RdFileStructureResultNullableSerializer = RdFileStructureResult.nullable()
         private val __RdRenameSymbolResultNullableSerializer = RdRenameSymbolResult.nullable()
         
-        const val serializationHash = -6211285361720734218L
+        const val serializationHash = -6776846329536477815L
         
     }
     override val serializersOwner: ISerializersOwner get() = IndexMcpModel
@@ -89,6 +92,7 @@ class IndexMcpModel private constructor(
     val findDefinition: IRdCall<RdFindDefinitionRequest, RdDefinitionResult?> get() = _findDefinition
     val findReferences: IRdCall<RdFindReferencesRequest, RdFindReferencesResult> get() = _findReferences
     val resolveSymbol: IRdCall<RdResolveSymbolRequest, RdSymbolInfo?> get() = _resolveSymbol
+    val resolveSymbolIndexed: IRdCall<RdResolveSymbolIndexedRequest, RdResolveSymbolIndexedResult> get() = _resolveSymbolIndexed
     val getTypeHierarchy: IRdCall<RdTypeHierarchyRequest, RdTypeHierarchyResult?> get() = _getTypeHierarchy
     val findImplementations: IRdCall<RdImplementationsRequest, RdImplementationsResult?> get() = _findImplementations
     val getCallHierarchy: IRdCall<RdCallHierarchyRequest, RdCallHierarchyResult?> get() = _getCallHierarchy
@@ -103,6 +107,7 @@ class IndexMcpModel private constructor(
         bindableChildren.add("findDefinition" to _findDefinition)
         bindableChildren.add("findReferences" to _findReferences)
         bindableChildren.add("resolveSymbol" to _resolveSymbol)
+        bindableChildren.add("resolveSymbolIndexed" to _resolveSymbolIndexed)
         bindableChildren.add("getTypeHierarchy" to _getTypeHierarchy)
         bindableChildren.add("findImplementations" to _findImplementations)
         bindableChildren.add("getCallHierarchy" to _getCallHierarchy)
@@ -119,6 +124,7 @@ class IndexMcpModel private constructor(
         RdCall<RdFindDefinitionRequest, RdDefinitionResult?>(RdFindDefinitionRequest, __RdDefinitionResultNullableSerializer),
         RdCall<RdFindReferencesRequest, RdFindReferencesResult>(RdFindReferencesRequest, RdFindReferencesResult),
         RdCall<RdResolveSymbolRequest, RdSymbolInfo?>(RdResolveSymbolRequest, __RdSymbolInfoNullableSerializer),
+        RdCall<RdResolveSymbolIndexedRequest, RdResolveSymbolIndexedResult>(RdResolveSymbolIndexedRequest, RdResolveSymbolIndexedResult),
         RdCall<RdTypeHierarchyRequest, RdTypeHierarchyResult?>(RdTypeHierarchyRequest, __RdTypeHierarchyResultNullableSerializer),
         RdCall<RdImplementationsRequest, RdImplementationsResult?>(RdImplementationsRequest, __RdImplementationsResultNullableSerializer),
         RdCall<RdCallHierarchyRequest, RdCallHierarchyResult?>(RdCallHierarchyRequest, __RdCallHierarchyResultNullableSerializer),
@@ -138,6 +144,7 @@ class IndexMcpModel private constructor(
             print("findDefinition = "); _findDefinition.print(printer); println()
             print("findReferences = "); _findReferences.print(printer); println()
             print("resolveSymbol = "); _resolveSymbol.print(printer); println()
+            print("resolveSymbolIndexed = "); _resolveSymbolIndexed.print(printer); println()
             print("getTypeHierarchy = "); _getTypeHierarchy.print(printer); println()
             print("findImplementations = "); _findImplementations.print(printer); println()
             print("getCallHierarchy = "); _getCallHierarchy.print(printer); println()
@@ -155,6 +162,7 @@ class IndexMcpModel private constructor(
             _findDefinition.deepClonePolymorphic(),
             _findReferences.deepClonePolymorphic(),
             _resolveSymbol.deepClonePolymorphic(),
+            _resolveSymbolIndexed.deepClonePolymorphic(),
             _getTypeHierarchy.deepClonePolymorphic(),
             _findImplementations.deepClonePolymorphic(),
             _getCallHierarchy.deepClonePolymorphic(),
@@ -249,13 +257,14 @@ data class RdBackendStatusResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:139]
+ * #### Generated from [IndexMcpModel.kt:151]
  */
 data class RdCallHierarchyRequest (
     val target: RdSemanticTarget,
     val direction: String,
     val depth: Int,
-    val scope: String
+    val scope: String,
+    val limit: Int
 ) : IPrintable {
     //companion
     
@@ -269,7 +278,8 @@ data class RdCallHierarchyRequest (
             val direction = buffer.readString()
             val depth = buffer.readInt()
             val scope = buffer.readString()
-            return RdCallHierarchyRequest(target, direction, depth, scope)
+            val limit = buffer.readInt()
+            return RdCallHierarchyRequest(target, direction, depth, scope, limit)
         }
         
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdCallHierarchyRequest)  {
@@ -277,6 +287,7 @@ data class RdCallHierarchyRequest (
             buffer.writeString(value.direction)
             buffer.writeInt(value.depth)
             buffer.writeString(value.scope)
+            buffer.writeInt(value.limit)
         }
         
         
@@ -296,6 +307,7 @@ data class RdCallHierarchyRequest (
         if (direction != other.direction) return false
         if (depth != other.depth) return false
         if (scope != other.scope) return false
+        if (limit != other.limit) return false
         
         return true
     }
@@ -306,6 +318,7 @@ data class RdCallHierarchyRequest (
         __r = __r*31 + direction.hashCode()
         __r = __r*31 + depth.hashCode()
         __r = __r*31 + scope.hashCode()
+        __r = __r*31 + limit.hashCode()
         return __r
     }
     //pretty print
@@ -316,6 +329,7 @@ data class RdCallHierarchyRequest (
             print("direction = "); direction.print(printer); println()
             print("depth = "); depth.print(printer); println()
             print("scope = "); scope.print(printer); println()
+            print("limit = "); limit.print(printer); println()
         }
         printer.print(")")
     }
@@ -326,7 +340,7 @@ data class RdCallHierarchyRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:146]
+ * #### Generated from [IndexMcpModel.kt:159]
  */
 data class RdCallHierarchyResult (
     val root: RdSymbolInfo,
@@ -462,7 +476,7 @@ data class RdDefinitionResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:172]
+ * #### Generated from [IndexMcpModel.kt:185]
  */
 data class RdFileStructureRequest (
     val filePath: String
@@ -521,7 +535,7 @@ data class RdFileStructureRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:187]
+ * #### Generated from [IndexMcpModel.kt:200]
  */
 data class RdFileStructureResult (
     val nodes: List<RdFlatStructureNode>
@@ -935,7 +949,7 @@ data class RdFindTypesResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:178]
+ * #### Generated from [IndexMcpModel.kt:191]
  */
 data class RdFlatStructureNode (
     val name: String,
@@ -1024,11 +1038,12 @@ data class RdFlatStructureNode (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:128]
+ * #### Generated from [IndexMcpModel.kt:139]
  */
 data class RdImplementationsRequest (
     val position: RdSourcePosition,
-    val scope: String
+    val scope: String,
+    val limit: Int
 ) : IPrintable {
     //companion
     
@@ -1040,12 +1055,14 @@ data class RdImplementationsRequest (
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdImplementationsRequest  {
             val position = RdSourcePosition.read(ctx, buffer)
             val scope = buffer.readString()
-            return RdImplementationsRequest(position, scope)
+            val limit = buffer.readInt()
+            return RdImplementationsRequest(position, scope, limit)
         }
         
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdImplementationsRequest)  {
             RdSourcePosition.write(ctx, buffer, value.position)
             buffer.writeString(value.scope)
+            buffer.writeInt(value.limit)
         }
         
         
@@ -1063,6 +1080,7 @@ data class RdImplementationsRequest (
         
         if (position != other.position) return false
         if (scope != other.scope) return false
+        if (limit != other.limit) return false
         
         return true
     }
@@ -1071,6 +1089,7 @@ data class RdImplementationsRequest (
         var __r = 0
         __r = __r*31 + position.hashCode()
         __r = __r*31 + scope.hashCode()
+        __r = __r*31 + limit.hashCode()
         return __r
     }
     //pretty print
@@ -1079,6 +1098,7 @@ data class RdImplementationsRequest (
         printer.indent {
             print("position = "); position.print(printer); println()
             print("scope = "); scope.print(printer); println()
+            print("limit = "); limit.print(printer); println()
         }
         printer.print(")")
     }
@@ -1089,7 +1109,7 @@ data class RdImplementationsRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:133]
+ * #### Generated from [IndexMcpModel.kt:145]
  */
 data class RdImplementationsResult (
     val implementations: List<RdSymbolInfo>
@@ -1237,7 +1257,7 @@ data class RdReferenceInfo (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:193]
+ * #### Generated from [IndexMcpModel.kt:206]
  */
 data class RdRenameSymbolRequest (
     val position: RdSourcePosition,
@@ -1302,7 +1322,7 @@ data class RdRenameSymbolRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:198]
+ * #### Generated from [IndexMcpModel.kt:211]
  */
 data class RdRenameSymbolResult (
     val success: Boolean,
@@ -1381,6 +1401,142 @@ data class RdRenameSymbolResult (
             print("affectedFiles = "); affectedFiles.print(printer); println()
             print("changesCount = "); changesCount.print(printer); println()
             print("message = "); message.print(printer); println()
+        }
+        printer.print(")")
+    }
+    //deepClone
+    //contexts
+    //threading
+}
+
+
+/**
+ * #### Generated from [IndexMcpModel.kt:113]
+ */
+data class RdResolveSymbolIndexedRequest (
+    val language: String,
+    val symbol: String
+) : IPrintable {
+    //companion
+    
+    companion object : IMarshaller<RdResolveSymbolIndexedRequest> {
+        override val _type: KClass<RdResolveSymbolIndexedRequest> = RdResolveSymbolIndexedRequest::class
+        override val id: RdId get() = RdId(-7597324494782965955)
+        
+        @Suppress("UNCHECKED_CAST")
+        override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdResolveSymbolIndexedRequest  {
+            val language = buffer.readString()
+            val symbol = buffer.readString()
+            return RdResolveSymbolIndexedRequest(language, symbol)
+        }
+        
+        override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdResolveSymbolIndexedRequest)  {
+            buffer.writeString(value.language)
+            buffer.writeString(value.symbol)
+        }
+        
+        
+    }
+    //fields
+    //methods
+    //initializer
+    //secondary constructor
+    //equals trait
+    override fun equals(other: Any?): Boolean  {
+        if (this === other) return true
+        if (other == null || other::class != this::class) return false
+        
+        other as RdResolveSymbolIndexedRequest
+        
+        if (language != other.language) return false
+        if (symbol != other.symbol) return false
+        
+        return true
+    }
+    //hash code trait
+    override fun hashCode(): Int  {
+        var __r = 0
+        __r = __r*31 + language.hashCode()
+        __r = __r*31 + symbol.hashCode()
+        return __r
+    }
+    //pretty print
+    override fun print(printer: PrettyPrinter)  {
+        printer.println("RdResolveSymbolIndexedRequest (")
+        printer.indent {
+            print("language = "); language.print(printer); println()
+            print("symbol = "); symbol.print(printer); println()
+        }
+        printer.print(")")
+    }
+    //deepClone
+    //contexts
+    //threading
+}
+
+
+/**
+ * #### Generated from [IndexMcpModel.kt:118]
+ */
+data class RdResolveSymbolIndexedResult (
+    val status: String,
+    val message: String?,
+    val symbolInfo: RdSymbolInfo?
+) : IPrintable {
+    //companion
+    
+    companion object : IMarshaller<RdResolveSymbolIndexedResult> {
+        override val _type: KClass<RdResolveSymbolIndexedResult> = RdResolveSymbolIndexedResult::class
+        override val id: RdId get() = RdId(-5005525067240565329)
+        
+        @Suppress("UNCHECKED_CAST")
+        override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdResolveSymbolIndexedResult  {
+            val status = buffer.readString()
+            val message = buffer.readNullable { buffer.readString() }
+            val symbolInfo = buffer.readNullable { RdSymbolInfo.read(ctx, buffer) }
+            return RdResolveSymbolIndexedResult(status, message, symbolInfo)
+        }
+        
+        override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdResolveSymbolIndexedResult)  {
+            buffer.writeString(value.status)
+            buffer.writeNullable(value.message) { buffer.writeString(it) }
+            buffer.writeNullable(value.symbolInfo) { RdSymbolInfo.write(ctx, buffer, it) }
+        }
+        
+        
+    }
+    //fields
+    //methods
+    //initializer
+    //secondary constructor
+    //equals trait
+    override fun equals(other: Any?): Boolean  {
+        if (this === other) return true
+        if (other == null || other::class != this::class) return false
+        
+        other as RdResolveSymbolIndexedResult
+        
+        if (status != other.status) return false
+        if (message != other.message) return false
+        if (symbolInfo != other.symbolInfo) return false
+        
+        return true
+    }
+    //hash code trait
+    override fun hashCode(): Int  {
+        var __r = 0
+        __r = __r*31 + status.hashCode()
+        __r = __r*31 + if (message != null) message.hashCode() else 0
+        __r = __r*31 + if (symbolInfo != null) symbolInfo.hashCode() else 0
+        return __r
+    }
+    //pretty print
+    override fun print(printer: PrettyPrinter)  {
+        printer.println("RdResolveSymbolIndexedResult (")
+        printer.indent {
+            print("status = "); status.print(printer); println()
+            print("message = "); message.print(printer); println()
+            print("symbolInfo = "); symbolInfo.print(printer); println()
         }
         printer.print(")")
     }
@@ -1610,7 +1766,7 @@ data class RdSourcePosition (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:157]
+ * #### Generated from [IndexMcpModel.kt:170]
  */
 data class RdSuperMethodInfo (
     val symbol: RdSymbolInfo,
@@ -1693,7 +1849,7 @@ data class RdSuperMethodInfo (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:153]
+ * #### Generated from [IndexMcpModel.kt:166]
  */
 data class RdSuperMethodsRequest (
     val position: RdSourcePosition
@@ -1752,7 +1908,7 @@ data class RdSuperMethodsRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:165]
+ * #### Generated from [IndexMcpModel.kt:178]
  */
 data class RdSuperMethodsResult (
     val method: RdSymbolInfo,
@@ -1924,7 +2080,7 @@ data class RdSymbolInfo (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:115]
+ * #### Generated from [IndexMcpModel.kt:126]
  */
 data class RdTypeHierarchyRequest (
     val position: RdSourcePosition,
@@ -1989,7 +2145,7 @@ data class RdTypeHierarchyRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:120]
+ * #### Generated from [IndexMcpModel.kt:131]
  */
 data class RdTypeHierarchyResult (
     val element: RdSymbolInfo,
