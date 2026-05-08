@@ -1,16 +1,21 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using JetBrains.Application.DataContext;
 using JetBrains.Application.Parts;
 using JetBrains.Application.Progress;
+using JetBrains.Application.UI.Actions.ActionManager;
 using JetBrains.Application.Threading;
 using JetBrains.Core;
 using JetBrains.DocumentModel;
+using JetBrains.DocumentManagers.Transactions;
 using JetBrains.Lifetimes;
 using JetBrains.ProjectModel;
 using JetBrains.ProjectModel.DataContext;
@@ -29,6 +34,8 @@ using JetBrains.ReSharper.Psi.Util;
 using JetBrains.ReSharper.Feature.Services.Refactorings;
 using JetBrains.ReSharper.Feature.Services.Refactorings.Specific.Rename;
 using JetBrains.ReSharper.Feature.Services.Protocol;
+using JetBrains.ReSharper.Refactorings.Move.MoveToFolder;
+using JetBrains.ReSharper.Refactorings.Move.MoveToFolder.Impl;
 using JetBrains.ReSharper.Refactorings.Rename;
 using JetBrains.Rider.Model;
 using JetBrains.Rider.Model.IndexMcp;
@@ -37,6 +44,7 @@ using JetBrains.Util;
 using JetBrains.Util.dataStructures.TypedIntrinsics;
 using JetBrains.Util.EventBus;
 using JetBrains.Util.Threading.Tasks;
+using ReSharperPlugin.IndexMcp.Mutations;
 
 namespace ReSharperPlugin.IndexMcp;
 
@@ -54,6 +62,24 @@ public class IndexMcpBackendHost
     private readonly RenameRefactoringService _renameRefactoringService;
     private const string BackendVersion = "4.18.0";
     private const int MaxResults = 200;
+    private const int BoundedFindReferencesBatchSize = 1;
+    private const int BoundedFindReferencesInteractiveBudgetMs = 10_000;
+    private const int TextControlPollTimeoutMs = 10_000;
+    private const int TextControlPollIntervalMs = 250;
+    private const string FSharpPluginZoneTypeName =
+        "JetBrains.ReSharper.Plugins.FSharp.IFSharpPluginZone, JetBrains.ReSharper.Plugins.FSharp.Common";
+    private const string FSharpPresentationLanguageTypeName =
+        "JetBrains.ReSharper.Plugins.FSharp.Psi.FSharpLanguage";
+    private static long ourFindReferencesRequestSequence;
+    private static long ourRenameRequestSequence;
+    private static readonly Lazy<FSharpCapabilityAvailability> ourFSharpCapability =
+        new(() => DetectFSharpCapability());
+    private static readonly Lazy<object?> ourFSharpPresentationLanguage =
+        new(TryResolveFSharpPresentationLanguage);
+    private static readonly Lazy<MethodInfo?> ourGetPresentableNameMethod =
+        new(() => typeof(IType).GetMethods(BindingFlags.Instance | BindingFlags.Public)
+            .FirstOrDefault(method => method.Name == nameof(IType.GetPresentableName) &&
+                                      method.GetParameters().Length == 1));
 
     public IndexMcpBackendHost(
         Lifetime lifetime,
@@ -68,6 +94,7 @@ public class IndexMcpBackendHost
 
         model.GetBackendStatus.SetAsync(HandleGetBackendStatus);
         model.FindTypes.SetAsync(HandleFindTypes);
+        model.FindSymbols.SetAsync(HandleFindSymbols);
         model.FindDefinition.SetAsync(HandleFindDefinition);
         model.FindReferences.SetAsync(HandleFindReferences);
         model.ResolveSymbol.SetAsync(HandleResolveSymbol);
@@ -78,6 +105,9 @@ public class IndexMcpBackendHost
         model.FindSuperMethods.SetAsync(HandleFindSuperMethods);
         model.GetFileStructure.SetAsync(HandleGetFileStructure);
         model.RenameSymbol.SetAsync(HandleRenameSymbol);
+        model.RenameFile.SetAsync(HandleRenameFile);
+        model.MoveFile.SetAsync(HandleMoveFile);
+        model.SafeDelete.SetAsync(HandleSafeDelete);
     }
 
     // ── Backend Status ──────────────────────────────────────────────────────
@@ -132,6 +162,66 @@ public class IndexMcpBackendHost
         });
     }
 
+    private Task<RdFindSymbolsResult> HandleFindSymbols(Lifetime lt, RdFindSymbolsRequest request)
+    {
+        return Task.Run(() =>
+        {
+            var normalizedLanguage = NormalizeLanguage(request.Language);
+            if (normalizedLanguage is not ("C#" or "F#"))
+                return new RdFindSymbolsResult(new List<RdSymbolInfo>(), 0);
+
+            var allowedProjectFileExtensions = GetProjectFileExtensions(normalizedLanguage);
+            var declaredProjectSymbols = EnumerateDeclaredSymbolElements(lt, allowedProjectFileExtensions);
+            var indexedLibrarySymbols = request.Scope.Equals("project_and_libraries", StringComparison.OrdinalIgnoreCase)
+                ? EnumerateIndexedSymbolElements(lt, request.Query, normalizedLanguage)
+                : Enumerable.Empty<IDeclaredElement>();
+
+            return BuildFindSymbolsResult(
+                declaredProjectSymbols.Concat(indexedLibrarySymbols),
+                request.Query,
+                request.Scope,
+                request.Language,
+                GetEffectiveResultLimit(request.Limit));
+        });
+    }
+
+    private static RdFindSymbolsResult BuildFindSymbolsResult(
+        IEnumerable<IDeclaredElement> candidates,
+        string query,
+        string scope,
+        string? language,
+        int limit)
+    {
+        var results = candidates
+            .Where(IsSupportedFindSymbolElement)
+            .Where(element => MatchesFindSymbolQuery(element, query))
+            .Where(element => MatchesLanguage(element, language))
+            .Where(element => MatchesScope(element, scope))
+            .OrderBy(element => MatchRank(element.ShortName, query, "substring"))
+            .ThenBy(BestDeclarationRank)
+            .ThenBy(element => IsTestPath(GetDeclarationPath(element) ?? string.Empty) ? 1 : 0)
+            .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetMemberSignatureSortKey, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase)
+            .Select(ToSymbolInfo)
+            .GroupBy(symbol => $"{symbol.Kind}:{symbol.QualifiedName}:{symbol.FilePath}:{symbol.Line}:{symbol.Column}:{symbol.Signature}")
+            .Select(group => group.First())
+            .ToList();
+
+        return new RdFindSymbolsResult(results.Take(limit).ToList(), results.Count);
+    }
+
+    private static bool IsSupportedFindSymbolElement(IDeclaredElement element)
+    {
+        return GetElementKind(element) != "UNKNOWN";
+    }
+
+    private static bool MatchesFindSymbolQuery(IDeclaredElement element, string query)
+    {
+        return MatchesName(element.ShortName, query, "substring") ||
+               MatchesQualifiedName(GetQualifiedName(element), query, "substring");
+    }
+
     private static FindTypesSearchPlan BuildFindTypesSearchPlan(
         string? language,
         string scope,
@@ -162,13 +252,104 @@ public class IndexMcpBackendHost
                                             isProjectFilesScope &&
                                             parsedSymbol.MemberName == null &&
                                             parsedSymbol.ContainerQualifiedName.Contains('.', StringComparison.Ordinal);
-        var rejectUnboundedReferenceSearch = useProjectQualifiedTypeLookup;
+        var useBoundedProjectFileSearch = useProjectQualifiedTypeLookup;
+        var rejectUnboundedReferenceSearch = false;
 
         return new FindReferencesResolutionPlan(
-            allowedProjectFileExtensions: useProjectQualifiedTypeLookup ? GetProjectFileExtensions(normalizedLanguage) : null,
+            allowedProjectFileExtensions: useBoundedProjectFileSearch ? GetProjectFileExtensions(normalizedLanguage) : null,
             useProjectQualifiedTypeLookup: useProjectQualifiedTypeLookup,
+            useBoundedProjectFileSearch: useBoundedProjectFileSearch,
             allowLibraryFallback: !useProjectQualifiedTypeLookup,
-            rejectUnboundedReferenceSearch: rejectUnboundedReferenceSearch);
+            rejectUnboundedReferenceSearch: rejectUnboundedReferenceSearch,
+            targetKind: "symbol",
+            isFSharpPositionTarget: false,
+            isFSharpSymbolTarget: normalizedLanguage == "F#");
+    }
+
+    private static FindReferencesResolutionPlan BuildFindReferencesResolutionPlan(
+        RdSemanticTarget target,
+        string scope,
+        ParsedRiderSymbol? parsedSymbol)
+    {
+        var isPositionTarget = !string.IsNullOrWhiteSpace(target.FilePath) &&
+                               target.Line.HasValue &&
+                               target.Column.HasValue;
+        if (isPositionTarget)
+        {
+            var normalizedLanguage = InferFindReferencesTargetLanguage(target);
+            var isFSharpPositionTarget = normalizedLanguage == "F#";
+            var isProjectFilesScope = scope.Equals("project_files", StringComparison.OrdinalIgnoreCase);
+            var useBoundedProjectFileSearch = isFSharpPositionTarget && isProjectFilesScope;
+
+            return new FindReferencesResolutionPlan(
+                allowedProjectFileExtensions: useBoundedProjectFileSearch
+                    ? GetProjectFileExtensions(normalizedLanguage)
+                    : null,
+                useProjectQualifiedTypeLookup: false,
+                useBoundedProjectFileSearch: useBoundedProjectFileSearch,
+                allowLibraryFallback: !useBoundedProjectFileSearch,
+                rejectUnboundedReferenceSearch: false,
+                targetKind: "position",
+                isFSharpPositionTarget: isFSharpPositionTarget,
+                isFSharpSymbolTarget: false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(target.Language) &&
+            !string.IsNullOrWhiteSpace(target.Symbol))
+        {
+            if (parsedSymbol != null)
+                return BuildFindReferencesResolutionPlan(scope, parsedSymbol);
+
+            return new FindReferencesResolutionPlan(
+                allowedProjectFileExtensions: null,
+                useProjectQualifiedTypeLookup: false,
+                useBoundedProjectFileSearch: false,
+                allowLibraryFallback: true,
+                rejectUnboundedReferenceSearch: false,
+                targetKind: "symbol",
+                isFSharpPositionTarget: false,
+                isFSharpSymbolTarget: NormalizeLanguage(target.Language) == "F#");
+        }
+
+        return new FindReferencesResolutionPlan(
+            allowedProjectFileExtensions: null,
+            useProjectQualifiedTypeLookup: false,
+            useBoundedProjectFileSearch: false,
+            allowLibraryFallback: true,
+            rejectUnboundedReferenceSearch: false,
+            targetKind: "unsupported",
+            isFSharpPositionTarget: false,
+            isFSharpSymbolTarget: false);
+    }
+
+    private static FSharpCapabilityAvailability DetectFSharpCapability(Func<string, Type?>? typeResolver = null)
+    {
+        typeResolver ??= static typeName => Type.GetType(typeName, throwOnError: false);
+
+        if (typeResolver(FSharpPluginZoneTypeName) == null)
+        {
+            return FSharpCapabilityAvailability.Unavailable(
+                "unsupported_language_capability",
+                $"F# find_references is unavailable because the Rider F# plugin APIs are not loaded ({FSharpPluginZoneTypeName}).");
+        }
+
+        return FSharpCapabilityAvailability.Available();
+    }
+
+    private static FindReferencesTargetResolution? ResolveFindReferencesCapabilityFailure(
+        RdSemanticTarget target,
+        Func<string, Type?>? typeResolver = null)
+    {
+        if (!IsFSharpFindReferencesTarget(target))
+            return null;
+
+        var capability = typeResolver == null ? ourFSharpCapability.Value : DetectFSharpCapability(typeResolver);
+        return capability.IsAvailable
+            ? null
+            : FindReferencesTargetResolution.Failure(
+                capability.FailureStatus!,
+                capability.FailureMessage,
+                "fsharp_capability");
     }
 
     private static void EnsureFindReferencesSearchIsSupported(
@@ -176,11 +357,14 @@ public class IndexMcpBackendHost
         ParsedRiderSymbol parsedSymbol,
         string scope)
     {
+        _ = parsedSymbol;
+        _ = scope;
+
         if (!plan.RejectUnboundedReferenceSearch)
             return;
 
         throw new InvalidOperationException(
-            $"F# symbol-based find_references for type-only qualified symbols in scope '{scope}' is temporarily blocked because Rider backend global reference search is unbounded and can exceed the RD timeout. Use a position-based target or a more specific member symbol instead.");
+            "Rider find_references rejected an unbounded search plan. This indicates a backend plan regression; position/member targets remain the safest low-latency option.");
     }
 
     private static void EnsureFindReferencesIndexedTargetIsSupported(
@@ -259,6 +443,18 @@ public class IndexMcpBackendHost
             ("IReadOnlyList", "System.Collections.Generic.IReadOnlyList", "INTERFACE"),
             ("IDictionary", "System.Collections.Generic.IDictionary", "INTERFACE"),
             ("IReadOnlyDictionary", "System.Collections.Generic.IReadOnlyDictionary", "INTERFACE")
+        };
+
+    private static readonly IReadOnlyDictionary<string, IReadOnlyList<string>> ClrPredefinedLookupNames =
+        new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["System.String"] = new[] { "System.String" },
+            ["System.Collections.IEnumerable"] = new[] { "System.Collections.IEnumerable" },
+            ["System.Collections.Generic.IEnumerable"] = new[]
+            {
+                "System.Collections.Generic.IEnumerable",
+                "System.Collections.Generic.IEnumerable`1"
+            }
         };
 
     private IEnumerable<ITypeElement> EnumerateIndexedTypeElements(Lifetime lt, string query, string matchMode)
@@ -342,28 +538,106 @@ public class IndexMcpBackendHost
     {
         return Task.Run(() =>
         {
-            if (!string.IsNullOrWhiteSpace(request.Target.Language) &&
-                !string.IsNullOrWhiteSpace(request.Target.Symbol))
+            var effectiveLimit = GetEffectiveResultLimit(request.Limit);
+            var trace = StartFindReferencesTrace(request, effectiveLimit);
+            FindReferencesResolutionPlan? plan = null;
+            var stage = "start";
+
+            try
             {
-                EnsureFindReferencesIndexedTargetIsSupported(
-                    request.Target.Language,
-                    request.Target.Symbol,
-                    request.Scope);
+                stage = "plan";
+                ParsedRiderSymbol? parsedSymbol = null;
+                if (!string.IsNullOrWhiteSpace(request.Target.Language) &&
+                    !string.IsNullOrWhiteSpace(request.Target.Symbol))
+                {
+                    var parseResult = ParseIndexedSymbol(request.Target.Language, request.Target.Symbol);
+                    if (parseResult.IsSuccess && parseResult.Symbol != null)
+                        parsedSymbol = parseResult.Symbol;
+
+                    EnsureFindReferencesIndexedTargetIsSupported(
+                        request.Target.Language,
+                        request.Target.Symbol,
+                        request.Scope);
+                }
+
+                plan = BuildFindReferencesResolutionPlan(request.Target, request.Scope, parsedSymbol);
+
+                LogFindReferencesInfo(trace,
+                    "plan",
+                    $"TargetKind={plan?.TargetKind ?? "unsupported"}, " +
+                    $"IsFSharpPositionTarget={plan?.IsFSharpPositionTarget ?? false}, " +
+                    $"IsFSharpSymbolTarget={plan?.IsFSharpSymbolTarget ?? false}, " +
+                    $"UseProjectQualifiedTypeLookup={plan?.UseProjectQualifiedTypeLookup ?? false}, " +
+                    $"UseBoundedProjectFileSearch={plan?.UseBoundedProjectFileSearch ?? false}, " +
+                    $"AllowLibraryFallback={plan?.AllowLibraryFallback ?? false}, " +
+                    $"AllowedProjectFileExtensions={FormatExtensions(plan?.AllowedProjectFileExtensions)}, " +
+                    $"RejectUnboundedReferenceSearch={plan?.RejectUnboundedReferenceSearch ?? false}");
+
+                stage = "resolve-target";
+                var resolveStopwatch = Stopwatch.StartNew();
+                LogFindReferencesInfo(trace, "resolve-target.start", $"elapsedMs={trace.ElapsedMilliseconds}");
+                var targetResolution = ResolveTargetForFindReferences(lt, request.Target, request.Scope, trace);
+                var element = targetResolution.TryGetElement();
+                resolveStopwatch.Stop();
+                LogFindReferencesInfo(
+                    trace,
+                    "resolve-target.end",
+                    $"elapsedMs={trace.ElapsedMilliseconds}, stageElapsedMs={resolveStopwatch.ElapsedMilliseconds}, " +
+                    $"status={targetResolution.Status}, origin={targetResolution.Origin}, element={(element == null ? "null" : "found")}, " +
+                    $"summary={(element == null ? "<null>" : DescribeFindReferencesResolvedTarget(element, targetResolution.Origin))}, " +
+                    $"message={targetResolution.Message ?? "<none>"}");
+                if (element == null)
+                {
+                    if (ShouldRaiseFindReferencesTargetResolutionFailure(request.Target, targetResolution.Status))
+                    {
+                        var unresolvedMessage = FormatFindReferencesTargetResolutionFailureMessage(
+                            request.Target,
+                            request.Scope,
+                            targetResolution.Status,
+                            targetResolution.Message,
+                            targetResolution.Origin);
+                        LogFindReferencesWarning(trace, $"stage=resolve-target, {unresolvedMessage}");
+                        throw new InvalidOperationException(unresolvedMessage);
+                    }
+
+                    return new RdFindReferencesResult(new List<RdReferenceInfo>(), 0);
+                }
+
+                var searchRoute = plan?.UseBoundedProjectFileSearch == true ? "bounded" : "legacy";
+                stage = searchRoute == "bounded" ? "find-bounded" : "find-legacy";
+                LogFindReferencesInfo(
+                    trace,
+                    "search-route",
+                    $"route={searchRoute}, target={DescribeFindReferencesResolvedTarget(element, targetResolution.Origin)}");
+                var references = (plan?.UseBoundedProjectFileSearch == true
+                        ? FindReferencesBounded(lt, element, plan.AllowedProjectFileExtensions, effectiveLimit, trace)
+                        : FindReferences(lt, element, effectiveLimit, trace, "legacy"))
+                    .Select(ToReferenceInfo)
+                    .Where(reference => reference != null)
+                    .Cast<RdReferenceInfo>()
+                    .Where(reference => MatchesScope(reference.FilePath, request.Scope))
+                    .GroupBy(reference => $"{reference.FilePath}:{reference.Line}:{reference.Column}")
+                    .Select(group => group.First())
+                    .ToList();
+
+                stage = "complete";
+                LogFindReferencesInfo(
+                    trace,
+                    "complete",
+                    $"elapsedMs={trace.ElapsedMilliseconds}, dedupedCount={references.Count}, returnedCount={Math.Min(references.Count, effectiveLimit)}, partial={trace.IsPartial}");
+                return new RdFindReferencesResult(references.Take(effectiveLimit).ToList(), references.Count);
             }
-
-            var element = ResolveTargetForFindReferences(lt, request.Target, request.Scope);
-            if (element == null) return new RdFindReferencesResult(new List<RdReferenceInfo>(), 0);
-
-            var references = FindReferences(lt, element)
-                .Select(ToReferenceInfo)
-                .Where(reference => reference != null)
-                .Cast<RdReferenceInfo>()
-                .Where(reference => MatchesScope(reference.FilePath, request.Scope))
-                .GroupBy(reference => $"{reference.FilePath}:{reference.Line}:{reference.Column}")
-                .Select(group => group.First())
-                .ToList();
-
-            return new RdFindReferencesResult(references.Take(Math.Min(request.Limit, MaxResults)).ToList(), references.Count);
+            catch (Exception ex)
+            {
+                LogFindReferencesWarning(
+                    trace,
+                    $"stage={stage}, elapsedMs={trace.ElapsedMilliseconds}, exception={ex.GetType().FullName}: {ex.Message}");
+                throw;
+            }
+            finally
+            {
+                LogFindReferencesInfo(trace, "finally", $"elapsedMs={trace.ElapsedMilliseconds}, stage={stage}");
+            }
         });
     }
 
@@ -386,31 +660,54 @@ public class IndexMcpBackendHost
     private Task<RdRenameSymbolResult?> HandleRenameSymbol(
         Lifetime lt, RdRenameSymbolRequest request)
     {
+        var trace = StartRenameTrace(
+            "renameSymbol",
+            $"filePath={request.Position.FilePath}, line={request.Position.Line}, column={request.Position.Column}, newName={request.NewName}");
+        LogRenameInfo(trace, "handle.received", $"elapsedMs={trace.ElapsedMilliseconds}");
+        var preAcquiredTextControl = TraceRenameStage(trace, "service-rename.text-control.prewrite-acquire",
+            () => TryAcquireTextControlBeforeWriteLock(request, trace),
+            textControl => $"found={textControl != null}, description={DescribeReflectedTextControl(textControl)}");
         OuterLifetime outerLifetime = lt;
         RdRenameSymbolResult? result = null;
-        return ExecuteWriteLockedRename(outerLifetime, () => { result = ExecuteRenameSymbol(request); })
+        return ExecuteWriteLockedRename(outerLifetime, () => { result = ExecuteRenameSymbol(request, preAcquiredTextControl, trace); }, trace)
             .ContinueWith<RdRenameSymbolResult?>(task =>
             {
                 if (!task.IsFaulted)
                 {
+                    LogRenameInfo(trace, "handle.completed", $"elapsedMs={trace.ElapsedMilliseconds}, status={result?.Status ?? "<null>"}");
                     return result;
                 }
 
                 var exception = task.Exception?.GetBaseException();
-                return new RdRenameSymbolResult(
-                    false,
-                    "",
-                    request.NewName,
-                    new List<string>(),
-                    0,
-                    exception == null
-                        ? "ReSharper backend rename failed while acquiring/executing the write lock."
-                        : $"ReSharper backend rename failed while acquiring/executing the write lock: {exception.GetType().Name}: {exception.Message}");
+                LogRenameWarning(trace,
+                    $"stage=handle.completed, elapsedMs={trace.ElapsedMilliseconds}, exception={exception?.GetType().FullName ?? "<null>"}: {exception?.Message ?? "<null>"}");
+                return MutationVerificationService
+                    .Blocked(
+                        exception == null
+                            ? "ReSharper backend rename failed while acquiring/executing the write lock."
+                            : $"ReSharper backend rename failed while acquiring/executing the write lock: {exception.GetType().Name}: {exception.Message}")
+                    .ToRenameSymbolResult("", request.NewName);
             });
     }
 
-    private Task ExecuteWriteLockedRename(OuterLifetime outerLifetime, Action action)
+    private Task ExecuteWriteLockedRename(OuterLifetime outerLifetime, Action action, RenameTraceContext? trace = null)
     {
+        Action tracedAction = () =>
+        {
+            LogRenameInfo(trace, "write-lock.action.start", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}");
+            try
+            {
+                action();
+                LogRenameInfo(trace, "write-lock.action.end", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}");
+            }
+            catch (Exception ex)
+            {
+                LogRenameWarning(trace,
+                    $"stage=write-lock.action, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, exception={ex.GetType().FullName}: {ex.Message}");
+                throw;
+            }
+        };
+
         var shellLocksEx = typeof(IShellLocks).Assembly.GetType("JetBrains.Application.Threading.IShellLocksEx")
             ?? throw new InvalidOperationException("Unable to locate IShellLocksEx in the Rider runtime.");
 
@@ -436,9 +733,10 @@ public class IndexMcpBackendHost
 
         if (writeLockAsync != null)
         {
+            LogRenameInfo(trace, "write-lock.request", "api=ExecuteOrQueueWriteLockAsyncEx timeoutSeconds=30");
             return (Task)writeLockAsync.Invoke(
                 null,
-                new object[] { _shellLocks, outerLifetime, action, TimeSpan.FromSeconds(30), TaskPriority.Normal, false, "", "" })!;
+                new object[] { _shellLocks, outerLifetime, tracedAction, TimeSpan.FromSeconds(30), TaskPriority.Normal, false, "", "" })!;
         }
 
         var writeLockWhenAvailable = shellLocksEx.GetMethods(BindingFlags.Public | BindingFlags.Static)
@@ -462,69 +760,100 @@ public class IndexMcpBackendHost
 
         if (writeLockWhenAvailable != null)
         {
+            LogRenameInfo(trace, "write-lock.request", "api=ExecuteOrQueueWithWriteLockWhenAvailableEx timeoutSeconds=30");
             return (Task)writeLockWhenAvailable.Invoke(
                 null,
-                new object[] { _shellLocks, outerLifetime, "Index MCP Rider rename", action, TimeSpan.FromSeconds(30), "", "" })!;
+                new object[] { _shellLocks, outerLifetime, "Index MCP Rider rename", tracedAction, TimeSpan.FromSeconds(30), "", "" })!;
         }
 
+        LogRenameWarning(trace, "stage=write-lock.request, exception=MissingMethodException: No compatible Rider/ReSharper write-lock API was found for headless symbol rename.");
         throw new MissingMethodException(
             "No compatible Rider/ReSharper write-lock API was found for headless symbol rename.");
     }
 
-    private RdRenameSymbolResult ExecuteRenameSymbol(RdRenameSymbolRequest request)
+    private RdRenameSymbolResult ExecuteRenameSymbol(
+        RdRenameSymbolRequest request,
+        object? preAcquiredTextControl,
+        RenameTraceContext? trace = null)
     {
-        // Use the stricter resolver: rename must act on the symbol literally at the requested
-        // coordinates. If the local declaration's textual name disagrees with the resolved type
-        // element's ShortName (e.g. desynced AXAML/code-behind partial classes), the resolver will
-        // reject that candidate, returning null and surfacing a clearer error here.
-        var localDeclarationNode = ResolveDeclarationNodeAt(request.Position);
-        var element = localDeclarationNode != null && TryGetDeclaredElement(localDeclarationNode, out var localElement)
-            ? localElement
-            : ResolveDeclaredElementAt(request.Position, requireConsistentLocalDeclaration: true);
-        if (element == null)
+        LogRenameInfo(trace, "execute-rename.start", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}");
+        var planStopwatch = Stopwatch.StartNew();
+        var renamePlan = RenameMutationPlanner.PlanExactSymbolRename(
+            request.Position.FilePath,
+            request.Position.Line,
+            request.Position.Column);
+        planStopwatch.Stop();
+        LogRenameInfo(trace,
+            "plan.end",
+            $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, stageElapsedMs={planStopwatch.ElapsedMilliseconds}, canProceed={renamePlan.CanProceed}, resolutionStatus={renamePlan.Resolution.Status}, resolvedName={renamePlan.Resolution.ResolvedName ?? "<null>"}, targetKind={renamePlan.Resolution.TargetKind ?? "<null>"}, sourceTokenText={renamePlan.Resolution.SourceTokenText ?? "<null>"}");
+
+        if (!renamePlan.CanProceed)
         {
-            return new RdRenameSymbolResult(
-                    false,
-                    "",
-                    request.NewName,
-                    new List<string>(),
-                    0,
-                    $"No C#/F# symbol found at {request.Position.FilePath}:{request.Position.Line}:{request.Position.Column}, " +
-                    "or the local declaration's textual name disagrees with the resolved type element " +
-                    "(this can happen with desynced partial-class pairs such as AXAML/code-behind " +
-                    "where one partial was renamed without the other). No files were modified.");
+            LogRenameWarning(trace, $"stage=plan, blocked=true, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, message={renamePlan.Resolution.Message}");
+            return ToRenameBlockedResult(renamePlan.Resolution, request.NewName);
         }
 
-        var oldName = element.ShortName;
-        var localName = GetDeclarationNodeName(localDeclarationNode);
-        if (!string.IsNullOrEmpty(localName))
-            oldName = localName;
+        var resolveStopwatch = Stopwatch.StartNew();
+        LogRenameInfo(trace, "target-resolution.start", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}");
+        var localDeclarationNode = ResolveExactDeclarationNodeAt(
+            request.Position,
+            renamePlan.Resolution.ResolvedName!,
+            renamePlan.Resolution.TargetKind);
+        resolveStopwatch.Stop();
+        LogRenameInfo(trace,
+            "target-resolution.end",
+            $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, stageElapsedMs={resolveStopwatch.ElapsedMilliseconds}, nodeFound={localDeclarationNode != null}");
+        if (localDeclarationNode == null || !TryGetDeclaredElement(localDeclarationNode, out var element))
+        {
+            LogRenameWarning(trace, $"stage=target-resolution, blocked=true, elapsedMs={trace?.ElapsedMilliseconds ?? 0}");
+            return MutationVerificationService
+                .Blocked(
+                    AppendSymbolRenameDiagnostics(
+                        $"Exact symbol rename preflight resolved '{renamePlan.Resolution.ResolvedName}', but the Rider backend could not bind the exact declaration node at {request.Position.FilePath}:{request.Position.Line}:{request.Position.Column} without widening. No files were modified.",
+                        renamePlan.Resolution,
+                        executionHint: "frontend_editor_backed_exact_target_only",
+                        unsupportedReason: "exact_declaration_node_binding_failed",
+                        "plan.end",
+                        "target-resolution.end",
+                        "target-resolution.blocked"))
+                .ToRenameSymbolResult(renamePlan.Resolution.ResolvedName ?? string.Empty, request.NewName);
+        }
 
-        // Bug guard: a no-op rename (oldName == newName) cannot be detected by the file-content
-        // polling oracle (the new name is always present, since it equals the existing name), so it
-        // would falsely report success without actually doing anything. Fail explicitly instead.
+        var oldName = renamePlan.Resolution.ResolvedName!;
+        LogRenameInfo(trace, "target-resolution.bound", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, oldName={oldName}, element={DescribeElement(element)}");
+
         if (string.Equals(oldName, request.NewName, StringComparison.Ordinal))
         {
-            return new RdRenameSymbolResult(
-                    false,
-                    oldName,
-                    request.NewName,
-                    new List<string>(),
-                    0,
-                    $"Rename refused: new name '{request.NewName}' equals current name '{oldName}' (no-op rename). " +
-                    "No files were modified.");
+            LogRenameInfo(trace, "no-op", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, reason=same-name");
+            return MutationVerificationService
+                .NoOp(
+                    AppendSymbolRenameDiagnostics(
+                        $"Rename refused: new name '{request.NewName}' equals current name '{oldName}' (no-op rename). No files were modified.",
+                        renamePlan.Resolution,
+                        executionHint: "no_mutation_required",
+                        unsupportedReason: "requested_name_matches_current_name",
+                        "plan.end",
+                        "target-resolution.bound",
+                        "no-op"))
+                .ToRenameSymbolResult(oldName, request.NewName);
         }
 
+        LogRenameInfo(trace, "availability.start", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}");
         var availability = _renameRefactoringService.CheckRenameAvailability(element);
+        LogRenameInfo(trace, "availability.end", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, availability={availability}");
         if (availability != RenameAvailabilityCheckResult.CanBeRenamed)
         {
-            return new RdRenameSymbolResult(
-                    false,
-                    oldName,
-                    request.NewName,
-                    new List<string>(),
-                    0,
-                    $"ReSharper reports that '{oldName}' cannot be renamed ({availability}). No files were modified.");
+            LogRenameWarning(trace, $"stage=availability, unsupported=true, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, availability={availability}");
+            return MutationVerificationService
+                .Unsupported(AppendSymbolRenameDiagnostics(
+                    $"ReSharper reports that '{oldName}' cannot be renamed ({availability}). No files were modified.",
+                    renamePlan.Resolution,
+                    executionHint: "frontend_editor_backed_exact_target_only",
+                    unsupportedReason: $"rename_availability_{availability}",
+                    "plan.end",
+                    "target-resolution.bound",
+                    "availability.end"))
+                .ToRenameSymbolResult(oldName, request.NewName);
         }
 
         var affectedFiles = GetPotentiallyAffectedFiles(element);
@@ -539,70 +868,861 @@ public class IndexMcpBackendHost
 
         try
         {
-            var workflowMessage = TryExecuteDrivenRename(element, request.NewName);
+            var renameExecution = TryExecuteDrivenRename(element, request.NewName, preAcquiredTextControl, trace);
 
-            if (!string.IsNullOrWhiteSpace(workflowMessage))
+            if (!renameExecution.Succeeded)
             {
-                return new RdRenameSymbolResult(
-                        false,
-                        oldName,
-                        request.NewName,
+                LogRenameWarning(trace,
+                    $"stage=workflow, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, message={renameExecution.Message}");
+
+                if (renameExecution.IsUnsupported)
+                {
+                    return MutationVerificationService
+                        .Unsupported(renameExecution.Message)
+                        .ToRenameSymbolResult(oldName, request.NewName);
+                }
+
+                return MutationVerificationService
+                    .VerificationFailed(
                         affectedFiles,
-                        0,
-                        $"ReSharper rename did not update affected files: {workflowMessage}");
+                        affectedFiles.Count,
+                        AppendSymbolRenameDiagnostics(
+                            $"ReSharper rename did not update affected files: {renameExecution.Message}",
+                            renamePlan.Resolution,
+                            executionHint: "frontend_editor_backed_exact_target_only",
+                            unsupportedReason: renameExecution.IsUnsupported
+                                ? "service_inspection_rejected_backend_symbol_lane"
+                                : "backend_symbol_execution_failed_without_mutation",
+                            "plan.end",
+                            "target-resolution.bound",
+                            "service-rename.inspect",
+                            "service-rename.failure"),
+                        new[] { "rename_execution", "post_change_semantics" },
+                        renameExecution.Message)
+                    .ToRenameSymbolResult(oldName, request.NewName);
             }
 
             if (!RenameChangedAffectedFiles(oldNameCountsBefore, oldName))
             {
-                return new RdRenameSymbolResult(
-                        false,
-                        oldName,
-                        request.NewName,
-                        affectedFiles,
-                        0,
-                        $"ReSharper rename completed without error, but no affected file's count of the identifier '{oldName}' decreased. The rename did not actually rewrite anything on disk.");
+                LogRenameWarning(trace, $"stage=verification, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, changedAffectedFiles=false");
+                return MutationVerificationService
+                    .NoOp(
+                        AppendSymbolRenameDiagnostics(
+                            $"ReSharper rename completed without error, but no affected file's count of the identifier '{oldName}' decreased. The rename did not actually rewrite anything on disk (no-op outcome).",
+                            renamePlan.Resolution,
+                            executionHint: "frontend_editor_backed_exact_target_only",
+                            unsupportedReason: "no_observable_identifier_mutation",
+                            "plan.end",
+                            "target-resolution.bound",
+                            "service-rename.inspect",
+                            "verification"))
+                    .ToRenameSymbolResult(oldName, request.NewName);
             }
 
-            return new RdRenameSymbolResult(
-                    true,
-                    oldName,
-                    request.NewName,
+            LogRenameInfo(trace,
+                "success",
+                $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, affectedFiles={affectedFiles.Count}, oldName={oldName}, newName={request.NewName}");
+            return MutationVerificationService
+                .Success(
                     affectedFiles,
                     affectedFiles.Count,
-                    $"Renamed '{oldName}' to '{request.NewName}' using ReSharper backend rename.");
+                    AppendSymbolRenameDiagnostics(
+                        $"Renamed '{oldName}' to '{request.NewName}' using ReSharper backend rename with verified semantic updates.",
+                        renamePlan.Resolution,
+                        executionHint: "frontend_editor_backed_exact_target_preferred_when_backend_lane_is_unsupported",
+                        unsupportedReason: "none",
+                        "plan.end",
+                        "target-resolution.bound",
+                        "service-rename.inspect",
+                        "success"))
+                .ToRenameSymbolResult(oldName, request.NewName);
         }
         catch (Exception ex)
         {
-            return new RdRenameSymbolResult(
-                    false,
-                    oldName,
-                    request.NewName,
-                    new List<string>(),
-                    0,
-                    $"ReSharper backend rename failed: {ex.GetType().Name}: {ex.Message}");
+            LogRenameWarning(trace,
+                $"stage=execute-rename, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, exception={ex.GetType().FullName}: {ex.Message}");
+            return MutationVerificationService
+                .Blocked(AppendSymbolRenameDiagnostics(
+                    $"ReSharper backend rename failed: {ex.GetType().Name}: {ex.Message}",
+                    renamePlan.Resolution,
+                    executionHint: "frontend_editor_backed_exact_target_only",
+                    unsupportedReason: "backend_symbol_lane_exception",
+                    "plan.end",
+                    "target-resolution.bound",
+                    "execute-rename"))
+                .ToRenameSymbolResult(oldName, request.NewName);
         }
     }
 
-    private string? TryExecuteDrivenRename(
+    private Task<RdRenameFileResult?> HandleRenameFile(Lifetime lt, RdRenameFileRequest request)
+    {
+        OuterLifetime outerLifetime = lt;
+        var renamePlan = RenameMutationPlanner.PlanExactFileRename(request.FilePath, request.NewName);
+        var oldPath = renamePlan.OldPath ?? request.FilePath;
+        var newPath = renamePlan.NewPath ?? CombinePath(Path.GetDirectoryName(oldPath), request.NewName);
+
+        if (string.Equals(Path.GetFileName(oldPath), request.NewName, StringComparison.OrdinalIgnoreCase))
+        {
+            return Task.FromResult<RdRenameFileResult?>(
+                MutationVerificationService
+                    .NoOp($"File rename refused because '{request.NewName}' already matches the current file name (no-op file rename).")
+                    .ToRenameFileResult(oldPath, oldPath));
+        }
+
+        if (!renamePlan.CanProceed)
+        {
+            return Task.FromResult<RdRenameFileResult?>(ToRenameFileBlockedResult(renamePlan.Resolution, oldPath, newPath));
+        }
+
+        if (!TryValidateHeadlessFileRenameAvailability(oldPath, out var availabilityFailure))
+        {
+            return Task.FromResult<RdRenameFileResult?>(
+                MutationVerificationService
+                    .Unsupported(availabilityFailure)
+                    .ToRenameFileResult(oldPath, newPath));
+        }
+
+        RdRenameFileResult? result = null;
+        return ExecuteWriteLockedRename(outerLifetime, () => { result = ExecuteRenameFile(renamePlan); })
+            .ContinueWith<RdRenameFileResult?>(task =>
+            {
+                if (!task.IsFaulted)
+                    return result;
+
+                var exception = task.Exception?.GetBaseException();
+                return MutationVerificationService
+                    .Blocked(
+                        exception == null
+                            ? "ReSharper backend file rename failed while acquiring/executing the write lock."
+                            : $"ReSharper backend file rename failed while acquiring/executing the write lock: {exception.GetType().Name}: {exception.Message}")
+                    .ToRenameFileResult(oldPath, newPath);
+            });
+    }
+
+    private Task<RdMoveFileResult?> HandleMoveFile(Lifetime lt, RdMoveFileRequest request)
+    {
+        OuterLifetime outerLifetime = lt;
+        var oldPath = request.FilePath;
+        var currentDirectory = Path.GetDirectoryName(oldPath);
+        var newPath = CombinePath(request.DestinationDirectory, Path.GetFileName(oldPath));
+        var movePlan = MoveMutationPlanner.PlanSemanticMove(request.FilePath, request.DestinationDirectory);
+
+        if (PathsEqual(currentDirectory, request.DestinationDirectory))
+        {
+            return Task.FromResult<RdMoveFileResult?>(
+                MutationVerificationService
+                    .NoOp("File move refused because the destination directory already matches the current location (no-op move).")
+                    .ToMoveFileResult(oldPath, oldPath));
+        }
+
+        if (!movePlan.CanProceed)
+            return Task.FromResult<RdMoveFileResult?>(ToMoveBlockedResult(movePlan.Resolution, oldPath, newPath));
+
+        RdMoveFileResult? result = null;
+        return ExecuteWriteLockedRename(outerLifetime, () => { result = ExecuteMoveFile(movePlan); })
+            .ContinueWith<RdMoveFileResult?>(task =>
+            {
+                if (!task.IsFaulted)
+                    return result;
+
+                var exception = task.Exception?.GetBaseException();
+                return MutationVerificationService
+                    .Blocked(
+                        exception == null
+                            ? "ReSharper backend semantic move failed while acquiring/executing the write lock."
+                            : $"ReSharper backend semantic move failed while acquiring/executing the write lock: {exception.GetType().Name}: {exception.Message}")
+                    .ToMoveFileResult(oldPath, newPath);
+            });
+    }
+
+    private static string CombinePath(string? directory, string fileName)
+        => string.IsNullOrWhiteSpace(directory)
+            ? fileName
+            : Path.Combine(directory, fileName);
+
+    private RdRenameFileResult ExecuteRenameFile(RenameMutationPlan renamePlan)
+    {
+        var oldPath = renamePlan.OldPath!;
+        var newPath = renamePlan.NewPath!;
+
+        if (!TryValidateHeadlessFileRenameAvailability(oldPath, out var availabilityFailure))
+        {
+            return MutationVerificationService
+                .Unsupported(availabilityFailure)
+                .ToRenameFileResult(oldPath, newPath);
+        }
+
+        var projectFile = GetProjectFileForPath(oldPath);
+        if (projectFile == null)
+        {
+            return MutationVerificationService
+                .Blocked($"Rider file rename resolved '{oldPath}', but the backend could not bind it to a project file for RenameDataProvider/RenameWorkflow execution. No files were modified.")
+                .ToRenameFileResult(oldPath, newPath);
+        }
+
+        var expectedNamespace = FileMutationSemantics.TryReadNamespaceOrDefault(oldPath, projectFile.Location.FullPath);
+
+        try
+        {
+            var workflowMessage = TryExecuteDrivenFileRename(projectFile, renamePlan.NewPath!);
+            if (!string.IsNullOrWhiteSpace(workflowMessage))
+            {
+                return MutationVerificationService
+                    .Unsupported(workflowMessage)
+                    .ToRenameFileResult(oldPath, newPath);
+            }
+
+            if (File.Exists(oldPath) || !File.Exists(newPath))
+            {
+                return MutationVerificationService
+                    .VerificationFailed(
+                        new[] { oldPath, newPath },
+                        File.Exists(newPath) ? 1 : 0,
+                        "Rider file rename workflow reported completion, but the on-disk file path transition could not be confirmed.",
+                        new[] { "rename_execution", "file_path_transition" },
+                        "expected the old path to disappear and the new path to exist after the workflow finished")
+                    .ToRenameFileResult(oldPath, newPath);
+            }
+
+            var declaredTypeNames = RenameMutationPlanner.ReadDeclaredTypeNames(newPath);
+            var semanticEvidence = CollectFileMutationSemanticEvidence(newPath, declaredTypeNames);
+
+            return MutationVerificationService
+                .ConfirmSemanticFileMutationProofWithEvidence(
+                    newPath,
+                    projectFile.Location.FullPath,
+                    expectedNamespace,
+                    semanticEvidence.ConfirmedAffectedFiles,
+                    semanticEvidence.ConfirmedReferenceFiles,
+                    declaredTypeNames,
+                    semanticEvidence,
+                    "Renamed the file through the Rider RenameDataProvider/RenameWorkflow lane and confirmed the file-scoped mutation path.")
+                .ToRenameFileResult(oldPath, newPath);
+        }
+        catch (Exception ex)
+        {
+            return MutationVerificationService
+                .Blocked($"Rider file rename workflow failed: {ex.GetType().Name}: {ex.Message}")
+                .ToRenameFileResult(oldPath, newPath);
+        }
+    }
+
+    private RdMoveFileResult ExecuteMoveFile(MoveMutationPlan movePlan)
+    {
+        var oldPath = movePlan.OldPath!;
+        var newPath = movePlan.NewPath!;
+
+        if (!TryValidateHeadlessMoveAvailability(oldPath, out var availabilityFailure))
+        {
+            return MutationVerificationService
+                .Unsupported(availabilityFailure)
+                .ToMoveFileResult(oldPath, newPath);
+        }
+
+        var projectFile = GetProjectFileForPath(oldPath);
+        if (projectFile == null)
+        {
+            return MutationVerificationService
+                .Blocked($"Rider file move resolved '{oldPath}', but the backend could not bind it to a project file for MoveToFolderWorkflow execution. No files were modified.")
+                .ToMoveFileResult(oldPath, newPath);
+        }
+
+        var projectFilePath = GetContainingProjectFilePath(projectFile);
+        var expectedNamespace = string.IsNullOrWhiteSpace(projectFilePath)
+            ? null
+            : FileMutationSemantics.TryComputeMovedNamespaceFromProjectFile(
+                oldPath,
+                Path.GetDirectoryName(newPath) ?? string.Empty,
+                FileMutationSemantics.TryReadNamespaceOrDefault(oldPath, projectFilePath) ?? string.Empty,
+                projectFilePath);
+
+        try
+        {
+            var workflowMessage = TryExecuteDrivenFileMove(projectFile, newPath);
+            if (!string.IsNullOrWhiteSpace(workflowMessage))
+            {
+                return MutationVerificationService
+                    .Unsupported(workflowMessage)
+                    .ToMoveFileResult(oldPath, newPath);
+            }
+
+            if (File.Exists(oldPath) || !File.Exists(newPath))
+            {
+                return MutationVerificationService
+                    .VerificationFailed(
+                        new[] { oldPath, newPath },
+                        File.Exists(newPath) ? 1 : 0,
+                        "Rider MoveToFolder workflow reported completion, but the on-disk file path transition could not be confirmed.",
+                        new[] { "move_execution", "file_path_transition" },
+                        "expected the old path to disappear and the new path to exist after the workflow finished")
+                    .ToMoveFileResult(oldPath, newPath);
+            }
+
+            var declaredTypeNames = RenameMutationPlanner.ReadDeclaredTypeNames(newPath);
+            var semanticEvidence = CollectFileMutationSemanticEvidence(newPath, declaredTypeNames);
+            var referenceTokens = new List<string>();
+            if (!string.IsNullOrWhiteSpace(expectedNamespace))
+                referenceTokens.Add($"using {expectedNamespace};");
+            referenceTokens.AddRange(declaredTypeNames);
+
+            return MutationVerificationService
+                .ConfirmSemanticFileMutationProofWithEvidence(
+                    newPath,
+                    projectFilePath ?? string.Empty,
+                    expectedNamespace,
+                    semanticEvidence.ConfirmedAffectedFiles,
+                    semanticEvidence.ConfirmedReferenceFiles,
+                    referenceTokens,
+                    semanticEvidence,
+                    "Moved the file through the Rider MoveToFolderWorkflow lane and confirmed the file-path transition.")
+                .ToMoveFileResult(oldPath, newPath);
+        }
+        catch (Exception ex)
+        {
+            return MutationVerificationService
+                .Blocked($"Rider MoveToFolder workflow failed: {ex.GetType().Name}: {ex.Message}")
+                .ToMoveFileResult(oldPath, newPath);
+        }
+    }
+
+    private Task<RdSafeDeleteResult?> HandleSafeDelete(Lifetime lt, RdSafeDeleteRequest request)
+    {
+        OuterLifetime outerLifetime = lt;
+        var targetFilePath = request.Target.FilePath;
+        if (string.IsNullOrWhiteSpace(targetFilePath) || !request.Target.Line.HasValue || !request.Target.Column.HasValue)
+        {
+            return Task.FromResult<RdSafeDeleteResult?>(
+                MutationVerificationService
+                    .Unsupported("Rider safe delete requires a file/line/column target in the backend mutation lane.")
+                    .ToSafeDeleteResult());
+        }
+
+        RdSafeDeleteResult? result = null;
+        return ExecuteWriteLockedRename(outerLifetime, () =>
+            {
+                result = string.Equals(request.TargetType, "file", StringComparison.OrdinalIgnoreCase)
+                    ? SafeDeleteMutationExecutor.ExecuteFileSafeDelete(targetFilePath, request.Force)
+                    : SafeDeleteMutationExecutor.ExecuteSafeDelete(
+                        targetFilePath,
+                        request.Target.Line.Value,
+                        request.Target.Column.Value,
+                        request.Target.Symbol ?? string.Empty,
+                        request.Force);
+            })
+            .ContinueWith<RdSafeDeleteResult?>(task =>
+            {
+                if (!task.IsFaulted)
+                    return result;
+
+                var exception = task.Exception?.GetBaseException();
+                return MutationVerificationService
+                    .Blocked(
+                        exception == null
+                            ? "ReSharper backend safe delete failed while acquiring/executing the write lock."
+                            : $"ReSharper backend safe delete failed while acquiring/executing the write lock: {exception.GetType().Name}: {exception.Message}")
+                    .ToSafeDeleteResult();
+            });
+    }
+
+    private RdRenameSymbolResult ToRenameBlockedResult(ExactTargetResolution resolution, string newName)
+    {
+        var outcome = string.Equals(resolution.Status, MutationResolutionStatuses.Unsupported, StringComparison.OrdinalIgnoreCase)
+            ? MutationVerificationService.Unsupported(AppendSymbolRenameDiagnostics(
+                resolution.Message ?? "Exact symbol rename was rejected before mutation.",
+                resolution,
+                executionHint: "frontend_editor_backed_exact_target_only",
+                unsupportedReason: ClassifyExactTargetUnsupportedReason(resolution),
+                "plan.end",
+                "plan.blocked"))
+            : MutationVerificationService.Blocked(AppendSymbolRenameDiagnostics(
+                resolution.Message ?? "Exact symbol rename was rejected before mutation.",
+                resolution,
+                executionHint: "frontend_editor_backed_exact_target_only",
+                unsupportedReason: ClassifyExactTargetUnsupportedReason(resolution),
+                "plan.end",
+                "plan.blocked"));
+        return outcome.ToRenameSymbolResult(resolution.ResolvedName ?? string.Empty, newName);
+    }
+
+    private static string AppendSymbolRenameDiagnostics(
+        string message,
+        ExactTargetResolution resolution,
+        string executionHint,
+        string unsupportedReason,
+        params string[] traceStages)
+    {
+        var diagnostics = new List<string>
+        {
+            $"resolutionStatus={resolution.Status}",
+            $"targetKind={resolution.TargetKind ?? "<null>"}",
+            $"resolvedName={resolution.ResolvedName ?? "<null>"}",
+            $"sourceTokenText={resolution.SourceTokenText ?? "<null>"}",
+            $"executionHint={executionHint}",
+            $"unsupportedReason={unsupportedReason}",
+            $"traceStages={string.Join(">", traceStages.Where(stage => !string.IsNullOrWhiteSpace(stage)).Distinct(StringComparer.Ordinal))}"
+        };
+
+        return $"{message} [backendSymbolRename: {string.Join(", ", diagnostics)}]";
+    }
+
+    private static string ClassifyExactTargetUnsupportedReason(ExactTargetResolution resolution)
+    {
+        return resolution.Status switch
+        {
+            MutationResolutionStatuses.Mismatch => "requested_symbol_mismatch",
+            MutationResolutionStatuses.Ambiguous => "exact_target_ambiguous",
+            MutationResolutionStatuses.Unsupported => "exact_target_unsupported",
+            _ => "exact_target_rejected"
+        };
+    }
+
+    private RdRenameFileResult ToRenameFileBlockedResult(ExactTargetResolution resolution, string oldPath, string newPath)
+    {
+        var outcome = string.Equals(resolution.Status, MutationResolutionStatuses.Unsupported, StringComparison.OrdinalIgnoreCase)
+            ? MutationVerificationService.Unsupported(resolution.Message ?? "Exact file rename was rejected before mutation.")
+            : MutationVerificationService.Blocked(resolution.Message ?? "Exact file rename was rejected before mutation.");
+        return outcome.ToRenameFileResult(oldPath, newPath);
+    }
+
+    private RdMoveFileResult ToMoveBlockedResult(ExactTargetResolution resolution, string oldPath, string newPath)
+    {
+        var outcome = string.Equals(resolution.Status, MutationResolutionStatuses.Unsupported, StringComparison.OrdinalIgnoreCase)
+            ? MutationVerificationService.Unsupported(resolution.Message ?? "Semantic move was rejected before mutation.")
+            : MutationVerificationService.Blocked(resolution.Message ?? "Semantic move was rejected before mutation.");
+        return outcome.ToMoveFileResult(oldPath, newPath);
+    }
+
+    private static bool PathsEqual(string? left, string? right)
+        => string.Equals(
+            TrimDirectorySeparator(left),
+            TrimDirectorySeparator(right),
+            StringComparison.OrdinalIgnoreCase);
+
+    private static string? TrimDirectorySeparator(string? path)
+        => string.IsNullOrWhiteSpace(path)
+            ? path
+            : path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+    private bool TryValidateHeadlessFileRenameAvailability(string filePath, out string failureMessage)
+    {
+        if (_solution == null || _shellLocks == null || _renameRefactoringService == null)
+        {
+            failureMessage = "File rename is fail-closed because the Rider RenameRefactoringService workflow is unavailable in this headless context. The backend will not fall back to symbol rename, token targeting, or raw filesystem rename.";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+        {
+            failureMessage = $"File rename is fail-closed because '{filePath}' is unavailable for workflow-backed execution.";
+            return false;
+        }
+
+        failureMessage = string.Empty;
+        return true;
+    }
+
+    private RenameExecutionAttempt TryExecuteDrivenRename(
         IDeclaredElement element,
-        string newName)
+        string newName,
+        object? preAcquiredTextControl,
+        RenameTraceContext? trace = null)
+    {
+        LogRenameInfo(trace, "service-rename.start", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, element={DescribeElement(element)}, newName={newName}");
+
+        try
+        {
+            var targetTextControl = preAcquiredTextControl;
+            LogRenameInfo(trace,
+                "service-rename.text-control.reuse",
+                $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, found={targetTextControl != null}, description={DescribeReflectedTextControl(targetTextControl)}");
+
+            if (targetTextControl != null)
+            {
+                LogRenameInfo(trace,
+                    "service-rename.text-control.found",
+                    $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, description={DescribeReflectedTextControl(targetTextControl)}");
+
+                var textControlRename = TraceRenameStage(trace, "service-rename.text-control.rename",
+                    () => TryExecuteTextControlRename(element, newName, targetTextControl),
+                    result => $"succeeded={result.Succeeded}, unsupported={result.IsUnsupported}, message={result.Message}");
+
+                if (textControlRename.Succeeded)
+                {
+                    LogRenameInfo(trace,
+                        "service-rename.text-control.success",
+                        $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, message={textControlRename.Message}");
+                    return textControlRename;
+                }
+
+                LogRenameWarning(trace,
+                    $"stage=service-rename.text-control.rename, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, message={textControlRename.Message}");
+            }
+            else
+            {
+                LogRenameInfo(trace,
+                    "service-rename.text-control.missing",
+                    $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, fallingBack=true");
+            }
+
+            var plan = TraceRenameStage(trace, "service-rename.inspect", InspectSymbolRenameServiceExecutionPlan,
+                inspectedPlan =>
+                    $"supported={inspectedPlan.IsSupported}, selectedMethod={inspectedPlan.SelectedMethodSignature ?? "<none>"}, requiresTextControl={inspectedPlan.RequiresTextControl}, availableMethods={string.Join(" || ", inspectedPlan.AvailableMethodSignatures)}");
+
+            if (!plan.IsSupported)
+            {
+                LogRenameWarning(trace,
+                    $"stage=service-rename.failure, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, message={plan.Message}");
+                return RenameExecutionAttempt.Unsupported(plan.Message);
+            }
+
+            if (plan.RequiresTextControl)
+            {
+                LogRenameWarning(trace,
+                    $"stage=service-rename.failure, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, message={plan.Message}");
+                return RenameExecutionAttempt.Unsupported(plan.Message);
+            }
+
+            LogRenameWarning(trace,
+                $"stage=service-rename.failure, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, message={plan.Message}");
+            return RenameExecutionAttempt.Unsupported(plan.Message);
+        }
+        catch (Exception ex)
+        {
+            LogRenameWarning(trace,
+                $"stage=service-rename.failure, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, exception={ex}");
+            return RenameExecutionAttempt.Unsupported(
+                $"Symbol rename is fail-closed because RenameRefactoringService inspection failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private object? TryFindTextControlForElement(IDeclaredElement element)
     {
         try
         {
+            var declaration = element.GetDeclarations().FirstOrDefault();
+            var document = declaration?.GetSourceFile()?.Document;
+            if (document == null)
+                return null;
+
+            var textControlManagerType = TryResolveRuntimeType("JetBrains.TextControl.ITextControlManager");
+            if (textControlManagerType == null)
+                return null;
+
+            var textControlManager = TryGetRuntimeComponent(textControlManagerType);
+            if (textControlManager == null)
+                return null;
+
+            return TryFindTextControlForDocument(textControlManagerType, textControlManager, document, null);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private object? TryAcquireTextControlBeforeWriteLock(RdRenameSymbolRequest request, RenameTraceContext? trace)
+    {
+        try
+        {
+            var renamePlan = RenameMutationPlanner.PlanExactSymbolRename(
+                request.Position.FilePath,
+                request.Position.Line,
+                request.Position.Column);
+            if (!renamePlan.CanProceed)
+            {
+                LogRenameInfo(trace,
+                    "service-rename.text-control.prewrite-skip",
+                    $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, reason=plan-blocked, resolutionStatus={renamePlan.Resolution.Status}");
+                return null;
+            }
+
+            var localDeclarationNode = ResolveExactDeclarationNodeAt(
+                request.Position,
+                renamePlan.Resolution.ResolvedName!,
+                renamePlan.Resolution.TargetKind);
+            if (localDeclarationNode == null || !TryGetDeclaredElement(localDeclarationNode, out var element))
+            {
+                LogRenameInfo(trace,
+                    "service-rename.text-control.prewrite-skip",
+                    $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, reason=element-unresolved");
+                return null;
+            }
+
+            return TryFindTextControlForElement(element, trace);
+        }
+        catch (Exception ex)
+        {
+            LogRenameWarning(trace,
+                $"stage=service-rename.text-control.prewrite-acquire, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, exception={ex.GetType().FullName}: {ex.Message}");
+            return null;
+        }
+    }
+
+    private object? TryFindTextControlForElement(IDeclaredElement element, RenameTraceContext? trace)
+    {
+        try
+        {
+            var declaration = element.GetDeclarations().FirstOrDefault();
+            var document = declaration?.GetSourceFile()?.Document;
+            if (document == null)
+            {
+                LogRenameInfo(trace,
+                    "service-rename.text-control.poll.summary",
+                    $"attempts=0, found=false, elapsedMs=0, reason=document-missing");
+                return null;
+            }
+
+            var textControlManagerType = TryResolveRuntimeType("JetBrains.TextControl.ITextControlManager");
+            if (textControlManagerType == null)
+            {
+                LogRenameInfo(trace,
+                    "service-rename.text-control.poll.summary",
+                    $"attempts=0, found=false, elapsedMs=0, reason=text-control-manager-type-missing");
+                return null;
+            }
+
+            var textControlManager = TryGetRuntimeComponent(textControlManagerType);
+            if (textControlManager == null)
+            {
+                LogRenameInfo(trace,
+                    "service-rename.text-control.poll.summary",
+                    $"attempts=0, found=false, elapsedMs=0, reason=text-control-manager-missing");
+                return null;
+            }
+
+            return TryFindTextControlForDocument(textControlManagerType, textControlManager, document, trace);
+        }
+        catch (Exception ex)
+        {
+            LogRenameWarning(trace,
+                $"stage=service-rename.text-control.poll, exception={ex.GetType().FullName}: {ex.Message}");
+            return null;
+        }
+    }
+
+    private object? TryFindTextControlForDocument(Type textControlManagerType, object textControlManager, object document, RenameTraceContext? trace)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var attempts = 0;
+
+        while (true)
+        {
+            attempts++;
+            var textControl = TryEnumerateMatchingTextControl(textControlManagerType, textControlManager, document);
+            var found = textControl != null;
+            LogRenameInfo(trace,
+                "service-rename.text-control.poll.attempt",
+                $"attempt={attempts}, found={found}, elapsedMs={stopwatch.ElapsedMilliseconds}");
+
+            if (found)
+            {
+                LogRenameInfo(trace,
+                    "service-rename.text-control.poll.summary",
+                    $"attempts={attempts}, found=true, elapsedMs={stopwatch.ElapsedMilliseconds}");
+                return textControl;
+            }
+
+            if (stopwatch.ElapsedMilliseconds >= TextControlPollTimeoutMs)
+            {
+                LogRenameInfo(trace,
+                    "service-rename.text-control.poll.summary",
+                    $"attempts={attempts}, found=false, elapsedMs={stopwatch.ElapsedMilliseconds}");
+                return null;
+            }
+
+            Thread.Sleep(TextControlPollIntervalMs);
+        }
+    }
+
+    private static object? TryEnumerateMatchingTextControl(Type textControlManagerType, object textControlManager, object document)
+    {
+        var textControlsProperty = textControlManagerType.GetProperty("TextControls", BindingFlags.Public | BindingFlags.Instance);
+        if (textControlsProperty?.GetValue(textControlManager) is not IEnumerable textControls)
+            return null;
+
+        foreach (var textControl in textControls)
+        {
+            if (textControl == null)
+                continue;
+
+            var candidateDocument = textControl.GetType().GetProperty("Document", BindingFlags.Public | BindingFlags.Instance)?.GetValue(textControl);
+            if (ReferenceEquals(candidateDocument, document) || Equals(candidateDocument, document))
+                return textControl;
+        }
+
+        return null;
+    }
+
+    private RenameExecutionAttempt TryExecuteTextControlRename(IDeclaredElement element, string newName, object targetTextControl)
+    {
+        try
+        {
+            var declaration = element.GetDeclarations().FirstOrDefault();
+            if (declaration == null)
+                return RenameExecutionAttempt.Unsupported("No declaration was available for ITextControl-backed rename execution.");
+
+            var caret = targetTextControl.GetType().GetProperty("Caret", BindingFlags.Public | BindingFlags.Instance)?.GetValue(targetTextControl);
+            if (caret == null)
+                return RenameExecutionAttempt.Unsupported("The matched ITextControl does not expose a caret required for rename positioning.");
+
+            var moveToMethod = caret.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(method =>
+                {
+                    if (!string.Equals(method.Name, "MoveTo", StringComparison.Ordinal))
+                        return false;
+
+                    var parameters = method.GetParameters();
+                    return parameters.Length == 2 &&
+                           parameters[0].ParameterType == typeof(int) &&
+                           string.Equals(parameters[1].ParameterType.FullName, "JetBrains.TextControl.CaretVisualPlacement", StringComparison.Ordinal);
+                });
+
+            if (moveToMethod == null)
+                return RenameExecutionAttempt.Unsupported("The matched ITextControl caret does not expose MoveTo(int, CaretVisualPlacement).");
+
+            var placementType = moveToMethod.GetParameters()[1].ParameterType;
+            var dontScrollIfVisible = Enum.Parse(placementType, "DontScrollIfVisible");
+            var offset = declaration.GetNavigationRange().StartOffset.Offset;
+            moveToMethod.Invoke(caret, new[] { (object)offset, dontScrollIfVisible });
+
             var dataProvider = new RenameDataProvider(element, newName);
-            SetRuntimeProperty(dataProvider, "CanBeLocal", false);
+            var renameMethod = typeof(RenameRefactoringService)
+                .GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance)
+                .FirstOrDefault(method =>
+                {
+                    if (!string.Equals(method.Name, "Rename", StringComparison.Ordinal) || method.IsGenericMethodDefinition)
+                        return false;
 
-            var model = new CustomRenameModel();
-            SetRuntimeProperty(model, "HasUI", false);
-            SetRuntimeProperty(model, "QuickRename", false);
-            SetRuntimeProperty(model, "CreateRenameConfirmationPage", false);
-            SetRuntimeProperty(model, "ChangeTextOccurrences", false);
-            SetRuntimeProperty(model, "RenameDerived", true);
-            SetRuntimeProperty(model, "Bulk", false);
-            SetRuntimeProperty(dataProvider, "Model", model);
+                    var parameters = method.GetParameters();
+                    return parameters.Length == 3 &&
+                           parameters[0].ParameterType == typeof(ISolution) &&
+                           typeof(RenameDataProvider).IsAssignableFrom(parameters[1].ParameterType) &&
+                           string.Equals(parameters[2].ParameterType.FullName, "JetBrains.TextControl.ITextControl", StringComparison.Ordinal);
+                });
 
-            var driver = ExecuteRenameWorkflow(element, dataProvider);
+            if (renameMethod == null)
+                return RenameExecutionAttempt.Unsupported("RenameRefactoringService.Rename(solution, provider, textControl) is unavailable in this Rider runtime.");
 
+            var renameTarget = renameMethod.IsStatic ? null : _renameRefactoringService;
+            var renameResult = renameMethod.Invoke(renameTarget, new[] { (object)_solution, dataProvider, targetTextControl });
+            return RenameExecutionAttempt.Success($"ITextControl-backed RenameRefactoringService invocation completed using {FormatMethodSignature(renameMethod)} (result={(renameResult == null ? "<null>" : renameResult.ToString())}).");
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException != null)
+        {
+            return RenameExecutionAttempt.Unsupported($"ITextControl-backed rename threw {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
+        }
+        catch (Exception ex)
+        {
+            return RenameExecutionAttempt.Unsupported($"ITextControl-backed rename failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private object? TryGetRuntimeComponent(Type componentType)
+    {
+        var component = TryGetRuntimeComponent(_solution, componentType);
+        return component ?? TryGetRuntimeComponent(Shell.Instance, componentType);
+    }
+
+    private static object? TryGetRuntimeComponent(object host, Type componentType)
+    {
+        try
+        {
+            var getComponentMethod = host.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(method =>
+                    string.Equals(method.Name, "GetComponent", StringComparison.Ordinal) &&
+                    method.IsGenericMethodDefinition &&
+                    method.GetParameters().Length == 0);
+
+            return getComponentMethod?.MakeGenericMethod(componentType).Invoke(host, Array.Empty<object>());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static Type? TryResolveRuntimeType(string fullName)
+    {
+        return Type.GetType(fullName)
+               ?? AppDomain.CurrentDomain.GetAssemblies()
+                   .Select(assembly => assembly.GetType(fullName, false))
+                   .FirstOrDefault(type => type != null);
+    }
+
+    private static string DescribeReflectedTextControl(object? textControl)
+    {
+        if (textControl == null)
+            return "<null>";
+
+        try
+        {
+            var document = textControl.GetType().GetProperty("Document", BindingFlags.Public | BindingFlags.Instance)?.GetValue(textControl);
+            var documentPath = document?.GetType().GetProperty("Moniker", BindingFlags.Public | BindingFlags.Instance)?.GetValue(document) as string;
+            return $"type={textControl.GetType().FullName}, document={documentPath ?? "<unknown>"}";
+        }
+        catch
+        {
+            return $"type={textControl.GetType().FullName}";
+        }
+    }
+
+    private static RenameServiceExecutionPlan InspectSymbolRenameServiceExecutionPlan()
+    {
+        var renameMethods = typeof(RenameRefactoringService)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)
+            .Where(method => method.Name.StartsWith("Rename", StringComparison.Ordinal))
+            .OrderBy(method => method.Name, StringComparer.Ordinal)
+            .ThenBy(method => method.GetParameters().Length)
+            .ToList();
+
+        var signatures = renameMethods
+            .Select(FormatMethodSignature)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var selectedMethod = renameMethods.FirstOrDefault(MethodRequiresTextControl);
+        var documentedMethod = renameMethods.FirstOrDefault(method =>
+            string.Equals(method.Name, "RenameAndGetConflicts", StringComparison.Ordinal) && MethodRequiresTextControl(method));
+
+        var message =
+            "Symbol rename is fail-closed in this Rider runtime. " +
+            $"RenameRefactoringService exposes: {string.Join(" || ", signatures)}. " +
+            $"The documented service lane is {(documentedMethod == null ? "not discoverable" : "bound to '" + FormatMethodSignature(documentedMethod) + "'")}, " +
+            "which still requires JetBrains.TextControl.ITextControl. " +
+            "No public headless service overload or custom host entry point analogous to the existing MoveToFolderWorkflow + SimpleWorkflowHost lane was confirmed for symbol rename. " +
+            "The backend will not fall back to manual RenameWorkflow.Initialize because runtime trace evidence showed it hangs after 'workflow.construct.end' and never reaches 'workflow.initialize.end'. No files were modified.";
+
+        return RenameServiceExecutionPlan.Unsupported(
+            selectedMethod == null ? null : FormatMethodSignature(selectedMethod),
+            selectedMethod != null,
+            signatures,
+            message);
+    }
+
+    private static bool MethodRequiresTextControl(MethodInfo method)
+        => method.GetParameters().Any(parameter =>
+            string.Equals(parameter.ParameterType.FullName, "JetBrains.TextControl.ITextControl", StringComparison.Ordinal));
+
+    private static string FormatMethodSignature(MethodInfo method)
+    {
+        var parameters = method.GetParameters()
+            .Select(parameter => $"{parameter.ParameterType.FullName ?? parameter.ParameterType.Name} {parameter.Name}");
+        return $"{method.ReturnType.FullName ?? method.ReturnType.Name} {method.Name}({string.Join(", ", parameters)})";
+    }
+
+    private string? TryExecuteDrivenFileRename(IProjectFile projectFile, string newPath)
+    {
+        try
+        {
+            var newName = Path.GetFileName(newPath);
+            if (string.IsNullOrWhiteSpace(newName))
+                return "Rider file rename rejected the requested destination because the new file name was empty.";
+
+            var dataProvider = CreateRuntimeFileRenameDataProvider(projectFile, newName, out var providerFailure);
+            if (dataProvider == null)
+                return providerFailure;
+
+            var driver = ExecuteRenameWorkflow(dataProvider, lifetime => CreateFileRenameDataContext(projectFile, dataProvider, lifetime));
             var conflicts = driver.Conflicts.ToList();
             if (conflicts.Count > 0)
                 return string.Join("; ", conflicts.Select(conflict => conflict.Description).Where(description => !string.IsNullOrWhiteSpace(description)));
@@ -611,56 +1731,67 @@ public class IndexMcpBackendHost
         }
         catch (TargetInvocationException ex) when (ex.InnerException != null)
         {
-            var stack = ex.InnerException.StackTrace?.Split(new[] { Environment.NewLine }, StringSplitOptions.None)
-                .Take(6);
-            var stackText = stack == null ? "" : $" Stack: {string.Join(" | ", stack)}";
-            return $"ReSharper driven rename failed: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}{stackText}";
+            return $"Rider file rename workflow failed: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}";
         }
         catch (Exception ex)
         {
-            var stack = ex.StackTrace?.Split(new[] { Environment.NewLine }, StringSplitOptions.None)
-                .Take(8);
-            var stackText = stack == null ? "" : $" Stack: {string.Join(" | ", stack)}";
-            return $"ReSharper driven rename failed: {ex.GetType().Name}: {ex.Message}{stackText}";
+            return $"Rider file rename workflow failed: {ex.GetType().Name}: {ex.Message}";
         }
     }
 
     private RefactoringDriverWithConflicts ExecuteRenameWorkflow(
         IDeclaredElement element,
-        RenameDataProvider dataProvider)
+        RenameDataProvider dataProvider,
+        RenameTraceContext? trace = null)
+        => ExecuteRenameWorkflow(dataProvider, lifetimeDefinition => CreateRenameDataContext(element, dataProvider, lifetimeDefinition), trace);
+
+    private RefactoringDriverWithConflicts ExecuteRenameWorkflow(
+        RenameDataProvider dataProvider,
+        Func<LifetimeDefinition, IDataContext> dataContextFactory,
+        RenameTraceContext? trace = null)
     {
         using var lifetimeDefinition = Lifetime.Define(_solution.GetSolutionLifetimes().UntilSolutionCloseLifetime);
         using var compilationContext = CompilationContextCookie.GetExplicitUniversalContextIfNotSet();
-        var dataContext = CreateRenameDataContext(element, dataProvider, lifetimeDefinition);
-        var workflow = new RenameWorkflow(_solution, "Index MCP Rider rename")
+        var dataContext = TraceRenameStage(trace, "workflow.data-context", () => dataContextFactory(lifetimeDefinition));
+        var workflow = TraceRenameStage(trace, "workflow.construct", () =>
         {
-            EventBus = Shell.Instance.GetComponent<IEventBus>(),
-            WorkflowExecuterLifetime = lifetimeDefinition.Lifetime
-        };
+            return new RenameWorkflow(_solution, "Index MCP Rider rename")
+            {
+                EventBus = Shell.Instance.GetComponent<IEventBus>(),
+                WorkflowExecuterLifetime = lifetimeDefinition.Lifetime
+            };
+        }, createdWorkflow => $"workflowType={createdWorkflow.GetType().FullName}");
 
-        if (!workflow.Initialize(dataContext))
+        var initialized = TraceRenameStage(trace, "workflow.initialize", () => workflow.Initialize(dataContext), initialized => $"initialized={initialized}");
+        if (!initialized)
             throw new InvalidOperationException("ReSharper rename workflow is not available for the selected symbol.");
 
-        ProcessWorkflowPages(workflow);
+        TraceRenameStage(trace, "workflow.pages", () => ProcessWorkflowPages(workflow));
 
         var driver = new RefactoringDriverWithConflicts(new RefactoringDriverStorage());
-        var executer = workflow.CreateRefactoring(driver)
-                       ?? throw new InvalidOperationException("ReSharper rename workflow did not create a refactoring executer.");
+        var executer = TraceRenameStage(trace, "workflow.create-refactoring", () =>
+                workflow.CreateRefactoring(driver)
+                ?? throw new InvalidOperationException("ReSharper rename workflow did not create a refactoring executer."),
+            createdExecuter => $"executerType={createdExecuter.GetType().FullName}");
 
-        if (!workflow.PreExecute(NoOpProgressIndicator.Instance))
+        var preExecuted = TraceRenameStage(trace, "workflow.pre-execute", () => workflow.PreExecute(NoOpProgressIndicator.Instance), executed => $"preExecute={executed}");
+        if (!preExecuted)
             throw new InvalidOperationException("ReSharper rename workflow PreExecute returned false.");
 
-        var executed = PsiTransactionCookie.ExecuteConditionally(
-            _solution.GetPsiServices(),
-            () => executer.Execute(NoOpProgressIndicator.Instance),
-            "Index MCP Rider rename");
+        var executed = TraceRenameStage(trace, "workflow.execute", () =>
+                PsiTransactionCookie.ExecuteConditionally(
+                    _solution.GetPsiServices(),
+                    () => executer.Execute(NoOpProgressIndicator.Instance),
+                    "Index MCP Rider rename"),
+            executeResult => $"executed={executeResult}");
         if (!executed)
             throw new InvalidOperationException("ReSharper rename workflow Execute returned false.");
 
-        if (!workflow.PostExecute(NoOpProgressIndicator.Instance))
+        var postExecuted = TraceRenameStage(trace, "workflow.post-execute", () => workflow.PostExecute(NoOpProgressIndicator.Instance), executed => $"postExecute={executed}");
+        if (!postExecuted)
             throw new InvalidOperationException("ReSharper rename workflow PostExecute returned false.");
 
-        workflow.SuccessfulFinish(NoOpProgressIndicator.Instance);
+        TraceRenameStage(trace, "workflow.successful-finish", () => workflow.SuccessfulFinish(NoOpProgressIndicator.Instance));
         return driver;
     }
 
@@ -675,6 +1806,145 @@ public class IndexMcpBackendHost
             .AddRule("IndexMcpRename", ProjectModelDataConstants.SOLUTION, _solution)
             .AddRule("IndexMcpRename", RenameRefactoringService.RenameDataProvider, dataProvider);
         return _solution.GetComponent<DataContexts>().CreateWithDataRules(lifetimeDefinition.Lifetime, rules);
+    }
+
+    private IDataContext CreateFileRenameDataContext(
+        IProjectFile projectFile,
+        RenameDataProvider dataProvider,
+        LifetimeDefinition lifetimeDefinition)
+    {
+        var rules = DataRules
+            .AddRule("IndexMcpRenameFile", ProjectModelDataConstants.SOLUTION, _solution)
+            .AddRule("IndexMcpRenameFile", RenameRefactoringService.RenameDataProvider, dataProvider);
+        return _solution.GetComponent<DataContexts>().CreateWithDataRules(lifetimeDefinition.Lifetime, rules);
+    }
+
+    private RenameDataProvider? CreateRuntimeFileRenameDataProvider(IProjectFile projectFile, string newName, out string failureMessage)
+    {
+        failureMessage = string.Empty;
+
+        RenameDataProvider dataProvider;
+        try
+        {
+            dataProvider = new RenameDataProvider(newName);
+        }
+        catch (Exception ex)
+        {
+            failureMessage = $"File rename is fail-closed because RenameDataProvider(newName) is unavailable in this Rider runtime: {ex.GetType().Name}: {ex.Message}";
+            return null;
+        }
+
+        try
+        {
+            SetRuntimeProperty(dataProvider, "RenameTarget", projectFile);
+            SetRuntimeProperty(dataProvider, "CanBeLocal", false);
+        }
+        catch (Exception ex)
+        {
+            failureMessage = $"File rename is fail-closed because the Rider runtime could not bind the project file target to RenameDataProvider: {ex.GetType().Name}: {ex.Message}";
+            return null;
+        }
+
+        object model;
+        try
+        {
+            model = new CustomRenameModel();
+        }
+        catch (Exception ex)
+        {
+            failureMessage = $"File rename is fail-closed because the Rider rename model could not be created headlessly: {ex.GetType().Name}: {ex.Message}";
+            return null;
+        }
+
+        try
+        {
+            SetRuntimeProperty(model, "HasUI", false);
+            SetRuntimeProperty(model, "QuickRename", false);
+            SetRuntimeProperty(model, "CreateRenameConfirmationPage", false);
+            SetRuntimeProperty(model, "ChangeTextOccurrences", false);
+            SetRuntimeProperty(model, "RenameDerived", false);
+            SetRuntimeProperty(model, "Bulk", false);
+            if (!TrySetRuntimeProperty(model, "RenameFile", true))
+            {
+                failureMessage = "File rename is fail-closed because the Rider rename model does not expose RenameFile in this runtime. The backend will not risk symbol rename widening without explicit file-lane support.";
+                return null;
+            }
+
+            SetRuntimeProperty(dataProvider, "Model", model);
+        }
+        catch (Exception ex)
+        {
+            failureMessage = $"File rename is fail-closed because the Rider rename model could not be configured for file-scoped execution: {ex.GetType().Name}: {ex.Message}";
+            return null;
+        }
+
+        return dataProvider;
+    }
+
+    private bool TryValidateHeadlessMoveAvailability(string filePath, out string failureMessage)
+    {
+        failureMessage = string.Empty;
+
+        if (_solution == null)
+        {
+            failureMessage = "Move file is fail-closed because the Rider solution is unavailable for MoveToFolderWorkflow execution.";
+            return false;
+        }
+
+        if (_solution.GetComponent<DataContexts>() == null)
+        {
+            failureMessage = "Move file is fail-closed because Rider DataContexts are unavailable for MoveToFolderWorkflow execution.";
+            return false;
+        }
+
+        if (Shell.Instance.GetComponent<IActionManager>() == null)
+        {
+            failureMessage = "Move file is fail-closed because the Rider action manager is unavailable for MoveToFolderWorkflow execution.";
+            return false;
+        }
+
+        if (GetProjectFileForPath(filePath) == null)
+        {
+            failureMessage = $"Move file is fail-closed because '{filePath}' is not bound to a Rider project file for MoveToFolderWorkflow execution.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private string? TryExecuteDrivenFileMove(IProjectFile projectFile, string newPath)
+    {
+        var destinationDirectory = Path.GetDirectoryName(newPath);
+        if (string.IsNullOrWhiteSpace(destinationDirectory))
+            return "Move file is fail-closed because the destination directory could not be resolved for MoveToFolderWorkflow execution.";
+
+        var containingProject = projectFile.GetProject();
+        if (containingProject == null)
+            return "Move file is fail-closed because the Rider backend could not bind the source file to a containing project for MoveToFolderWorkflow execution.";
+
+        var targetLocation = VirtualFileSystemPath.Parse(destinationDirectory, InteractionContext.SolutionContext);
+        var targetFolder = containingProject.FindProjectItemByLocation(targetLocation) as IProjectFolder;
+        if (targetFolder == null)
+        {
+            return $"Move file is fail-closed because destination folder '{destinationDirectory}' is not yet available in the Rider project model for MoveToFolderWorkflow execution.";
+        }
+
+        var workflow = new MoveToFolderWorkflow(_solution, "Index MCP Rider move");
+        var dataProvider = new MoveToFolderDataProvider(true, false, targetFolder, new List<string>(), new List<string>());
+        workflow.SetDataProvider(dataProvider);
+
+        Lifetime.Using(lifetime =>
+            WorkflowExecuter.ExecuteWithCustomHost(
+                Shell.Instance.GetComponent<IActionManager>()
+                    .DataContexts
+                    .CreateWithoutDataRules(
+                        lifetime,
+                        DataRules
+                            .AddRule("IndexMcpMoveFile", ProjectModelDataConstants.PROJECT_MODEL_ELEMENTS, new IProjectModelElement[] { projectFile })
+                            .AddRule("IndexMcpMoveFile", ProjectModelDataConstants.SOLUTION, _solution)),
+                workflow,
+                new SimpleWorkflowHost()));
+        return null;
     }
 
     private static void ProcessWorkflowPages(IRefactoringWorkflow workflow)
@@ -698,6 +1968,19 @@ public class IndexMcpBackendHost
             throw new MissingMethodException(target.GetType().FullName, $"set_{propertyName}");
         property.SetValue(target, value);
     }
+
+    private static bool TrySetRuntimeProperty(object target, string propertyName, object value)
+    {
+        var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+        if (property == null || !property.CanWrite)
+            return false;
+
+        property.SetValue(target, value);
+        return true;
+    }
+
+    private static string? GetContainingProjectFilePath(IProjectFile projectFile)
+        => projectFile.GetProject()?.ProjectFileLocation.FullPath;
 
     // ── Type Hierarchy ──────────────────────────────────────────────────────
 
@@ -942,25 +2225,85 @@ public class IndexMcpBackendHost
         return null;
     }
 
-    private IDeclaredElement? ResolveTargetForFindReferences(Lifetime lt, RdSemanticTarget target, string scope)
+    private FindReferencesTargetResolution ResolveTargetForFindReferences(
+        Lifetime lt,
+        RdSemanticTarget target,
+        string scope,
+        FindReferencesTraceContext? trace = null)
     {
+        var capabilityFailure = ResolveFindReferencesCapabilityFailure(target);
+        if (capabilityFailure != null)
+            return capabilityFailure;
+
         if (!string.IsNullOrWhiteSpace(target.FilePath) &&
             target.Line.HasValue &&
             target.Column.HasValue)
         {
-            return ResolveDeclaredElementAt(new RdSourcePosition(
+            if (IsFSharpFindReferencesTarget(target))
+                return ResolveFSharpPositionTargetForFindReferences(target);
+
+            var resolvedElement = ResolveDeclaredElementAt(new RdSourcePosition(
                 target.FilePath,
                 target.Line.Value,
                 target.Column.Value));
+            return resolvedElement == null
+                ? FindReferencesTargetResolution.Failure(
+                    "unresolved_target",
+                    $"No Rider declaration matches position '{target.FilePath}:{target.Line}:{target.Column}'.",
+                    "position")
+                : FindReferencesTargetResolution.Success(resolvedElement, "position");
         }
 
         if (!string.IsNullOrWhiteSpace(target.Language) &&
             !string.IsNullOrWhiteSpace(target.Symbol))
         {
-            return ResolveSymbolForFindReferences(lt, target.Language, target.Symbol, scope);
+            return ResolveSymbolForFindReferences(lt, target.Language, target.Symbol, scope, trace);
         }
 
-        return null;
+        return FindReferencesTargetResolution.Failure(
+            "unsupported_target",
+            "Rider find_references requires either a position target or a language+symbol target.",
+            "unsupported");
+    }
+
+    private FindReferencesTargetResolution ResolveFSharpPositionTargetForFindReferences(RdSemanticTarget target)
+    {
+        var position = new RdSourcePosition(target.FilePath!, target.Line!.Value, target.Column!.Value);
+        var safeCandidates = ResolveSafeFSharpPositionCandidates(position);
+        var fallbackElement = ResolveDeclaredElementAt(position);
+        return ClassifyFSharpPositionTargetResolution(target, safeCandidates, fallbackElement);
+    }
+
+    private static FindReferencesTargetResolution ClassifyFSharpPositionTargetResolution(
+        RdSemanticTarget target,
+        IReadOnlyList<IDeclaredElement> safeCandidates,
+        IDeclaredElement? fallbackElement)
+    {
+        var targetLabel = $"{target.FilePath}:{target.Line}:{target.Column}";
+
+        if (safeCandidates.Count == 1)
+            return FindReferencesTargetResolution.Success(safeCandidates[0], "fsharp_position_safe");
+
+        if (safeCandidates.Count > 1)
+        {
+            return FindReferencesTargetResolution.Failure(
+                "ambiguous_match",
+                $"F# position target '{targetLabel}' matched multiple safe semantic targets. Use a more specific declaration/member token.",
+                "fsharp_position_safe");
+        }
+
+        if (fallbackElement != null)
+        {
+            return FindReferencesTargetResolution.Failure(
+                "unsupported_target",
+                $"F# position target '{targetLabel}' resolved only via an unsafe fallback target '{fallbackElement.ShortName}'. Use the declaration/member token or a more specific position.",
+                "fsharp_position_safe");
+        }
+
+        return FindReferencesTargetResolution.Failure(
+            "unresolved_target",
+            $"No safe F# semantic target matches position '{targetLabel}'.",
+            "fsharp_position_safe");
     }
 
     private static int GetEffectiveResultLimit(int requestedLimit)
@@ -1128,40 +2471,79 @@ public class IndexMcpBackendHost
         return ResolveSymbolIndexed(language, symbol).TryGetElement();
     }
 
-    private IDeclaredElement? ResolveSymbolForFindReferences(Lifetime lt, string? language, string symbol, string scope)
+    private FindReferencesTargetResolution ResolveSymbolForFindReferences(
+        Lifetime lt,
+        string? language,
+        string symbol,
+        string scope,
+        FindReferencesTraceContext? trace = null)
     {
         EnsureFindReferencesIndexedTargetIsSupported(language, symbol, scope);
 
         var parseResult = ParseIndexedSymbol(language, symbol);
         if (!parseResult.IsSuccess)
-            return parseResult.ToResolution().TryGetElement();
+            return FindReferencesTargetResolution.FromResolution(
+                DecorateFSharpSymbolModeResolution(parseResult.ToResolution(), language, symbol),
+                "parse");
 
         var parsed = parseResult.Symbol!;
         var plan = BuildFindReferencesResolutionPlan(scope, parsed);
         if (!plan.UseProjectQualifiedTypeLookup)
-            return ResolveSymbolIndexed(language, symbol).TryGetElement();
+            return ResolveSymbolIndexedForFindReferences(language, symbol);
 
-        var projectCandidates = EnumerateProjectQualifiedTypeElements(
+        var projectLookupStopwatch = Stopwatch.StartNew();
+        var projectCandidates = ResolveProjectQualifiedTypeCandidatesCoreDetailed(
+            parsed.Language,
+            parsed.ContainerQualifiedName,
+            () => EnumerateProjectQualifiedTypeElements(
                 lt,
                 parsed.ContainerQualifiedName,
-                plan.AllowedProjectFileExtensions)
-            .Where(type => MatchesLanguage(type, parsed.Language))
-            .Where(type => MatchesQualifiedName(GetQualifiedName(type), parsed.ContainerQualifiedName, "exact"))
-            .Cast<IDeclaredElement>()
-            .ToList();
+                plan.AllowedProjectFileExtensions),
+            () => ResolveClrPredefinedContainerCandidates(parsed.Language, NormalizeQualifiedName(parsed.ContainerQualifiedName)));
+        projectLookupStopwatch.Stop();
+        LogFindReferencesInfo(
+            trace,
+            "resolve-symbol.project-qualified-lookup",
+            $"elapsedMs={trace?.ElapsedMilliseconds ?? projectLookupStopwatch.ElapsedMilliseconds}, stageElapsedMs={projectLookupStopwatch.ElapsedMilliseconds}, candidateCount={projectCandidates.Matches.Count}, container={parsed.ContainerQualifiedName}, origin={projectCandidates.Origin}");
 
         var resolution = ResolveSingleMatch(
-            OrderDeclaredElementsDeterministically(projectCandidates).ToList(),
+            OrderDeclaredElementsDeterministically(projectCandidates.Matches).ToList(),
             $"Multiple Rider declarations match container '{parsed.ContainerQualifiedName}'.",
             $"No Rider declaration matches container '{parsed.ContainerQualifiedName}'.");
+        var decoratedResolution = DecorateFSharpSymbolModeResolution(resolution, parsed.Language, symbol);
 
-        if (resolution.TryGetElement() != null)
-            return resolution.TryGetElement();
+        if (decoratedResolution.TryGetElement() != null)
+            return FindReferencesTargetResolution.FromResolution(decoratedResolution, projectCandidates.Origin);
 
         if (!plan.AllowLibraryFallback)
-            return null;
+            return FindReferencesTargetResolution.FromResolution(decoratedResolution, projectCandidates.Origin);
 
-        return ResolveSymbolIndexed(language, symbol).TryGetElement();
+        return ResolveSymbolIndexedForFindReferences(language, symbol);
+    }
+
+    private static List<IDeclaredElement> ResolveProjectQualifiedTypeCandidatesCore(
+        string language,
+        string containerQualifiedName,
+        Func<IEnumerable<ITypeElement>> projectLookup,
+        Func<IEnumerable<IDeclaredElement>> clrFallbackLookup)
+    {
+        return ResolveProjectQualifiedTypeCandidatesCoreDetailed(language, containerQualifiedName, projectLookup, clrFallbackLookup).Matches;
+    }
+
+    private static ContainerCandidateResolution ResolveProjectQualifiedTypeCandidatesCoreDetailed(
+        string language,
+        string containerQualifiedName,
+        Func<IEnumerable<ITypeElement>> projectLookup,
+        Func<IEnumerable<IDeclaredElement>> clrFallbackLookup)
+    {
+        var normalizedContainer = NormalizeQualifiedName(containerQualifiedName);
+        return ResolveContainerCandidatesCoreDetailed(
+            language,
+            normalizedContainer,
+            () => projectLookup().Cast<IDeclaredElement>(),
+            clrFallbackLookup,
+            primaryOrigin: "project_qualified_primary",
+            fallbackOrigin: "project_qualified_clr_predefined_fallback");
     }
 
     private IndexedSymbolResolution ResolveSymbolIndexed(string? language, string symbol)
@@ -1214,31 +2596,270 @@ public class IndexMcpBackendHost
     private List<IDeclaredElement> ResolveContainerCandidates(string language, string containerQualifiedName)
     {
         var normalizedContainer = NormalizeQualifiedName(containerQualifiedName);
-        var projectMatches = EnumerateProjectPsiModules(Lifetime.Eternal, null)
-            .Distinct()
-            .SelectMany(module => ResolveContainerCandidatesFromScope(
-                _solution.GetPsiServices().Symbols.GetSymbolScope(module, true, false),
-                normalizedContainer,
-                language))
+        return ResolveContainerCandidatesCore(
+            language,
+            normalizedContainer,
+            () =>
+            {
+                var projectMatches = EnumerateProjectPsiModules(Lifetime.Eternal, null)
+                    .Distinct()
+                    .SelectMany(module => ResolveContainerCandidatesFromScope(
+                        _solution.GetPsiServices().Symbols.GetSymbolScope(module, true, false),
+                        normalizedContainer,
+                        language))
+                    .ToList();
+
+                if (projectMatches.Count > 0)
+                    return projectMatches;
+
+                return new[] { LibrarySymbolScope.REFERENCED, LibrarySymbolScope.TRANSITIVE, LibrarySymbolScope.FULL }
+                    .SelectMany(scopeKind => ResolveContainerCandidatesFromScope(
+                        _solution.GetPsiServices().Symbols.GetSymbolScope(scopeKind, false),
+                        normalizedContainer,
+                        language))
+                    .ToList();
+            },
+            () => ResolveClrPredefinedContainerCandidates(language, normalizedContainer));
+    }
+
+    private static List<IDeclaredElement> ResolveContainerCandidatesCore(
+        string language,
+        string normalizedContainer,
+        Func<IEnumerable<IDeclaredElement>> primaryLookup,
+        Func<IEnumerable<IDeclaredElement>> clrFallbackLookup)
+    {
+        return ResolveContainerCandidatesCoreDetailed(language, normalizedContainer, primaryLookup, clrFallbackLookup).Matches;
+    }
+
+    private static ContainerCandidateResolution ResolveContainerCandidatesCoreDetailed(
+        string language,
+        string normalizedContainer,
+        Func<IEnumerable<IDeclaredElement>> primaryLookup,
+        Func<IEnumerable<IDeclaredElement>> clrFallbackLookup,
+        string primaryOrigin = "primary_lookup",
+        string fallbackOrigin = "clr_predefined_fallback")
+    {
+        var primaryMatches = FilterAndOrderContainerCandidates(primaryLookup(), normalizedContainer, language);
+        if (primaryMatches.Count > 0 || !ShouldUseClrPredefinedTypeFallback(language, normalizedContainer))
+            return new ContainerCandidateResolution(primaryMatches, primaryOrigin, false);
+
+        return new ContainerCandidateResolution(
+            FilterAndOrderContainerCandidates(clrFallbackLookup(), normalizedContainer, language),
+            fallbackOrigin,
+            true);
+    }
+
+    private FindReferencesTargetResolution ResolveSymbolIndexedForFindReferences(string? language, string symbol)
+    {
+        var parseResult = ParseIndexedSymbol(language, symbol);
+        if (!parseResult.IsSuccess)
+            return FindReferencesTargetResolution.FromResolution(
+                DecorateFSharpSymbolModeResolution(parseResult.ToResolution(), language, symbol),
+                "parse");
+
+        var parsed = parseResult.Symbol!;
+        var containers = ResolveContainerCandidatesCoreDetailed(
+            parsed.Language,
+            NormalizeQualifiedName(parsed.ContainerQualifiedName),
+            () =>
+            {
+                var projectMatches = EnumerateProjectPsiModules(Lifetime.Eternal, null)
+                    .Distinct()
+                    .SelectMany(module => ResolveContainerCandidatesFromScope(
+                        _solution.GetPsiServices().Symbols.GetSymbolScope(module, true, false),
+                        NormalizeQualifiedName(parsed.ContainerQualifiedName),
+                        parsed.Language))
+                    .ToList();
+
+                if (projectMatches.Count > 0)
+                    return projectMatches;
+
+                return new[] { LibrarySymbolScope.REFERENCED, LibrarySymbolScope.TRANSITIVE, LibrarySymbolScope.FULL }
+                    .SelectMany(scopeKind => ResolveContainerCandidatesFromScope(
+                        _solution.GetPsiServices().Symbols.GetSymbolScope(scopeKind, false),
+                        NormalizeQualifiedName(parsed.ContainerQualifiedName),
+                        parsed.Language))
+                    .ToList();
+            },
+            () => ResolveClrPredefinedContainerCandidates(parsed.Language, NormalizeQualifiedName(parsed.ContainerQualifiedName)));
+
+        if (containers.Matches.Count == 0)
+        {
+            return FindReferencesTargetResolution.Failure(
+                "unresolved_symbol",
+                AppendFSharpSymbolModeGuidance(
+                    parsed.Language,
+                    symbol,
+                    $"No Rider declaration matches container '{parsed.ContainerQualifiedName}'.",
+                    "unresolved_symbol"),
+                containers.Origin);
+        }
+
+        if (parsed.MemberName == null)
+        {
+            var usedClrPredefinedDisambiguation = TryResolveClrPredefinedCanonicalCandidate(
+                containers.Matches,
+                parsed.Language,
+                parsed.ContainerQualifiedName,
+                out _);
+
+            var resolution = ResolveSingleMatch(
+                containers.Matches,
+                $"Multiple Rider declarations match container '{parsed.ContainerQualifiedName}'.",
+                $"No Rider declaration matches container '{parsed.ContainerQualifiedName}'.",
+                parsed.Language,
+                parsed.ContainerQualifiedName,
+                enableClrPredefinedDisambiguation: true);
+            var decoratedResolution = DecorateFSharpSymbolModeResolution(resolution, parsed.Language, symbol);
+
+            return FindReferencesTargetResolution.FromResolution(
+                decoratedResolution,
+                usedClrPredefinedDisambiguation && decoratedResolution.TryGetElement() != null
+                    ? "clr_predefined_disambiguated"
+                    : containers.Origin);
+        }
+
+        var supportedContainers = containers.Matches
+            .OfType<ITypeElement>()
+            .ToList();
+
+        if (supportedContainers.Count == 0)
+        {
+            return FindReferencesTargetResolution.Failure(
+                "unsupported_target",
+                AppendFSharpSymbolModeGuidance(
+                    parsed.Language,
+                    symbol,
+                    $"Container '{parsed.ContainerQualifiedName}' does not support member lookup.",
+                    "unsupported_target"),
+                containers.Origin);
+        }
+
+        var members = supportedContainers
+            .SelectMany(container => ResolveMemberCandidates(container, parsed))
             .Distinct()
             .OrderBy(BestDeclarationRank)
             .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetMemberSignatureSortKey, StringComparer.OrdinalIgnoreCase)
             .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        if (projectMatches.Count > 0)
-            return projectMatches;
+        return FindReferencesTargetResolution.FromResolution(
+            DecorateFSharpSymbolModeResolution(
+                ResolveSingleMatch(
+                members,
+                $"Multiple Rider declarations match symbol '{symbol}'.",
+                $"No Rider declaration matches symbol '{symbol}'."),
+                parsed.Language,
+                symbol),
+            containers.Origin);
+    }
+
+    private static IndexedSymbolResolution DecorateFSharpSymbolModeResolution(
+        IndexedSymbolResolution resolution,
+        string? language,
+        string symbol)
+    {
+        ArgumentNullException.ThrowIfNull(resolution);
+
+        if (NormalizeLanguage(language) != "F#" || resolution.TryGetElement() != null)
+            return resolution;
+
+        var decoratedMessage = AppendFSharpSymbolModeGuidance(language, symbol, resolution.Message, resolution.Status);
+        if (string.Equals(decoratedMessage, resolution.Message, StringComparison.Ordinal))
+            return resolution;
+
+        return resolution.Status switch
+        {
+            "invalid_symbol" => IndexedSymbolResolution.Invalid(decoratedMessage),
+            "unresolved_symbol" => IndexedSymbolResolution.Unresolved(decoratedMessage),
+            "ambiguous_match" => IndexedSymbolResolution.Ambiguous(decoratedMessage),
+            "unsupported_target" => IndexedSymbolResolution.Unsupported(decoratedMessage),
+            _ => resolution
+        };
+    }
+
+    private static string? AppendFSharpSymbolModeGuidance(
+        string? language,
+        string symbol,
+        string? message,
+        string status)
+    {
+        if (NormalizeLanguage(language) != "F#" || !ShouldRecommendFSharpPositionLookup(status))
+            return message;
+
+        const string guidance = " F# language+symbol lookup remains best-effort and lossy; use file + line + column on the declaration/member token when safe resolution cannot be proven.";
+        if (string.IsNullOrWhiteSpace(message))
+            return $"Rider could not prove a safe F# semantic target for symbol '{symbol}'.{guidance}";
+
+        return message.Contains("file + line + column", StringComparison.OrdinalIgnoreCase)
+            ? message
+            : message + guidance;
+    }
+
+    private static bool ShouldRecommendFSharpPositionLookup(string status)
+    {
+        return status.Equals("invalid_symbol", StringComparison.OrdinalIgnoreCase) ||
+               status.Equals("unresolved_symbol", StringComparison.OrdinalIgnoreCase) ||
+               status.Equals("ambiguous_match", StringComparison.OrdinalIgnoreCase) ||
+               status.Equals("unsupported_target", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private List<IDeclaredElement> ResolveClrPredefinedContainerCandidates(string language, string normalizedContainer)
+    {
+        var lookupNames = EnumerateClrPredefinedLookupNames(normalizedContainer).ToList();
+        if (lookupNames.Count == 0)
+            return new List<IDeclaredElement>();
+
+        var seenModules = new HashSet<IPsiModule>();
+        var moduleMatches = EnumerateProjectPsiModules(Lifetime.Eternal, null)
+            .Where(module => seenModules.Add(module))
+            .SelectMany(module => ResolveClrPredefinedContainerCandidatesFromModule(module, normalizedContainer, lookupNames, language))
+            .ToList();
+
+        if (moduleMatches.Count > 0)
+            return moduleMatches;
 
         return new[] { LibrarySymbolScope.REFERENCED, LibrarySymbolScope.TRANSITIVE, LibrarySymbolScope.FULL }
-            .SelectMany(scopeKind => ResolveContainerCandidatesFromScope(
+            .SelectMany(scopeKind => ResolveClrPredefinedContainerCandidatesFromScope(
                 _solution.GetPsiServices().Symbols.GetSymbolScope(scopeKind, false),
                 normalizedContainer,
+                lookupNames,
                 language))
-            .Distinct()
-            .OrderBy(BestDeclarationRank)
-            .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private IEnumerable<IDeclaredElement> ResolveClrPredefinedContainerCandidatesFromModule(
+        IPsiModule module,
+        string normalizedContainer,
+        IReadOnlyList<string> lookupNames,
+        string language)
+    {
+        var symbolScope = _solution.GetPsiServices().Symbols.GetSymbolScope(module, true, false);
+        foreach (var candidate in ResolveClrPredefinedContainerCandidatesFromScope(symbolScope, normalizedContainer, lookupNames, language))
+            yield return candidate;
+
+        foreach (var typeElement in EnumeratePredefinedTypeElements(module)
+                     .Where(element => MatchesContainerCandidate(element, normalizedContainer, language)))
+        {
+            yield return typeElement;
+        }
+    }
+
+    private static IEnumerable<IDeclaredElement> ResolveClrPredefinedContainerCandidatesFromScope(
+        ISymbolScope symbolScope,
+        string normalizedContainer,
+        IReadOnlyList<string> lookupNames,
+        string language)
+    {
+        foreach (var lookupName in lookupNames)
+        {
+            foreach (var typeElement in TryGetTypeElementsByClrName(symbolScope, lookupName)
+                         .Where(element => MatchesContainerCandidate(element, normalizedContainer, language)))
+            {
+                yield return typeElement;
+            }
+        }
     }
 
     private IEnumerable<IDeclaredElement> ResolveContainerCandidatesFromScope(
@@ -1254,6 +2875,102 @@ public class IndexMcpBackendHost
         {
             yield return candidate;
         }
+    }
+
+    private static List<IDeclaredElement> FilterAndOrderContainerCandidates(
+        IEnumerable<IDeclaredElement> candidates,
+        string normalizedContainer,
+        string language)
+    {
+        return candidates
+            .Where(element => MatchesContainerCandidate(element, normalizedContainer, language))
+            .Distinct()
+            .OrderBy(BestDeclarationRank)
+            .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static bool MatchesContainerCandidate(IDeclaredElement element, string normalizedContainer, string language)
+    {
+        return MatchesLanguage(element, language) &&
+               HasCompatibleSourceLanguage(element, language) &&
+               NormalizeQualifiedName(GetQualifiedName(element))
+                   .Equals(normalizedContainer, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasCompatibleSourceLanguage(IDeclaredElement element, string language)
+    {
+        var normalizedLanguage = NormalizeLanguage(language);
+        if (normalizedLanguage == null)
+            return true;
+
+        var declarationPaths = element.GetDeclarations()
+            .Select(declaration => declaration.GetSourceFile()?.GetLocation().FullPath)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (declarationPaths.Count == 0)
+            return true;
+
+        return declarationPaths.All(path => MatchesLanguageForSourcePath(path, normalizedLanguage));
+    }
+
+    private static bool ShouldUseClrPredefinedTypeFallback(string language, string normalizedContainer)
+    {
+        return NormalizeLanguage(language) == "F#" &&
+               EnumerateClrPredefinedLookupNames(normalizedContainer).Any();
+    }
+
+    private static IEnumerable<string> EnumerateClrPredefinedLookupNames(string normalizedContainer)
+    {
+        var normalized = NormalizeQualifiedName(normalizedContainer);
+        return ClrPredefinedLookupNames.TryGetValue(normalized, out var lookupNames)
+            ? lookupNames
+            : Array.Empty<string>();
+    }
+
+    private static IEnumerable<ITypeElement> TryGetTypeElementsByClrName(ISymbolScope symbolScope, string clrName)
+    {
+        var method = symbolScope.GetType()
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .FirstOrDefault(candidate =>
+                candidate.Name == "GetTypeElementsByCLRName" &&
+                candidate.GetParameters().Length == 1);
+        if (method == null)
+            yield break;
+
+        var parameterType = method.GetParameters()[0].ParameterType;
+        var lookupArgument = TryCreateClrLookupArgument(parameterType, clrName);
+        if (lookupArgument == null)
+            yield break;
+
+        if (method.Invoke(symbolScope, new[] { lookupArgument }) is IEnumerable enumerable)
+        {
+            foreach (var typeElement in enumerable.OfType<ITypeElement>())
+                yield return typeElement;
+        }
+    }
+
+    private static object? TryCreateClrLookupArgument(Type parameterType, string clrName)
+    {
+        if (parameterType == typeof(string))
+            return clrName;
+
+        var constructor = parameterType.GetConstructor(new[] { typeof(string) });
+        if (constructor != null)
+            return constructor.Invoke(new object[] { clrName });
+
+        var parseMethod = parameterType.GetMethod(
+            "Parse",
+            BindingFlags.Public | BindingFlags.Static,
+            null,
+            new[] { typeof(string) },
+            null);
+        if (parseMethod != null)
+            return parseMethod.Invoke(null, new object[] { clrName });
+
+        return null;
     }
 
     private static IEnumerable<string> EnumerateQualifiedNameCandidates(string normalizedQualifiedName)
@@ -1272,8 +2989,31 @@ public class IndexMcpBackendHost
         string ambiguousMessage,
         string unresolvedMessage)
     {
+        return ResolveSingleMatch(
+            candidates,
+            ambiguousMessage,
+            unresolvedMessage,
+            language: null,
+            requestedQualifiedName: null,
+            enableClrPredefinedDisambiguation: false);
+    }
+
+    private static IndexedSymbolResolution ResolveSingleMatch(
+        IReadOnlyList<IDeclaredElement> candidates,
+        string ambiguousMessage,
+        string unresolvedMessage,
+        string? language,
+        string? requestedQualifiedName,
+        bool enableClrPredefinedDisambiguation)
+    {
         if (candidates.Count == 0)
             return IndexedSymbolResolution.Unresolved(unresolvedMessage);
+
+        if (enableClrPredefinedDisambiguation &&
+            TryResolveClrPredefinedCanonicalCandidate(candidates, language, requestedQualifiedName, out var canonicalCandidate))
+        {
+            return IndexedSymbolResolution.Success(canonicalCandidate!);
+        }
 
         var preferredTypeCandidates = candidates
             .OfType<ITypeElement>()
@@ -1295,6 +3035,60 @@ public class IndexMcpBackendHost
             return IndexedSymbolResolution.Success(candidates[0]);
 
         return IndexedSymbolResolution.Ambiguous(ambiguousMessage);
+    }
+
+    private static bool TryResolveClrPredefinedCanonicalCandidate(
+        IReadOnlyList<IDeclaredElement> candidates,
+        string? language,
+        string? requestedQualifiedName,
+        out IDeclaredElement? candidate)
+    {
+        candidate = null;
+
+        if (NormalizeLanguage(language) != "F#" || string.IsNullOrWhiteSpace(requestedQualifiedName))
+            return false;
+
+        var normalizedRequested = NormalizeQualifiedName(requestedQualifiedName);
+        var requestedClrName = NormalizeClrQualifiedNamePreservingArity(requestedQualifiedName);
+        var clrLookupNames = EnumerateClrPredefinedLookupNames(normalizedRequested)
+            .Select(NormalizeClrQualifiedNamePreservingArity)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (clrLookupNames.Count == 0)
+            return false;
+
+        return TryPickSourceLessCanonicalTypeCandidate(candidates, new[] { requestedClrName }, out candidate) ||
+               TryPickSourceLessCanonicalTypeCandidate(candidates, clrLookupNames, out candidate);
+    }
+
+    private static bool TryPickSourceLessCanonicalTypeCandidate(
+        IReadOnlyList<IDeclaredElement> candidates,
+        IEnumerable<string> acceptedQualifiedNames,
+        out IDeclaredElement? candidate)
+    {
+        var acceptedNames = acceptedQualifiedNames
+            .Select(NormalizeClrQualifiedNamePreservingArity)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var relevantMatches = candidates
+            .OfType<ITypeElement>()
+            .Where(type => acceptedNames.Contains(NormalizeClrQualifiedNamePreservingArity(type.GetClrName().FullName)))
+            .ToList();
+
+        if (relevantMatches.Any(type => type.GetDeclarations().Any()))
+        {
+            candidate = null;
+            return false;
+        }
+
+        var canonicalMatches = OrderDeclaredElementsDeterministically(relevantMatches)
+            .ToList();
+
+        candidate = canonicalMatches.Count == 1
+            ? canonicalMatches[0]
+            : null;
+
+        return candidate != null;
     }
 
     private static IEnumerable<IDeclaredElement> ResolveMemberCandidates(ITypeElement container, ParsedRiderSymbol parsed)
@@ -1359,7 +3153,7 @@ public class IndexMcpBackendHost
 
     private static IEnumerable<string> GetParameterComparisonNames(IType declaredType, string? languageName)
     {
-        yield return declaredType.GetPresentableName(CSharpLanguage.Instance!);
+        yield return GetPresentableTypeName(declaredType, languageName);
 
         if (declaredType is IDeclaredType namedType && namedType.GetTypeElement() is { } typeElement)
         {
@@ -1368,8 +3162,70 @@ public class IndexMcpBackendHost
         }
     }
 
+    private static string GetPresentableTypeName(
+        IType declaredType,
+        string? preferredLanguageName,
+        Func<string, object?>? presentationLanguageResolver = null,
+        Func<IType, object, string?>? presentableNameInvoker = null)
+    {
+        var presentationLanguage = ResolveRequestedPresentationLanguage(preferredLanguageName, presentationLanguageResolver);
+        if (!ReferenceEquals(presentationLanguage, CSharpLanguage.Instance!))
+        {
+            var resolvedName = (presentableNameInvoker ?? InvokePresentableTypeName)(declaredType, presentationLanguage);
+            if (!string.IsNullOrWhiteSpace(resolvedName))
+                return resolvedName;
+        }
+
+        return declaredType.GetPresentableName(CSharpLanguage.Instance!).ToString();
+    }
+
+    private static object ResolveRequestedPresentationLanguage(
+        string? preferredLanguageName,
+        Func<string, object?>? presentationLanguageResolver = null)
+    {
+        return NormalizeLanguage(preferredLanguageName) == "F#"
+            ? TryResolveFSharpPresentationLanguage(presentationLanguageResolver) ?? CSharpLanguage.Instance!
+            : CSharpLanguage.Instance!;
+    }
+
+    private static object? TryResolveFSharpPresentationLanguage(Func<string, object?>? presentationLanguageResolver = null)
+    {
+        presentationLanguageResolver ??= ResolveFSharpPresentationLanguageByReflection;
+        return presentationLanguageResolver(FSharpPresentationLanguageTypeName);
+    }
+
+    private static object? ResolveFSharpPresentationLanguageByReflection(string typeName)
+    {
+        var languageType = Type.GetType(typeName, throwOnError: false);
+        if (languageType == null)
+        {
+            languageType = AppDomain.CurrentDomain
+                .GetAssemblies()
+                .Select(assembly => assembly.GetType(typeName, throwOnError: false))
+                .FirstOrDefault(type => type != null);
+        }
+
+        return languageType?
+            .GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)
+            ?.GetValue(null);
+    }
+
+    private static string? InvokePresentableTypeName(IType declaredType, object presentationLanguage)
+    {
+        var method = ourGetPresentableNameMethod.Value;
+        if (method == null)
+            return null;
+
+        var parameterType = method.GetParameters()[0].ParameterType;
+        if (!parameterType.IsInstanceOfType(presentationLanguage))
+            return null;
+
+        return method.Invoke(declaredType, new[] { presentationLanguage })?.ToString();
+    }
+
     private static IndexedSymbolParseResult ParseIndexedSymbol(string? language, string symbol)
     {
+        var normalizedLanguage = NormalizeLanguage(language);
         if (!IsSupportedRiderLanguage(language))
         {
             return IndexedSymbolParseResult.Unsupported(
@@ -1388,12 +3244,12 @@ public class IndexMcpBackendHost
             return IndexedSymbolParseResult.Invalid("Rider symbol must include a container name.");
 
         if (memberPart == null)
-            return IndexedSymbolParseResult.Success(new ParsedRiderSymbol(language!, containerPart, null, null, false));
+            return IndexedSymbolParseResult.Success(new ParsedRiderSymbol(normalizedLanguage!, containerPart, null, null, false));
 
         if (!TryParseMemberPart(containerPart, memberPart, out var parsedMemberName, out var parameterTypes, out var isConstructor, out var memberError))
             return IndexedSymbolParseResult.Invalid(memberError!);
 
-        return IndexedSymbolParseResult.Success(new ParsedRiderSymbol(language!, containerPart, parsedMemberName, parameterTypes, isConstructor));
+        return IndexedSymbolParseResult.Success(new ParsedRiderSymbol(normalizedLanguage!, containerPart, parsedMemberName, parameterTypes, isConstructor));
     }
 
     private static bool TrySplitMemberPart(string symbol, out string containerPart, out string? memberPart, out string? error)
@@ -1540,9 +3396,8 @@ public class IndexMcpBackendHost
 
     private static bool IsSupportedRiderLanguage(string? language)
     {
-        return language != null &&
-               (language.Equals("C#", StringComparison.OrdinalIgnoreCase) ||
-                language.Equals("F#", StringComparison.OrdinalIgnoreCase));
+        var normalizedLanguage = NormalizeLanguage(language);
+        return normalizedLanguage is "C#" or "F#";
     }
 
     private static string GetContainerLeafName(string containerQualifiedName)
@@ -1558,6 +3413,14 @@ public class IndexMcpBackendHost
             .Replace("global::", string.Empty, StringComparison.OrdinalIgnoreCase)
             .Replace("global.", string.Empty, StringComparison.OrdinalIgnoreCase);
         return CanonicalizeTypeName(withoutGlobalPrefix);
+    }
+
+    private static string NormalizeClrQualifiedNamePreservingArity(string value)
+    {
+        return value.Trim()
+            .Replace("global::", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Replace("global.", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Replace("+", ".", StringComparison.Ordinal);
     }
 
     private static string NormalizeSimpleName(string value)
@@ -1611,9 +3474,19 @@ public class IndexMcpBackendHost
         if (element is not IParametersOwner parametersOwner)
             return element.ShortName;
 
+        var presentationLanguage = element.PresentationLanguage?.Name;
         var parameterNames = parametersOwner.Parameters
-            .Select(parameter => CanonicalizeTypeName(parameter.Type.GetPresentableName(CSharpLanguage.Instance!)));
+            .Select(parameter => CanonicalizeTypeName(GetPresentableTypeName(parameter.Type, presentationLanguage)));
         return $"{element.ShortName}({string.Join(",", parameterNames)})";
+    }
+
+    private static string? BuildPresentableSignature(IDeclaredElement element)
+    {
+        if (element is not IParametersOwner parametersOwner)
+            return null;
+
+        var presentationLanguage = element.PresentationLanguage?.Name;
+        return $"{element.ShortName}({string.Join(", ", parametersOwner.Parameters.Select(parameter => GetPresentableTypeName(parameter.Type, presentationLanguage)))})";
     }
 
     private static readonly IReadOnlyDictionary<string, string> BuiltInTypeAliases =
@@ -1667,6 +3540,59 @@ public class IndexMcpBackendHost
         }
     }
 
+    private IEnumerable<IDeclaredElement> EnumerateDeclaredSymbolElements(Lifetime lt, IReadOnlyList<string>? allowedProjectFileExtensions)
+    {
+        foreach (var psiFile in EnumerateProjectPsiFiles(lt, allowedProjectFileExtensions))
+        {
+            EnsureLifetimeAlive(lt);
+            var elements = new List<IDeclaredElement>();
+            CollectDeclaredElements(psiFile, elements);
+            foreach (var element in elements)
+                yield return element;
+        }
+    }
+
+    private IEnumerable<IDeclaredElement> EnumerateIndexedSymbolElements(Lifetime lt, string query, string language)
+    {
+        foreach (var libraryScope in new[] { LibrarySymbolScope.REFERENCED, LibrarySymbolScope.TRANSITIVE, LibrarySymbolScope.FULL })
+        {
+            EnsureLifetimeAlive(lt);
+            foreach (var element in EnumerateSymbolScopeDeclaredElements(
+                         _solution.GetPsiServices().Symbols.GetSymbolScope(libraryScope, false),
+                         query,
+                         language))
+            {
+                yield return element;
+            }
+        }
+    }
+
+    private static IEnumerable<IDeclaredElement> EnumerateSymbolScopeDeclaredElements(
+        ISymbolScope symbolScope,
+        string query,
+        string language)
+    {
+        var seen = new HashSet<IDeclaredElement>();
+
+        if (query.Contains('.', StringComparison.Ordinal))
+        {
+            foreach (var element in symbolScope.GetElementsByQualifiedName(query))
+            {
+                if (seen.Add(element) && MatchesLanguage(element, language))
+                    yield return element;
+            }
+        }
+
+        foreach (var shortName in symbolScope.GetAllShortNames().Where(name => MatchesName(name, query, "substring")))
+        {
+            foreach (var element in symbolScope.GetElementsByShortName(shortName))
+            {
+                if (seen.Add(element) && MatchesLanguage(element, language))
+                    yield return element;
+            }
+        }
+    }
+
     private IEnumerable<ITypeElement> EnumerateProjectQualifiedTypeElements(
         Lifetime lt,
         string qualifiedName,
@@ -1701,26 +3627,20 @@ public class IndexMcpBackendHost
 
     private IEnumerable<IFile> EnumerateProjectPsiFiles(Lifetime lt, IReadOnlyList<string>? allowedProjectFileExtensions)
     {
-        foreach (var project in _solution.GetAllProjects())
+        foreach (var sourceFile in EnumerateProjectSourceFiles(lt, allowedProjectFileExtensions))
         {
-            EnsureLifetimeAlive(lt);
-            foreach (var projectFile in project.GetAllProjectFiles())
-            {
-                EnsureLifetimeAlive(lt);
-                foreach (var sourceFile in projectFile.ToSourceFiles())
-                {
-                    EnsureLifetimeAlive(lt);
-                    if (!MatchesProjectFileExtension(sourceFile.GetLocation().FullPath, allowedProjectFileExtensions))
-                        continue;
-
-                    var psiFile = sourceFile.GetPrimaryPsiFile();
-                    if (psiFile != null) yield return psiFile;
-                }
-            }
+            var psiFile = sourceFile.GetPrimaryPsiFile();
+            if (psiFile != null) yield return psiFile;
         }
     }
 
     private IEnumerable<IPsiModule> EnumerateProjectPsiModules(Lifetime lt, IReadOnlyList<string>? allowedProjectFileExtensions)
+    {
+        foreach (var sourceFile in EnumerateProjectSourceFiles(lt, allowedProjectFileExtensions))
+            yield return sourceFile.PsiModule;
+    }
+
+    private IEnumerable<IPsiSourceFile> EnumerateProjectSourceFiles(Lifetime lt, IReadOnlyList<string>? allowedProjectFileExtensions)
     {
         foreach (var project in _solution.GetAllProjects())
         {
@@ -1734,7 +3654,7 @@ public class IndexMcpBackendHost
                     if (!MatchesProjectFileExtension(sourceFile.GetLocation().FullPath, allowedProjectFileExtensions))
                         continue;
 
-                    yield return sourceFile.PsiModule;
+                    yield return sourceFile;
                 }
             }
         }
@@ -1758,8 +3678,20 @@ public class IndexMcpBackendHost
             return true;
 
         var filePath = PickPreferredDeclaration(element)?.GetSourceFile()?.GetLocation().FullPath ?? "";
+        return MatchesLanguageForSourcePath(filePath, normalizedLanguage);
+    }
+
+    private static bool MatchesLanguageForSourcePath(string? filePath, string normalizedLanguage)
+    {
         if (string.IsNullOrWhiteSpace(filePath))
-            return normalizedLanguage.Equals("C#", StringComparison.OrdinalIgnoreCase);
+        {
+            // CLR/BCL/library declarations commonly resolve without a source file and may report
+            // a C#-centric presentation language even when the caller requested F#. Keep strict
+            // file-extension filtering for source-backed declarations, but do not discard
+            // source-less library symbols for C#/F# indexed lookups.
+            return normalizedLanguage.Equals("C#", StringComparison.OrdinalIgnoreCase) ||
+                   normalizedLanguage.Equals("F#", StringComparison.OrdinalIgnoreCase);
+        }
 
         return normalizedLanguage.Equals("C#", StringComparison.OrdinalIgnoreCase) && filePath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) ||
                normalizedLanguage.Equals("F#", StringComparison.OrdinalIgnoreCase) && (
@@ -1782,6 +3714,21 @@ public class IndexMcpBackendHost
             return "F#";
 
         return language;
+    }
+
+    private static string? InferFindReferencesTargetLanguage(RdSemanticTarget target)
+    {
+        var normalizedLanguage = NormalizeLanguage(target.Language);
+        if (normalizedLanguage != null)
+            return normalizedLanguage;
+
+        var fileExtension = Path.GetExtension(target.FilePath ?? string.Empty);
+        if (fileExtension.Equals(".cs", StringComparison.OrdinalIgnoreCase))
+            return "C#";
+
+        return FSharpProjectFileExtensions.Contains(fileExtension, StringComparer.OrdinalIgnoreCase)
+            ? "F#"
+            : null;
     }
 
     private static IReadOnlyList<string>? GetProjectFileExtensions(string? normalizedLanguage)
@@ -2008,6 +3955,84 @@ public class IndexMcpBackendHost
         return ResolveDeclaredElementAt(position, requireConsistentLocalDeclaration: false);
     }
 
+    private List<IDeclaredElement> ResolveSafeFSharpPositionCandidates(RdSourcePosition position)
+    {
+        var psiFile = GetPsiFileForPath(position.FilePath);
+        if (psiFile == null)
+            return new List<IDeclaredElement>();
+
+        var sourceFile = psiFile.GetSourceFile();
+        var document = sourceFile?.Document;
+        if (document == null)
+            return new List<IDeclaredElement>();
+
+        var line = Math.Max(0, position.Line - 1);
+        var col = Math.Max(0, position.Column - 1);
+        var offset = document.GetLineStartOffset((Int32<DocLine>)line) + col;
+
+        return CandidateOffsets(offset)
+            .SelectMany(candidateOffset => EnumerateSafeFSharpPositionCandidatesAtOffset(psiFile, candidateOffset))
+            .GroupBy(GetDeclaredElementIdentityKey)
+            .Select(group => group.First())
+            .OrderBy(BestDeclarationRank)
+            .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetMemberSignatureSortKey, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static IEnumerable<IDeclaredElement> EnumerateSafeFSharpPositionCandidatesAtOffset(IFile psiFile, int candidateOffset)
+    {
+        var node = psiFile.FindNodeAt(TreeTextRange.FromLength(new TreeOffset(candidateOffset), 1));
+        if (node == null)
+            yield break;
+
+        var directReferenceElement = TryResolveDirectReferenceElement(node);
+        if (directReferenceElement != null)
+            yield return directReferenceElement;
+
+        var declarationElement = TryResolveDeclarationNameElement(node);
+        if (declarationElement != null)
+            yield return declarationElement;
+    }
+
+    private static IDeclaredElement? TryResolveDirectReferenceElement(ITreeNode node)
+    {
+        foreach (var reference in node.GetReferences())
+        {
+            var resolved = reference.Resolve().DeclaredElement;
+            if (resolved != null)
+                return resolved;
+        }
+
+        return node.GetContainingNode<IReferenceExpression>()?.Reference?.Resolve().DeclaredElement;
+    }
+
+    private static IDeclaredElement? TryResolveDeclarationNameElement(ITreeNode node)
+    {
+        var nodeText = node.GetText().Trim();
+        if (string.IsNullOrEmpty(nodeText))
+            return null;
+
+        var declaration = node.GetContainingNode<IDeclaration>();
+        if (declaration != null &&
+            string.Equals(nodeText, declaration.DeclaredName, StringComparison.Ordinal) &&
+            declaration.DeclaredElement != null)
+        {
+            return declaration.DeclaredElement;
+        }
+
+        var typeDeclaration = node.GetContainingNode<ITypeDeclaration>();
+        if (typeDeclaration != null &&
+            string.Equals(nodeText, typeDeclaration.DeclaredName, StringComparison.Ordinal) &&
+            typeDeclaration.DeclaredElement != null)
+        {
+            return typeDeclaration.DeclaredElement;
+        }
+
+        return null;
+    }
+
     /// <summary>
     /// Position-based PSI resolver. When <paramref name="requireConsistentLocalDeclaration"/> is
     /// true, additionally enforces that if the symbol is resolved via a local <see cref="IDeclaration"/>
@@ -2116,7 +4141,7 @@ public class IndexMcpBackendHost
         return typeDeclaration?.DeclaredName;
     }
 
-    private ITreeNode? ResolveDeclarationNodeAt(RdSourcePosition position)
+    private ITreeNode? ResolveExactDeclarationNodeAt(RdSourcePosition position, string expectedName, string? expectedTargetKind)
     {
         var psiFile = GetPsiFileForPath(position.FilePath);
         if (psiFile == null) return null;
@@ -2134,13 +4159,16 @@ public class IndexMcpBackendHost
             var node = psiFile.FindNodeAt(TreeTextRange.FromLength(new TreeOffset(candidateOffset), 1));
             if (node == null) continue;
 
-            var typeDeclaration = node.GetContainingNode<ITypeDeclaration>();
-            if (typeDeclaration != null)
-                return typeDeclaration as ITreeNode;
-
             var declaration = node.GetContainingNode<IDeclaration>();
-            if (declaration != null)
+            if (declaration != null && string.Equals(declaration.DeclaredName, expectedName, StringComparison.Ordinal))
                 return declaration as ITreeNode;
+
+            if (string.Equals(expectedTargetKind, MutationTargetKind.Type.ToContractValue(), StringComparison.OrdinalIgnoreCase))
+            {
+                var typeDeclaration = node.GetContainingNode<ITypeDeclaration>();
+                if (typeDeclaration != null && string.Equals(typeDeclaration.DeclaredName, expectedName, StringComparison.Ordinal))
+                    return typeDeclaration as ITreeNode;
+            }
         }
 
         return null;
@@ -2153,11 +4181,312 @@ public class IndexMcpBackendHost
         return null;
     }
 
-    private List<JetBrains.ReSharper.Psi.Resolve.IReference> FindReferences(Lifetime lt, IDeclaredElement element)
+    private List<JetBrains.ReSharper.Psi.Resolve.IReference> FindReferences(
+        Lifetime lt,
+        IDeclaredElement element,
+        int limit,
+        FindReferencesTraceContext? trace = null,
+        string searchMode = "legacy")
     {
         var searchDomain = _solution.GetPsiServices().SearchDomainFactory
             .CreateSearchDomain(_solution, false);
+        return FindReferences(lt, element, searchDomain, limit, trace, searchMode);
+    }
+
+    private List<JetBrains.ReSharper.Psi.Resolve.IReference> FindReferencesBounded(
+        Lifetime lt,
+        IDeclaredElement element,
+        IReadOnlyList<string>? allowedProjectFileExtensions,
+        int limit,
+        FindReferencesTraceContext? trace = null)
+    {
+        if (allowedProjectFileExtensions == null || allowedProjectFileExtensions.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "Bounded Rider find_references search requires explicit project file extensions.");
+        }
+
+        var enumerateStopwatch = Stopwatch.StartNew();
+        var sourceFiles = EnumerateProjectSourceFiles(lt, allowedProjectFileExtensions)
+            .ToList();
+        enumerateStopwatch.Stop();
+
+        var sourceFileBatches = BatchSourceFilesForBoundedFindReferences(sourceFiles, BoundedFindReferencesBatchSize);
+
+        LogFindReferencesInfo(
+            trace,
+            "find-bounded.domain",
+            $"elapsedMs={trace?.ElapsedMilliseconds ?? enumerateStopwatch.ElapsedMilliseconds}, " +
+            $"sourceFiles={sourceFileBatches.Sum(batch => batch.Count)}, batches={sourceFileBatches.Count}, batchSize={BoundedFindReferencesBatchSize}, enumerateMs={enumerateStopwatch.ElapsedMilliseconds}, extensions={FormatExtensions(allowedProjectFileExtensions)}");
+
+        var deadlineIndicator = CreateBoundedFindReferencesDeadlineProgressIndicator();
+        var references = new List<JetBrains.ReSharper.Psi.Resolve.IReference>();
+        var skippedDiagnostics = new List<BoundedFindReferencesSkipDiagnostic>();
+        for (var batchIndex = 0; batchIndex < sourceFileBatches.Count; batchIndex++)
+        {
+            EnsureLifetimeAlive(lt);
+            deadlineIndicator.ThrowIfExpired();
+
+            var limitRemaining = limit - references.Count;
+            if (limitRemaining <= 0)
+                break;
+
+            var batch = sourceFileBatches[batchIndex];
+            var batchLabel = batch.Count == 1 ? "file" : "batch";
+            var searchMode = batch.Count == 1 ? "bounded-file" : "bounded-batch";
+            var batchDescriptor = DescribeSourceFileBatch(batch);
+            var batchStopwatch = Stopwatch.StartNew();
+            LogFindReferencesInfo(
+                trace,
+                $"find-bounded.{batchLabel}.start",
+                $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, index={batchIndex + 1}, total={sourceFileBatches.Count}, batchSize={batch.Count}, limitRemaining={limitRemaining}, files={batchDescriptor}");
+
+            var createDomainStopwatch = Stopwatch.StartNew();
+            ISearchDomain? searchDomain = null;
+            RunBoundedFindReferencesStage(deadlineIndicator, () =>
+            {
+                searchDomain = _solution.GetPsiServices().SearchDomainFactory
+                    .CreateSearchDomain(batch);
+            });
+            createDomainStopwatch.Stop();
+
+            List<JetBrains.ReSharper.Psi.Resolve.IReference>? batchReferences = null;
+            try
+            {
+                RunBoundedFindReferencesStage(deadlineIndicator, () =>
+                {
+                    batchReferences = FindReferences(lt, element, searchDomain!, limitRemaining, trace, searchMode, deadlineIndicator);
+                });
+            }
+            catch (Exception ex)
+            {
+                batchStopwatch.Stop();
+
+                var classifiedException = ClassifyBoundedFindReferencesException(ex);
+                var skippedDiagnostic = new BoundedFindReferencesSkipDiagnostic(
+                    batchIndex + 1,
+                    sourceFileBatches.Count,
+                    batchDescriptor,
+                    classifiedException.Category,
+                    classifiedException.Exception.GetType().FullName ?? classifiedException.Exception.GetType().Name,
+                    classifiedException.Exception.Message,
+                    trace?.ElapsedMilliseconds ?? batchStopwatch.ElapsedMilliseconds,
+                    batchStopwatch.ElapsedMilliseconds,
+                    references.Count);
+
+                skippedDiagnostics.Add(skippedDiagnostic);
+                trace?.MarkPartial();
+
+                LogFindReferencesWarning(
+                    trace,
+                    FormatBoundedFindReferencesSkipMessage(
+                        searchMode,
+                        element,
+                        skippedDiagnostic.Category,
+                        skippedDiagnostic.Index,
+                        skippedDiagnostic.Total,
+                        skippedDiagnostic.Descriptor,
+                        skippedDiagnostic.ExceptionType,
+                        skippedDiagnostic.ExceptionMessage,
+                        skippedDiagnostic.ElapsedMilliseconds,
+                        skippedDiagnostic.StageElapsedMilliseconds,
+                        skippedDiagnostic.CollectedCount));
+                continue;
+            }
+
+            references.AddRange(batchReferences!);
+            batchStopwatch.Stop();
+
+            LogFindReferencesInfo(
+                trace,
+                $"find-bounded.{batchLabel}.end",
+                $"elapsedMs={trace?.ElapsedMilliseconds ?? batchStopwatch.ElapsedMilliseconds}, stageElapsedMs={batchStopwatch.ElapsedMilliseconds}, createDomainMs={createDomainStopwatch.ElapsedMilliseconds}, index={batchIndex + 1}, total={sourceFileBatches.Count}, batchSize={batch.Count}, batchCollectedCount={batchReferences.Count}, collectedCount={references.Count}, files={batchDescriptor}");
+
+            if (references.Count >= limit)
+            {
+                LogFindReferencesInfo(
+                    trace,
+                    "find-bounded.early-stop",
+                    $"elapsedMs={trace?.ElapsedMilliseconds ?? batchStopwatch.ElapsedMilliseconds}, collectedCount={references.Count}, limit={limit}, index={batchIndex + 1}, total={sourceFileBatches.Count}");
+                break;
+            }
+        }
+
+        if (skippedDiagnostics.Count > 0)
+        {
+            LogFindReferencesWarning(
+                trace,
+                $"stage=find-bounded.summary, partial=true, skippedCount={skippedDiagnostics.Count}, skippedFiles={FormatSkippedFindReferencesDescriptors(skippedDiagnostics.Select(diagnostic => diagnostic.Descriptor).ToList(), 5)}, collectedCount={references.Count}");
+        }
+
+        return references;
+    }
+
+    private static ClassifiedBoundedFindReferencesException ClassifyBoundedFindReferencesException(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        if (exception is OperationCanceledException operationCanceledException)
+            return new ClassifiedBoundedFindReferencesException("cancellation", operationCanceledException);
+
+        if (exception is AggregateException aggregateException)
+        {
+            var flattened = aggregateException.Flatten();
+            var cancellation = flattened.InnerExceptions.OfType<OperationCanceledException>().FirstOrDefault();
+            if (cancellation != null)
+                return new ClassifiedBoundedFindReferencesException("cancellation", cancellation);
+        }
+
+        return new ClassifiedBoundedFindReferencesException("exception", exception);
+    }
+
+    private static DeadlineProgressIndicator CreateBoundedFindReferencesDeadlineProgressIndicator()
+    {
+        return new DeadlineProgressIndicator(
+            DateTime.UtcNow.AddMilliseconds(BoundedFindReferencesInteractiveBudgetMs),
+            GetBoundedFindReferencesTimeoutMessage());
+    }
+
+    private static string GetBoundedFindReferencesTimeoutMessage()
+    {
+        return "Rider F# find_references requires warmed ReSharper usage caches; module/type-only project_files searches should retry after IDE warm-up or use a position/member target.";
+    }
+
+    private static void RethrowIfBoundedFindReferencesDeadlineExpired(Exception exception, DeadlineProgressIndicator progressIndicator)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        ArgumentNullException.ThrowIfNull(progressIndicator);
+
+        if (!progressIndicator.HasExpired)
+            return;
+
+        if (exception is TimeoutException timeoutException)
+            throw progressIndicator.Wrap(timeoutException);
+
+        if (exception is OperationCanceledException operationCanceledException)
+            throw progressIndicator.Wrap(operationCanceledException);
+
+        if (exception is AggregateException aggregateException)
+        {
+            var cancellation = aggregateException.Flatten().InnerExceptions.OfType<OperationCanceledException>().FirstOrDefault();
+            if (cancellation != null)
+                throw progressIndicator.Wrap(cancellation);
+        }
+    }
+
+    private static void RunBoundedFindReferencesStage(DeadlineProgressIndicator progressIndicator, Action action)
+    {
+        ArgumentNullException.ThrowIfNull(progressIndicator);
+        ArgumentNullException.ThrowIfNull(action);
+
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            RethrowIfBoundedFindReferencesDeadlineExpired(exception, progressIndicator);
+            throw;
+        }
+    }
+
+    private static IReadOnlyList<IReadOnlyList<IPsiSourceFile>> BatchSourceFilesForBoundedFindReferences(
+        IEnumerable<IPsiSourceFile> sourceFiles,
+        int batchSize)
+    {
+        return BatchItemsForBoundedFindReferences(sourceFiles, GetSourceFileTracePath, batchSize);
+    }
+
+    private static IReadOnlyList<IReadOnlyList<string>> BatchSourceFilePathsForBoundedFindReferences(
+        IEnumerable<string> sourceFilePaths,
+        int batchSize)
+    {
+        return BatchItemsForBoundedFindReferences(sourceFilePaths, NormalizeBoundedReferenceBatchKey, batchSize);
+    }
+
+    private static IReadOnlyList<IReadOnlyList<T>> BatchItemsForBoundedFindReferences<T>(
+        IEnumerable<T> items,
+        Func<T, string> keySelector,
+        int batchSize)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        ArgumentNullException.ThrowIfNull(keySelector);
+        if (batchSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batchSize), batchSize, "Batch size must be greater than zero.");
+
+        var orderedDistinctItems = items
+            .GroupBy(item => NormalizeBoundedReferenceBatchKey(keySelector(item)), StringComparer.OrdinalIgnoreCase)
+            .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+
+        if (orderedDistinctItems.Count == 0)
+            return Array.Empty<IReadOnlyList<T>>();
+
+        var batches = new List<IReadOnlyList<T>>();
+        for (var index = 0; index < orderedDistinctItems.Count; index += batchSize)
+            batches.Add(orderedDistinctItems.Skip(index).Take(batchSize).ToList());
+
+        return batches;
+    }
+
+    private static string DescribeSourceFileBatch(IReadOnlyList<IPsiSourceFile> batch)
+    {
+        if (batch.Count == 0)
+            return "<empty>";
+
+        var normalizedPaths = batch
+            .Select(GetSourceFileTracePath)
+            .ToList();
+
+        return batch.Count == 1
+            ? normalizedPaths[0]
+            : $"{normalizedPaths.First()} .. {normalizedPaths.Last()}";
+    }
+
+    private static string GetSourceFileTracePath(IPsiSourceFile sourceFile)
+    {
+        return NormalizeBoundedReferenceBatchKey(sourceFile.GetLocation().FullPath);
+    }
+
+    private static string NormalizeBoundedReferenceBatchKey(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value)
+            ? "<unknown>"
+            : value.Trim();
+    }
+
+    private static string FormatSkippedFindReferencesDescriptors(IReadOnlyList<string> descriptors, int maxItems)
+    {
+        ArgumentNullException.ThrowIfNull(descriptors);
+        if (maxItems <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxItems), maxItems, "Max items must be greater than zero.");
+
+        var normalizedDescriptors = descriptors
+            .Select(NormalizeBoundedReferenceBatchKey)
+            .ToList();
+
+        if (normalizedDescriptors.Count == 0)
+            return "<none>";
+
+        if (normalizedDescriptors.Count <= maxItems)
+            return string.Join(", ", normalizedDescriptors);
+
+        return string.Join(", ", normalizedDescriptors.Take(maxItems)) +
+               $" (+{normalizedDescriptors.Count - maxItems} more)";
+    }
+
+    private List<JetBrains.ReSharper.Psi.Resolve.IReference> FindReferences(
+        Lifetime lt,
+        IDeclaredElement element,
+        ISearchDomain searchDomain,
+        int limit,
+        FindReferencesTraceContext? trace = null,
+        string searchMode = "legacy",
+        IProgressIndicator? progressIndicator = null)
+    {
         var referenceResults = new List<FindResult>();
+        var effectiveProgressIndicator = ResolveFindReferencesProgressIndicator(progressIndicator);
         var consumer = new FindResultConsumer<List<FindResult>>(
             result => new List<FindResult> { result },
             results =>
@@ -2167,18 +4496,40 @@ public class IndexMcpBackendHost
                 {
                     EnsureLifetimeAlive(lt);
                     referenceResults.Add(result);
-                    if (referenceResults.Count >= MaxResults)
+                    if (referenceResults.Count >= limit)
                         return FindExecution.Stop;
                 }
                 return FindExecution.Continue;
             });
 
-        _solution.GetPsiServices().Finder.FindReferences(
-            element,
-            searchDomain,
-            consumer,
-            NoOpProgressIndicator.Instance,
-            false);
+        var findStopwatch = Stopwatch.StartNew();
+        LogFindReferencesInfo(
+            trace,
+            $"finder.{searchMode}.start",
+            $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}, limit={limit}, element={DescribeElement(element)}");
+        try
+        {
+            _solution.GetPsiServices().Finder.FindReferences(
+                element,
+                searchDomain,
+                consumer,
+                effectiveProgressIndicator,
+                false);
+        }
+        catch (Exception ex)
+        {
+            findStopwatch.Stop();
+            LogFindReferencesWarning(
+                trace,
+                $"stage=finder.{searchMode}, elapsedMs={trace?.ElapsedMilliseconds ?? findStopwatch.ElapsedMilliseconds}, stageElapsedMs={findStopwatch.ElapsedMilliseconds}, exception={ex.GetType().FullName}: {ex.Message}");
+            throw;
+        }
+        findStopwatch.Stop();
+
+        LogFindReferencesInfo(
+            trace,
+            $"finder.{searchMode}.end",
+            $"elapsedMs={trace?.ElapsedMilliseconds ?? findStopwatch.ElapsedMilliseconds}, stageElapsedMs={findStopwatch.ElapsedMilliseconds}, collectedCount={referenceResults.Count}, limit={limit}");
 
         return referenceResults
             .OfType<FindResultReference>()
@@ -2187,16 +4538,518 @@ public class IndexMcpBackendHost
             .ToList();
     }
 
+    private static IProgressIndicator ResolveFindReferencesProgressIndicator(IProgressIndicator? progressIndicator)
+    {
+        return progressIndicator ?? NoOpProgressIndicator.Instance;
+    }
+
+    private static FindReferencesTraceContext StartFindReferencesTrace(RdFindReferencesRequest request, int effectiveLimit)
+    {
+        var trace = new FindReferencesTraceContext(Interlocked.Increment(ref ourFindReferencesRequestSequence));
+        LogFindReferencesInfo(
+            trace,
+            "start",
+            $"language={request.Target.Language ?? "<null>"}, symbol={request.Target.Symbol ?? "<null>"}, scope={request.Scope}, limit={effectiveLimit}, targetKind={GetTargetKind(request.Target)}, traceFile={FindReferencesTraceSink.BuildTraceFilePath()}"
+        );
+        return trace;
+    }
+
+    private static string GetTargetKind(RdSemanticTarget target)
+    {
+        if (!string.IsNullOrWhiteSpace(target.FilePath) && target.Line.HasValue && target.Column.HasValue)
+            return "position";
+        if (!string.IsNullOrWhiteSpace(target.Language) && !string.IsNullOrWhiteSpace(target.Symbol))
+            return "symbol";
+        return "unknown";
+    }
+
+    private static string FormatExtensions(IReadOnlyList<string>? extensions)
+    {
+        return extensions == null || extensions.Count == 0
+            ? "<none>"
+            : string.Join(",", extensions);
+    }
+
+    private static string DescribeElement(IDeclaredElement? element)
+    {
+        if (element == null)
+            return "<null>";
+
+        var kind = element.GetType().Name;
+        var qualifiedName = GetQualifiedName(element);
+        return string.IsNullOrWhiteSpace(qualifiedName)
+            ? kind
+            : $"{kind}:{qualifiedName}";
+    }
+
+    private static string DescribeFindReferencesResolvedTarget(IDeclaredElement element, string origin)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+
+        var declaration = PickPreferredDeclaration(element);
+        var sourceFilePath = declaration?.GetSourceFile()?.GetLocation().FullPath;
+        var elementType = element is ITypeElement ? "ITypeElement" : "IDeclaredElement";
+        var hasSourcePath = !string.IsNullOrWhiteSpace(sourceFilePath) ? "true" : "false";
+
+        return $"origin={origin}, qualifiedName={GetQualifiedName(element)}, kind={GetElementKind(element)}, " +
+               $"elementType={elementType}, presentationLanguage={element.PresentationLanguage?.Name ?? "<null>"}, " +
+               $"hasSourcePath={hasSourcePath}, sourceFilePath={sourceFilePath ?? "<absent>"}";
+    }
+
+    private static string FormatFindReferencesUnresolvedTargetMessage(
+        string? language,
+        string symbol,
+        string scope,
+        IndexedSymbolResolution resolution)
+    {
+        ArgumentNullException.ThrowIfNull(resolution);
+        return FormatFindReferencesUnresolvedTargetMessage(language, symbol, scope, resolution.Status, resolution.Message, "primary_lookup");
+    }
+
+    private static string FormatFindReferencesUnresolvedTargetMessage(
+        string? language,
+        string symbol,
+        string scope,
+        string status,
+        string? message,
+        string origin)
+    {
+        return $"find_references target_resolution_failed status={status}, origin={origin}, language={language ?? "<null>"}, " +
+               $"symbol={symbol}, scope={scope}, message={message ?? "<none>"}";
+    }
+
+    private static string FormatFindReferencesTargetResolutionFailureMessage(
+        RdSemanticTarget target,
+        string scope,
+        string status,
+        string? message,
+        string origin)
+    {
+        if (IsFindReferencesSymbolTarget(target))
+        {
+            return FormatFindReferencesUnresolvedTargetMessage(
+                target.Language,
+                target.Symbol ?? "<null>",
+                scope,
+                status,
+                message,
+                origin);
+        }
+
+        var position = !string.IsNullOrWhiteSpace(target.FilePath) && target.Line.HasValue && target.Column.HasValue
+            ? $"{target.FilePath}:{target.Line}:{target.Column}"
+            : "<unknown>";
+
+        return $"find_references target_resolution_failed status={status}, origin={origin}, target={position}, " +
+               $"scope={scope}, message={message ?? "<none>"}";
+    }
+
+    private static string FormatBoundedFindReferencesSkipMessage(
+        string searchRoute,
+        IDeclaredElement element,
+        string category,
+        int index,
+        int total,
+        string descriptor,
+        string exceptionType,
+        string exceptionMessage,
+        long elapsedMilliseconds,
+        long stageElapsedMilliseconds,
+        int collectedCount)
+    {
+        return $"stage=find-bounded.skip, partial=true, searchRoute={searchRoute}, target={DescribeFindReferencesResolvedTarget(element, "resolved")}, " +
+               $"category={category}, index={index}, total={total}, descriptor={descriptor}, exception={exceptionType}: {exceptionMessage}, " +
+               $"elapsedMs={elapsedMilliseconds}, stageElapsedMs={stageElapsedMilliseconds}, collectedCount={collectedCount}";
+    }
+
+    private static bool IsFindReferencesSymbolTarget(RdSemanticTarget target)
+    {
+        return !string.IsNullOrWhiteSpace(target.Language) && !string.IsNullOrWhiteSpace(target.Symbol);
+    }
+
+    private static bool ShouldRaiseFindReferencesTargetResolutionFailure(RdSemanticTarget target, string status)
+    {
+        return IsFindReferencesSymbolTarget(target) ||
+               (IsFindReferencesPositionTarget(target) &&
+                IsFSharpFindReferencesTarget(target) &&
+                (status.Equals("unsupported_target", StringComparison.OrdinalIgnoreCase) ||
+                 status.Equals("ambiguous_match", StringComparison.OrdinalIgnoreCase) ||
+                 status.Equals("unresolved_target", StringComparison.OrdinalIgnoreCase))) ||
+               status.Equals("unsupported_language_capability", StringComparison.OrdinalIgnoreCase) ||
+               status.Equals("unavailable_feature", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsFindReferencesPositionTarget(RdSemanticTarget target)
+    {
+        return !string.IsNullOrWhiteSpace(target.FilePath) &&
+               target.Line.HasValue &&
+               target.Column.HasValue;
+    }
+
+    private static bool IsFSharpFindReferencesTarget(RdSemanticTarget target)
+    {
+        if (NormalizeLanguage(target.Language) == "F#")
+            return true;
+
+        var fileExtension = Path.GetExtension(target.FilePath ?? string.Empty);
+        return FSharpProjectFileExtensions.Contains(fileExtension, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static void LogFindReferencesInfo(FindReferencesTraceContext? trace, string stage, string message)
+    {
+        if (trace == null)
+            return;
+
+        FindReferencesTraceSink.WriteInfo(trace.RequestId, stage, message);
+    }
+
+    private static void LogFindReferencesWarning(FindReferencesTraceContext? trace, string message)
+    {
+        if (trace == null)
+            return;
+
+        FindReferencesTraceSink.WriteWarning(trace.RequestId, message);
+    }
+
+    private static RenameTraceContext StartRenameTrace(string operation, string details)
+    {
+        var trace = new RenameTraceContext(Interlocked.Increment(ref ourRenameRequestSequence));
+        RenameTraceSink.WriteInfo(trace.RequestId, "start", $"operation={operation} {details}");
+        return trace;
+    }
+
+    private static void LogRenameInfo(RenameTraceContext? trace, string stage, string message)
+    {
+        if (trace == null)
+            return;
+
+        RenameTraceSink.WriteInfo(trace.RequestId, stage, message);
+    }
+
+    private static void LogRenameWarning(RenameTraceContext? trace, string message)
+    {
+        if (trace == null)
+            return;
+
+        RenameTraceSink.WriteWarning(trace.RequestId, message);
+    }
+
+    private static void TraceRenameStage(RenameTraceContext? trace, string stage, Action action)
+    {
+        TraceRenameStage<object?>(trace, stage, () =>
+        {
+            action();
+            return null;
+        });
+    }
+
+    private static T TraceRenameStage<T>(
+        RenameTraceContext? trace,
+        string stage,
+        Func<T> action,
+        Func<T, string>? successDetails = null)
+    {
+        LogRenameInfo(trace, $"{stage}.start", $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}");
+        try
+        {
+            var result = action();
+            var message = $"elapsedMs={trace?.ElapsedMilliseconds ?? 0}";
+            var details = successDetails?.Invoke(result);
+            if (!string.IsNullOrWhiteSpace(details))
+                message += $", {details}";
+
+            LogRenameInfo(trace, $"{stage}.end", message);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            LogRenameWarning(trace, FormatRenameStageException(stage, trace, ex));
+            throw;
+        }
+    }
+
+    private static string FormatRenameStageException(string stage, RenameTraceContext? trace, Exception ex)
+    {
+        return $"stage={stage}, elapsedMs={trace?.ElapsedMilliseconds ?? 0}, exception={ex.GetType().FullName}: {ex.Message}";
+    }
+
+    private sealed class RenameTraceContext(long requestId)
+    {
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+
+        public long RequestId { get; } = requestId;
+
+        public long ElapsedMilliseconds => _stopwatch.ElapsedMilliseconds;
+    }
+
+    private sealed class RenameExecutionAttempt
+    {
+        private RenameExecutionAttempt(bool succeeded, bool isUnsupported, string message)
+        {
+            Succeeded = succeeded;
+            IsUnsupported = isUnsupported;
+            Message = message;
+        }
+
+        public bool Succeeded { get; }
+
+        public bool IsUnsupported { get; }
+
+        public string Message { get; }
+
+        public static RenameExecutionAttempt Success(string message = "")
+            => new(true, false, message);
+
+        public static RenameExecutionAttempt Unsupported(string message)
+            => new(false, true, message);
+    }
+
+    private sealed class RenameServiceExecutionPlan
+    {
+        private RenameServiceExecutionPlan(bool isSupported, string? selectedMethodSignature, bool requiresTextControl,
+            IReadOnlyList<string> availableMethodSignatures, string message)
+        {
+            IsSupported = isSupported;
+            SelectedMethodSignature = selectedMethodSignature;
+            RequiresTextControl = requiresTextControl;
+            AvailableMethodSignatures = availableMethodSignatures;
+            Message = message;
+        }
+
+        public bool IsSupported { get; }
+
+        public string? SelectedMethodSignature { get; }
+
+        public bool RequiresTextControl { get; }
+
+        public IReadOnlyList<string> AvailableMethodSignatures { get; }
+
+        public string Message { get; }
+
+        public static RenameServiceExecutionPlan Unsupported(string? selectedMethodSignature, bool requiresTextControl,
+            IReadOnlyList<string> availableMethodSignatures, string message)
+            => new(false, selectedMethodSignature, requiresTextControl, availableMethodSignatures, message);
+    }
+
+    private sealed class FindReferencesTraceContext(long requestId)
+    {
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+        private int _isPartial;
+
+        public long RequestId { get; } = requestId;
+
+        public long ElapsedMilliseconds => _stopwatch.ElapsedMilliseconds;
+
+        public bool IsPartial => Volatile.Read(ref _isPartial) == 1;
+
+        public void MarkPartial()
+        {
+            Interlocked.Exchange(ref _isPartial, 1);
+        }
+    }
+
+    private sealed record ClassifiedBoundedFindReferencesException(string Category, Exception Exception);
+
+    private sealed record ContainerCandidateResolution(
+        List<IDeclaredElement> Matches,
+        string Origin,
+        bool UsedClrPredefinedFallback);
+
+    private sealed record BoundedFindReferencesSkipDiagnostic(
+        int Index,
+        int Total,
+        string Descriptor,
+        string Category,
+        string ExceptionType,
+        string ExceptionMessage,
+        long ElapsedMilliseconds,
+        long StageElapsedMilliseconds,
+        int CollectedCount);
+
+    private sealed class FindReferencesTargetResolution
+    {
+        private FindReferencesTargetResolution(string status, string? message, IDeclaredElement? element, string origin)
+        {
+            Status = status;
+            Message = message;
+            Element = element;
+            Origin = origin;
+        }
+
+        public string Status { get; }
+        public string? Message { get; }
+        public IDeclaredElement? Element { get; }
+        public string Origin { get; }
+
+        public static FindReferencesTargetResolution Success(IDeclaredElement element, string origin) =>
+            new("success", null, element, origin);
+
+        public static FindReferencesTargetResolution Failure(string status, string? message, string origin) =>
+            new(status, message, null, origin);
+
+        public static FindReferencesTargetResolution FromResolution(IndexedSymbolResolution resolution, string origin)
+        {
+            ArgumentNullException.ThrowIfNull(resolution);
+            return resolution.TryGetElement() != null
+                ? Success(resolution.TryGetElement()!, origin)
+                : Failure(resolution.Status, resolution.Message, origin);
+        }
+
+        public IDeclaredElement? TryGetElement() => Status == "success" ? Element : null;
+    }
+
+    private static class FindReferencesTraceSink
+    {
+        private const string TraceFileName = "indexmcp-findreferences-trace.log";
+        private static readonly object ourWriteLock = new();
+
+        public static void WriteInfo(long requestId, string stage, string message)
+        {
+            AppendLine(
+                BuildTraceFilePath(),
+                $"{DateTime.UtcNow:O} INFO [IndexMcp.FindReferences #{requestId}] {stage} {message}");
+        }
+
+        public static void WriteWarning(long requestId, string message)
+        {
+            AppendLine(
+                BuildTraceFilePath(),
+                $"{DateTime.UtcNow:O} WARN [IndexMcp.FindReferences #{requestId}] {message}");
+        }
+
+        internal static string BuildTraceFilePath()
+        {
+            return Path.Combine(Path.GetTempPath(), TraceFileName);
+        }
+
+        internal static void AppendLine(string path, string line)
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(directory))
+                    Directory.CreateDirectory(directory);
+
+                lock (ourWriteLock)
+                {
+                    File.AppendAllText(path, line + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // Logging must never affect request execution.
+            }
+        }
+    }
+
+    private static class RenameTraceSink
+    {
+        private const string TraceFileName = "indexmcp-rename-trace.log";
+        private static readonly object ourWriteLock = new();
+
+        public static void WriteInfo(long requestId, string stage, string message)
+        {
+            AppendLine(
+                BuildTraceFilePath(),
+                $"{DateTime.UtcNow:O} INFO [IndexMcp.Rename #{requestId}] {stage} {message}");
+        }
+
+        public static void WriteWarning(long requestId, string message)
+        {
+            AppendLine(
+                BuildTraceFilePath(),
+                $"{DateTime.UtcNow:O} WARN [IndexMcp.Rename #{requestId}] {message}");
+        }
+
+        internal static string BuildTraceFilePath()
+        {
+            return Path.Combine(Path.GetTempPath(), TraceFileName);
+        }
+
+        internal static void AppendLine(string path, string line)
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(directory))
+                    Directory.CreateDirectory(directory);
+
+                lock (ourWriteLock)
+                {
+                    File.AppendAllText(path, line + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // Logging must never affect request execution.
+            }
+        }
+    }
+
     private List<string> GetPotentiallyAffectedFiles(IDeclaredElement element)
     {
         return element.GetDeclarations()
             .Select(declaration => declaration.GetSourceFile()?.GetLocation().FullPath)
-            .Concat(FindReferences(Lifetime.Eternal, element)
+            .Concat(FindReferences(Lifetime.Eternal, element, MaxResults)
                 .Select(reference => reference.GetTreeNode().GetSourceFile()?.GetLocation().FullPath))
             .Where(path => !string.IsNullOrWhiteSpace(path))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Cast<string>()
             .ToList();
+    }
+
+    private MutationSemanticEvidence CollectFileMutationSemanticEvidence(string primaryFilePath, IReadOnlyList<string> declaredTypeNames)
+    {
+        var projectFile = GetProjectFileForPath(primaryFilePath);
+        var psiFile = GetPsiFileForPath(primaryFilePath);
+        var confirmedAffectedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var confirmedReferenceFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (projectFile != null && File.Exists(primaryFilePath))
+            confirmedAffectedFiles.Add(primaryFilePath);
+
+        if (psiFile != null)
+        {
+            foreach (var element in GetDeclaredTypeElementsForFile(psiFile, primaryFilePath, declaredTypeNames))
+            {
+                foreach (var affectedFile in GetPotentiallyAffectedFiles(element))
+                {
+                    if (string.IsNullOrWhiteSpace(affectedFile))
+                        continue;
+
+                    confirmedAffectedFiles.Add(affectedFile);
+                    if (!PathsEqual(affectedFile, primaryFilePath))
+                        confirmedReferenceFiles.Add(affectedFile);
+                }
+            }
+        }
+
+        return MutationSemanticEvidence.Create(
+            projectFile != null,
+            psiFile != null,
+            confirmedAffectedFiles,
+            confirmedReferenceFiles);
+    }
+
+    private IEnumerable<ITypeElement> GetDeclaredTypeElementsForFile(IFile psiFile, string primaryFilePath, IReadOnlyList<string> declaredTypeNames)
+    {
+        var declaredElements = new List<IDeclaredElement>();
+        CollectDeclaredElements(psiFile, declaredElements);
+        var expectedNames = new HashSet<string>(declaredTypeNames ?? Array.Empty<string>(), StringComparer.Ordinal);
+
+        return declaredElements
+            .OfType<ITypeElement>()
+            .Where(element => ElementDeclaredInFile(element, primaryFilePath))
+            .Where(element => expectedNames.Count == 0 || expectedNames.Contains(element.ShortName))
+            .Distinct();
+    }
+
+    private static bool ElementDeclaredInFile(IDeclaredElement element, string primaryFilePath)
+    {
+        return element.GetDeclarations()
+            .Select(declaration => declaration.GetSourceFile()?.GetLocation().FullPath)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Any(path => PathsEqual(path, primaryFilePath));
     }
 
     private static void AddAffectedFile(List<string> affectedFiles, string? path)
@@ -2311,6 +5164,18 @@ public class IndexMcpBackendHost
         return psiFiles.FirstOrDefault(ContainsDeclaredElement) ?? psiFiles.FirstOrDefault();
     }
 
+    private IProjectFile? GetProjectFileForPath(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath) || _solution == null)
+            return null;
+
+        var normalizedPath = filePath.Replace('/', Path.DirectorySeparatorChar);
+        var vfp = VirtualFileSystemPath.Parse(normalizedPath, InteractionContext.SolutionContext);
+        return _solution.FindProjectItemsByLocation(vfp)
+            .OfType<IProjectFile>()
+            .FirstOrDefault();
+    }
+
     private static bool ContainsDeclaredElement(ITreeNode node)
     {
         if (TryGetDeclaredElement(node, out _)) return true;
@@ -2347,9 +5212,7 @@ public class IndexMcpBackendHost
         }
 
         var language = element.PresentationLanguage?.Name ?? "C#";
-        var signature = element is IParametersOwner paramOwner
-            ? $"{element.ShortName}({string.Join(", ", paramOwner.Parameters.Select(p => p.Type.GetPresentableName(CSharpLanguage.Instance!)))})"
-            : null;
+        var signature = BuildPresentableSignature(element);
 
         return new RdSymbolInfo(
             name: element.ShortName,
@@ -2438,9 +5301,7 @@ public class IndexMcpBackendHost
                     line = (int)document.GetCoordsByOffset(offset).Line + 1;
                 }
 
-                var signature = element is IParametersOwner paramOwner
-                    ? $"{element.ShortName}({string.Join(", ", paramOwner.Parameters.Select(p => p.Type.GetPresentableName(CSharpLanguage.Instance!)))})"
-                    : null;
+                var signature = BuildPresentableSignature(element);
 
                 nodes.Add(new RdFlatStructureNode(
                     name: element.ShortName,
@@ -2484,19 +5345,50 @@ internal sealed class FindReferencesResolutionPlan
     public FindReferencesResolutionPlan(
         IReadOnlyList<string>? allowedProjectFileExtensions,
         bool useProjectQualifiedTypeLookup,
+        bool useBoundedProjectFileSearch,
         bool allowLibraryFallback,
-        bool rejectUnboundedReferenceSearch)
+        bool rejectUnboundedReferenceSearch,
+        string targetKind,
+        bool isFSharpPositionTarget,
+        bool isFSharpSymbolTarget)
     {
         AllowedProjectFileExtensions = allowedProjectFileExtensions;
         UseProjectQualifiedTypeLookup = useProjectQualifiedTypeLookup;
+        UseBoundedProjectFileSearch = useBoundedProjectFileSearch;
         AllowLibraryFallback = allowLibraryFallback;
         RejectUnboundedReferenceSearch = rejectUnboundedReferenceSearch;
+        TargetKind = targetKind;
+        IsFSharpPositionTarget = isFSharpPositionTarget;
+        IsFSharpSymbolTarget = isFSharpSymbolTarget;
     }
 
     public IReadOnlyList<string>? AllowedProjectFileExtensions { get; }
     public bool UseProjectQualifiedTypeLookup { get; }
+    public bool UseBoundedProjectFileSearch { get; }
     public bool AllowLibraryFallback { get; }
     public bool RejectUnboundedReferenceSearch { get; }
+    public string TargetKind { get; }
+    public bool IsFSharpPositionTarget { get; }
+    public bool IsFSharpSymbolTarget { get; }
+}
+
+internal sealed class FSharpCapabilityAvailability
+{
+    private FSharpCapabilityAvailability(bool isAvailable, string? failureStatus, string? failureMessage)
+    {
+        IsAvailable = isAvailable;
+        FailureStatus = failureStatus;
+        FailureMessage = failureMessage;
+    }
+
+    public bool IsAvailable { get; }
+    public string? FailureStatus { get; }
+    public string? FailureMessage { get; }
+
+    public static FSharpCapabilityAvailability Available() => new(true, null, null);
+
+    public static FSharpCapabilityAvailability Unavailable(string status, string message) =>
+        new(false, status, message);
 }
 
 internal sealed class CallableTarget
@@ -2605,6 +5497,55 @@ internal sealed class NoOpProgressIndicator : IProgressIndicator
     public bool IsCanceled { get; set; }
     public string? TaskName { get; set; }
     public string? CurrentItemText { get; set; }
+
+    public void Start(int totalWork) { }
+    public void Stop() { }
+    public void Advance(double work) { }
+    public void Dispose() { }
+}
+
+internal sealed class DeadlineProgressIndicator : IProgressIndicator
+{
+    private bool _isCanceled;
+
+    public DeadlineProgressIndicator(DateTime deadlineUtc, string timeoutMessage)
+    {
+        DeadlineUtc = deadlineUtc;
+        TimeoutMessage = timeoutMessage;
+    }
+
+    public DateTime DeadlineUtc { get; }
+    public string TimeoutMessage { get; }
+    public bool HasExpired => DateTime.UtcNow >= DeadlineUtc;
+    public bool IsCanceled
+    {
+        get => _isCanceled || HasExpired;
+        set => _isCanceled = value;
+    }
+
+    public string? TaskName { get; set; }
+    public string? CurrentItemText { get; set; }
+
+    public void ThrowIfExpired()
+    {
+        if (HasExpired)
+            throw CreateTimeoutException();
+    }
+
+    public TimeoutException Wrap(Exception innerException)
+    {
+        return innerException is TimeoutException timeoutException &&
+               string.Equals(timeoutException.Message, TimeoutMessage, StringComparison.Ordinal)
+            ? timeoutException
+            : CreateTimeoutException(innerException);
+    }
+
+    public TimeoutException CreateTimeoutException(Exception? innerException = null)
+    {
+        return innerException == null
+            ? new TimeoutException(TimeoutMessage)
+            : new TimeoutException(TimeoutMessage, innerException);
+    }
 
     public void Start(int totalWork) { }
     public void Stop() { }

@@ -22,8 +22,11 @@ import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiManager
 import com.intellij.psi.PsiNamedElement
 import java.io.File
+import java.nio.file.Path
+import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Rider protocol-based handlers for C# and F# code intelligence.
@@ -325,6 +328,42 @@ object RdProtocolBridge {
     }
 }
 
+internal object RiderRenameTraceSink {
+    private const val TRACE_FILE_NAME = "indexmcp-rename-trace.log"
+    private val writeLock = Any()
+    private val requestSequence = AtomicLong()
+
+    internal fun nextRequestId(): Long = requestSequence.incrementAndGet()
+
+    internal fun writeInfo(requestId: Long, stage: String, message: String) {
+        appendLine(
+            buildTraceFilePath(),
+            "${Instant.now()} INFO [IndexMcp.Rename #$requestId] $stage $message"
+        )
+    }
+
+    internal fun writeWarning(requestId: Long, stage: String, message: String) {
+        appendLine(
+            buildTraceFilePath(),
+            "${Instant.now()} WARN [IndexMcp.Rename #$requestId] $stage $message"
+        )
+    }
+
+    internal fun buildTraceFilePath(): String =
+        Path.of(System.getProperty("java.io.tmpdir"), TRACE_FILE_NAME).toString()
+
+    internal fun appendLine(path: String, line: String) {
+        try {
+            File(path).parentFile?.mkdirs()
+            synchronized(writeLock) {
+                File(path).appendText(line + System.lineSeparator())
+            }
+        } catch (_: Exception) {
+            // Trace logging must never affect rename execution.
+        }
+    }
+}
+
 const val MODEL_PKG = "com.jetbrains.rd.ide.model"
 
 data class RiderBackendResponse<T>(
@@ -344,6 +383,9 @@ internal fun RdCallOutcome.Timeout.toUserMessage(operation: String): String =
 
 internal fun RdCallOutcome.Failure.toUserMessage(operation: String): String {
     val detail = cause.message?.takeIf { it.isNotBlank() } ?: cause.toString()
+    if (detail.contains("requires warmed ReSharper usage caches", ignoreCase = false)) {
+        return detail
+    }
     return "Rider backend failed while $operation (rd call '$callName'): $detail"
 }
 
@@ -359,12 +401,116 @@ internal data class RiderBackendSymbolResult(
     val symbolInfo: Any?
 )
 
+internal data class RiderBackendVerificationResult(
+    val status: String?,
+    val checksRun: List<String>,
+    val warnings: List<String>
+)
+
+internal data class RiderBackendRenameDiagnostics(
+    val resolutionStatus: String?,
+    val targetKind: String?,
+    val resolvedName: String?,
+    val sourceTokenText: String?,
+    val executionHint: String?,
+    val unsupportedReason: String?,
+    val traceStages: List<String>
+)
+
+internal data class RiderBackendMutationResult(
+    val success: Boolean,
+    val status: String?,
+    val message: String?,
+    val affectedFiles: List<String>,
+    val changesCount: Int,
+    val verification: RiderBackendVerificationResult?,
+    val renameDiagnostics: RiderBackendRenameDiagnostics?
+)
+
+internal object RiderBackendMutationResultMapper {
+    private const val RENAME_DIAGNOSTICS_PREFIX = "[backendSymbolRename:"
+    private val renameDiagnosticsEntryRegex = Regex("""(?:^|,\s*)([A-Za-z][A-Za-z0-9]*)=(.*?)(?=,\s*[A-Za-z][A-Za-z0-9]*=|$)""")
+
+    fun fromRdResult(result: Any): RiderBackendMutationResult {
+        val rawMessage = RdProtocolBridge.getProperty(result, "message") as? String
+        val parsedMessage = parseRenameDiagnostics(rawMessage)
+        val verification = parseVerification(RdProtocolBridge.getProperty(result, "verification"))
+        @Suppress("UNCHECKED_CAST")
+        val affectedFiles = (RdProtocolBridge.getProperty(result, "affectedFiles") as? List<String>) ?: emptyList()
+
+        return RiderBackendMutationResult(
+            success = RdProtocolBridge.getProperty(result, "success") as? Boolean ?: false,
+            status = RdProtocolBridge.getProperty(result, "status") as? String,
+            message = parsedMessage.userMessage,
+            affectedFiles = affectedFiles,
+            changesCount = RdProtocolBridge.getProperty(result, "changesCount") as? Int ?: 0,
+            verification = verification,
+            renameDiagnostics = parsedMessage.renameDiagnostics
+        )
+    }
+
+    private fun parseVerification(verification: Any?): RiderBackendVerificationResult? {
+        verification ?: return null
+        @Suppress("UNCHECKED_CAST")
+        val checksRun = (RdProtocolBridge.getProperty(verification, "checksRun") as? List<String>) ?: emptyList()
+        @Suppress("UNCHECKED_CAST")
+        val warnings = (RdProtocolBridge.getProperty(verification, "warnings") as? List<String>) ?: emptyList()
+        return RiderBackendVerificationResult(
+            status = RdProtocolBridge.getProperty(verification, "status") as? String,
+            checksRun = checksRun,
+            warnings = warnings
+        )
+    }
+
+    private fun parseRenameDiagnostics(message: String?): ParsedRiderBackendMessage {
+        if (message.isNullOrBlank()) {
+            return ParsedRiderBackendMessage(message, null)
+        }
+
+        val markerIndex = message.lastIndexOf(RENAME_DIAGNOSTICS_PREFIX)
+        if (markerIndex < 0 || !message.endsWith(']')) {
+            return ParsedRiderBackendMessage(message, null)
+        }
+
+        val userMessage = message.substring(0, markerIndex).trimEnd().ifBlank { null }
+        val payload = message.substring(markerIndex + RENAME_DIAGNOSTICS_PREFIX.length, message.length - 1).trim()
+        val entries = renameDiagnosticsEntryRegex.findAll(payload)
+            .associate { match ->
+                match.groupValues[1] to match.groupValues[2].trim()
+            }
+
+        val diagnostics = RiderBackendRenameDiagnostics(
+            resolutionStatus = entries["resolutionStatus"].normalizedDiagnosticValue(),
+            targetKind = entries["targetKind"].normalizedDiagnosticValue(),
+            resolvedName = entries["resolvedName"].normalizedDiagnosticValue(),
+            sourceTokenText = entries["sourceTokenText"].normalizedDiagnosticValue(),
+            executionHint = entries["executionHint"].normalizedDiagnosticValue(),
+            unsupportedReason = entries["unsupportedReason"].normalizedDiagnosticValue(),
+            traceStages = entries["traceStages"].normalizedDiagnosticValue()
+                ?.split('>')
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                ?: emptyList()
+        )
+
+        return ParsedRiderBackendMessage(userMessage, diagnostics)
+    }
+
+    private fun String?.normalizedDiagnosticValue(): String? =
+        this?.takeUnless { it.isBlank() || it == "<null>" }
+
+    private data class ParsedRiderBackendMessage(
+        val userMessage: String?,
+        val renameDiagnostics: RiderBackendRenameDiagnostics?
+    )
+}
+
 object RiderBackendSemanticService {
     private val LOG = logger<RiderBackendSemanticService>()
 
     private fun canHandleLanguage(language: String?): Boolean =
-        language == null || CSHARP_LANGUAGE_IDS.any { it.equals(language, ignoreCase = true) } ||
-            FSHARP_LANGUAGE_IDS.any { it.equals(language, ignoreCase = true) }
+        language == null || isAcceptedLanguageAlias(language, CSHARP_LANGUAGE_IDS) ||
+            isAcceptedLanguageAlias(language, FSHARP_LANGUAGE_IDS)
 
     fun isDotNetFile(file: String?): Boolean {
         val ext = file?.substringAfterLast('.', missingDelimiterValue = "")?.lowercase()
@@ -398,6 +544,38 @@ object RiderBackendSemanticService {
             handled = true,
             value = types.mapNotNull { rdSymbolToSymbolMatch(project, it) }
                 .distinctBy { "${it.qualifiedName}:${it.file}:${it.line}" }
+                .take(limit)
+        )
+    }
+
+    fun findSymbols(
+        project: Project,
+        query: String,
+        scope: BuiltInSearchScope,
+        language: String?,
+        limit: Int
+    ): RiderBackendResponse<List<SymbolMatch>> {
+        val normalizedLanguage = normalizeAcceptedCSharpAlias(language)
+        if (!canUseBackend(project) || normalizedLanguage != CSHARP_CANONICAL_LANGUAGE_ID) {
+            return RiderBackendResponse(handled = false)
+        }
+
+        val model = RdProtocolBridge.getModel(project) ?: return RiderBackendResponse(handled = true)
+        val request = RdProtocolBridge.createStruct(
+            "$MODEL_PKG.RdFindSymbolsRequest",
+            query,
+            scope.wireValue,
+            normalizedLanguage,
+            limit
+        ) ?: return RiderBackendResponse(handled = true)
+        val result = RdProtocolBridge.invokeCall(model, "findSymbols", request) ?: return RiderBackendResponse(handled = true)
+        @Suppress("UNCHECKED_CAST")
+        val symbols = (RdProtocolBridge.getProperty(result, "symbols") as? List<Any>) ?: emptyList()
+
+        return RiderBackendResponse(
+            handled = true,
+            value = symbols.mapNotNull { rdSymbolToSymbolMatch(project, it) }
+                .distinctBy { "${it.qualifiedName}:${it.file}:${it.line}:${it.column}" }
                 .take(limit)
         )
     }
@@ -633,10 +811,19 @@ object RiderBackendSemanticService {
 
 private val CSHARP_EXTENSIONS = setOf("cs", "csx")
 private val FSHARP_EXTENSIONS = setOf("fs", "fsi", "fsx")
+internal const val CSHARP_CANONICAL_LANGUAGE_ID = "C#"
 private val CSHARP_LANGUAGE_IDS = setOf("C#", "CSHARP", "CSharp")
 private val FSHARP_LANGUAGE_IDS = setOf("F#", "FSHARP", "FSharp")
 internal const val IMPLEMENTATIONS_RESULT_LIMIT = PaginationService.DEFAULT_OVERCOLLECT
 internal const val CALL_HIERARCHY_RESULT_LIMIT = 20
+
+internal fun normalizeAcceptedCSharpAlias(language: String?): String? =
+    language?.takeIf { it.isNotBlank() }?.let {
+        if (isAcceptedLanguageAlias(it, CSHARP_LANGUAGE_IDS)) CSHARP_CANONICAL_LANGUAGE_ID else it
+    }
+
+private fun isAcceptedLanguageAlias(language: String, aliases: Set<String>): Boolean =
+    aliases.any { it.equals(language, ignoreCase = true) }
 
 private fun riderBackendPath(file: VirtualFile): String =
     file.path.replace('/', File.separatorChar)

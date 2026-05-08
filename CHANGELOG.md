@@ -4,12 +4,35 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Rider rename documentation now matches the canonical external status contract.** `ide_refactor_rename` is documented with the terminal statuses `success`, `no_op`, `needs_active_editor`, `conflict`, `unsupported_context`, and `failed`; legacy verification terms now appear only as metadata/trace context.
+- **Usage docs now reflect the verified C# rename path and the current F# limitation boundary.** Local checkout paths were removed from the guidance, C# is documented as the supported Rider-backed mutation lane, and F# is called out as beta/unstable until Rider language support matures.
+
+## [4.18.3] - 2026-05-06
+
+### Fixed
+- **Rider C# file-rename and move-file workflows now stay within verified, fail-closed boundaries.** File rename uses its dedicated file lane, move-file uses the bounded MoveToFolder lane, and both now describe terminal outcomes with the canonical external status contract; any legacy verification detail is kept in metadata/trace rather than surfaced as a final status.
+- **Release claims for Rider C# file mutations now stop at semantic verification.** The changelog reflects workflow-backed verification only and avoids overstating installed-runtime smoke execution or broader backend coverage that was not exercised here.
+
+## [4.18.2] - 2026-05-06
+
+### Changed
+- **Rider C# mutation paths now report bounded, backend-verified outcomes.** Symbol rename, file rename, move, and safe delete for Rider-backed C# use the backend routing/verification path with exact-target safety, backend-only move/safe-delete handling, and explicit `success` / `no_op` / `needs_active_editor` / `conflict` / `unsupported_context` / `failed` external statuses, while any legacy verification details remain confined to metadata/trace rather than terminal outcomes.
+- **Rider C# `find_symbol` now routes accepted C# aliases through the backend search lane.** Requests normalized from `C#`, `CSharp`, or `CSHARP` are handled by the Rider-backed C# symbol-search path, while non-C# search behavior remains unchanged.
+
+### Fixed
+- **Reformat and verification reporting are stricter for Rider C# workflows.** Partial-range validation, conservative `rearrangeCode=false` defaults, and honest `changesCount` / operations-run reporting help avoid overstating mutation results.
+- **Release claims stay limited to verified Rider C# production-readiness improvements.** The changelog reflects the tested mutation/search behavior and keeps the remaining Rider/ReSharper visibility caveats bounded.
+
 ### Added
 - **Rider C# / F# semantics powered by an in-process ReSharper backend** — Replaces the previous frontend-only navigation bridge with a real backend integration following the Rider plugin SDK pattern. The plugin now ships a ReSharper backend assembly (`ReSharperPlugin.IndexMcp.dll`) packaged under `dotnet/` in the plugin ZIP and bound through the rd protocol (`IndexMcpModel`). All position-based and symbol-based semantic operations for C# and F# (`ide_find_class`, `ide_find_definition`, `ide_find_references`, `ide_type_hierarchy`, `ide_call_hierarchy`, `ide_find_implementations`, `ide_find_super_methods`, `ide_refactor_rename`, `ide_move_file`) execute against ReSharper PSI/caches in the same process as Rider, instead of the limited frontend heuristics that previous versions used.
 - **`language` + `symbol` form for C# and F#.** `ide_find_definition`, `ide_find_references`, `ide_find_implementations`, `ide_find_super_methods`, and `ide_call_hierarchy` accept `language: "C#"` (or `"CSHARP"` / `"F#"` / `"FSHARP"`) plus a fully qualified `symbol` (e.g. `Namespace.TypeName`, `Namespace.TypeName#MethodName`, `Namespace.TypeName.PropertyName`) as an alternative to `file` + `line` + `column`.
 - **C# / F# rename and move use ReSharper's refactoring engine.** `ide_refactor_rename` for C# and F# acquires a backend write lock and runs ReSharper's rename workflow headlessly — no lexical search/replace fallback. `ide_move_file` adjusts namespaces and imports through ReSharper when moving `.cs` files between project folders.
 - **`project_and_libraries` scope returns BCL types.** `ide_find_class` for C# / F# in `project_and_libraries` scope returns source-less standard .NET / BCL types such as `System.Console` and `System.Collections.Generic.List<T>` from a curated catalog (single source of truth in `IndexMcpBackendHost.StandardDotNetTypes`).
 - **Live smoke harness for Rider** — `scripts/rider-live-smoke.ps1` exercises the full MCP tool surface against a real solution. Includes apply + revert assertions for `ide_refactor_rename` that cross-verify via `ide_find_class` to catch silent no-op renames.
+
+### Fixed
+- **Stabilized Rider F# `find_references` behavior.** F# position-based requests now use the primary bounded route, C# remains on the baseline path, and F# symbol-mode requests report explicit limitation diagnostics instead of implying full parity.
 
 ### Changed
 - README promotes Rider from "may work, untested" to **fully tested**.

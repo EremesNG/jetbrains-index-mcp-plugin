@@ -59,7 +59,7 @@ class FindUsagesTool : AbstractMcpTool() {
 
         Target (mutually exclusive):
         - file + line + column: position-based lookup (necessary for fresh search, ignored when cursor is provided)
-        - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#; necessary for fresh search, ignored when cursor is provided)
+        - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#; necessary for fresh search, ignored when cursor is provided). Note: Rider F# module/type-only symbol-mode searches in project_files use a bounded, cache-aware search to stay agent-friendly; cold IDE caches can still make the first search expensive, while position/member targets remain the preferred option for more deterministic latency.
         - cursor: pagination cursor from a previous response
 
         Parameters: scope (optional, default: "project_files"; supported: project_files, project_and_libraries, project_production_files, project_test_files), pageSize (optional, default: 100, max: 500).

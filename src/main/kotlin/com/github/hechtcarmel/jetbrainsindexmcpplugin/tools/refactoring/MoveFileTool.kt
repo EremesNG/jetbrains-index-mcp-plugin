@@ -1,7 +1,10 @@
 package com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring
 
-import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderEnvironment
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.MODEL_PKG
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RdProtocolBridge
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderBackendSemanticService
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.models.ToolCallResult
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.MutationVerification
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.RefactoringResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.schema.SchemaBuilder
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.util.PluginDetectors
@@ -27,6 +30,7 @@ import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.refactoring.move.moveFilesOrDirectories.MoveFilesOrDirectoriesProcessor
 import com.intellij.util.containers.MultiMap
 import com.intellij.usageView.UsageInfo
+import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlinx.serialization.json.Json
@@ -102,6 +106,12 @@ open class MoveFileTool : AbstractRefactoringTool() {
         val phpDeclarationPointer: SmartPsiElementPointer<PsiElement>? = null,
         val phpDeclarationName: String? = null
     )
+
+    private sealed interface RiderMoveOutcome {
+        data class Success(val result: ToolCallResult) : RiderMoveOutcome
+        data object NotInRider : RiderMoveOutcome
+        data class BackendCallFailed(val reason: String) : RiderMoveOutcome
+    }
 
     override suspend fun doExecute(project: Project, arguments: JsonObject): ToolCallResult {
         val file = requiredStringArg(arguments, "file").getOrElse {
@@ -186,10 +196,106 @@ open class MoveFileTool : AbstractRefactoringTool() {
             return createErrorResult(error ?: "Unknown validation error")
         }
 
+        if (RiderBackendSemanticService.isDotNetFile(file)) {
+            val riderResult = when (val riderOutcome = tryExecuteRiderMove(project, movePrep)) {
+                is RiderMoveOutcome.Success -> riderOutcome.result
+                is RiderMoveOutcome.NotInRider -> null
+                is RiderMoveOutcome.BackendCallFailed -> createErrorResult(
+                    "Rider ReSharper backend move failed: ${riderOutcome.reason}"
+                )
+            }
+            if (riderResult != null) return riderResult
+        }
+
         // ═══════════════════════════════════════════════════════════════════════
         // PHASE 4: EDT - Execute move processor (manages its own write actions)
         // ═══════════════════════════════════════════════════════════════════════
         return executeMove(project, movePrep)
+    }
+
+    private suspend fun tryExecuteRiderMove(project: Project, preparation: MovePreparation): RiderMoveOutcome {
+        commitDocuments(project)
+        edtAction { FileDocumentManager.getInstance().saveAllDocuments() }
+
+        val model = RdProtocolBridge.getModel(project) ?: return RiderMoveOutcome.NotInRider
+        val request = RdProtocolBridge.createStruct(
+            "$MODEL_PKG.RdMoveFileRequest",
+            preparation.psiFile.virtualFile.path,
+            preparation.targetDirectory.virtualFile.path
+        ) ?: return RiderMoveOutcome.BackendCallFailed(
+            "Failed to create rd move request struct (rdgen mismatch?)"
+        )
+        val result = RdProtocolBridge.invokeCall(model, "moveFile", request)
+            ?: return RiderMoveOutcome.BackendCallFailed(
+                "Backend rd call returned no result (timeout, fault, or cancellation; check IDE log for details)"
+            )
+
+        return mapRiderMoveResult(project, result)
+    }
+
+    private suspend fun mapRiderMoveResult(project: Project, result: Any): RiderMoveOutcome {
+        val success = RdProtocolBridge.getProperty(result, "success") as? Boolean ?: false
+        val message = RdProtocolBridge.getProperty(result, "message") as? String ?: "Rider backend move failed"
+        val status = RdProtocolBridge.getProperty(result, "status") as? String
+            ?: return RiderMoveOutcome.BackendCallFailed("Backend move result omitted required status field")
+
+        @Suppress("UNCHECKED_CAST")
+        val rawAffectedFiles = (RdProtocolBridge.getProperty(result, "affectedFiles") as? List<String>) ?: emptyList()
+        val affectedFiles = rawAffectedFiles.map { absolute -> toRelativeProjectPath(project, absolute) }
+        val changesCount = RdProtocolBridge.getProperty(result, "changesCount") as? Int ?: 0
+        val verification = RiderMutationResultMapper.toMutationVerification(
+            RdProtocolBridge.getProperty(result, "verification"),
+            RdProtocolBridge::getProperty
+        )
+
+        val extraRefreshPaths = buildList {
+            addAll(rawAffectedFiles)
+            (RdProtocolBridge.getProperty(result, "oldPath") as? String)?.takeIf { it.isNotBlank() }?.let(::add)
+            (RdProtocolBridge.getProperty(result, "newPath") as? String)?.takeIf { it.isNotBlank() }?.let(::add)
+        }.distinct()
+
+        refreshAffectedFiles(extraRefreshPaths)
+        refreshProjectRootsAndCommit(project)
+        commitDocuments(project)
+        edtAction { FileDocumentManager.getInstance().saveAllDocuments() }
+
+        val summary = RiderMutationResultMapper.summary(
+            legacySuccess = success,
+            status = status,
+            affectedFiles = affectedFiles,
+            changesCount = changesCount,
+            message = message,
+            verification = verification
+        )
+
+        return RiderMoveOutcome.Success(createJsonResult(summary.toRefactoringResult()))
+    }
+
+    private fun toMutationVerification(rawVerification: Any?): MutationVerification? {
+        return RiderMutationResultMapper.toMutationVerification(rawVerification, RdProtocolBridge::getProperty)
+    }
+
+    private fun toRelativeProjectPath(project: Project, absolutePath: String): String {
+        return try {
+            val virtualFile = LocalFileSystem.getInstance().findFileByPath(absolutePath)
+            if (virtualFile != null) {
+                ProjectUtils.getToolFilePath(project, virtualFile)
+            } else {
+                absolutePath.replace('\\', '/')
+            }
+        } catch (e: Exception) {
+            log.debug("Failed to relativize '$absolutePath': ${e.message}")
+            absolutePath.replace('\\', '/')
+        }
+    }
+
+    private fun refreshAffectedFiles(paths: List<String>) {
+        val virtualFiles = paths.mapNotNull { path ->
+            LocalFileSystem.getInstance().refreshAndFindFileByPath(path.replace('\\', File.separatorChar))
+        }
+        if (virtualFiles.isNotEmpty()) {
+            VfsUtil.markDirtyAndRefresh(false, false, false, *virtualFiles.toTypedArray())
+        }
     }
 
     /**
@@ -280,15 +386,10 @@ open class MoveFileTool : AbstractRefactoringTool() {
             }
             val backendNote = when (preparation.backend) {
                 MoveBackend.GENERIC_FILE_MOVE -> if (fileName.endsWith(".cs", ignoreCase = true)) {
-                    val riderSuffix = if (RiderEnvironment.isAvailable) {
-                        ", and cross-file using/import updates depend on Rider frontend support"
-                    } else {
-                        ""
-                    }
                     if (namespaceUpdated) {
-                        " using IDE file move semantics; C# namespace updated$riderSuffix"
+                        " using IDE file move semantics; C# namespace updated"
                     } else {
-                        " using IDE file move semantics; no C# namespace change was needed$riderSuffix"
+                        " using IDE file move semantics; no C# namespace change was needed"
                     }
                 } else {
                     " using IDE file move semantics"

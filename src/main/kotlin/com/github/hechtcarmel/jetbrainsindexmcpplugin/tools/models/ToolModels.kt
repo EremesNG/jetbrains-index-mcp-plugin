@@ -174,13 +174,22 @@ data class TestSummary(
     val runConfigName: String?
 )
 
+@Serializable
+data class MutationVerification(
+    val status: String,
+    val checksRun: List<String> = emptyList(),
+    val warnings: List<String> = emptyList()
+)
+
 // Refactoring result
 @Serializable
 data class RefactoringResult(
     val success: Boolean,
     val affectedFiles: List<String>,
     val changesCount: Int,
-    val message: String
+    val message: String,
+    val status: String? = null,
+    val verification: MutationVerification? = null
 )
 
 

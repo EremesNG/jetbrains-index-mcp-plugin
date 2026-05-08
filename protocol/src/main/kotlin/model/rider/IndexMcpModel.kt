@@ -73,6 +73,18 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
         field("totalCount", int)
     }
 
+    private val RdFindSymbolsRequest = structdef {
+        field("query", string)
+        field("scope", string)
+        field("language", string)
+        field("limit", int)
+    }
+
+    private val RdFindSymbolsResult = structdef {
+        field("symbols", immutableList(RdSymbolInfo))
+        field("totalCount", int)
+    }
+
     private val RdFindDefinitionRequest = structdef {
         field("target", RdSemanticTarget)
         field("fullElementPreview", bool)
@@ -208,6 +220,12 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
         field("newName", string)
     }
 
+    private val RdMutationVerification = structdef {
+        field("status", string)
+        field("checksRun", immutableList(string))
+        field("warnings", immutableList(string))
+    }
+
     private val RdRenameSymbolResult = structdef {
         field("success", bool)
         field("oldName", string)
@@ -215,6 +233,64 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
         field("affectedFiles", immutableList(string))
         field("changesCount", int)
         field("message", string)
+        field("status", string)
+        field("verification", RdMutationVerification.nullable)
+    }
+
+    private val RdRenameFileRequest = structdef {
+        field("filePath", string)
+        field("newName", string)
+    }
+
+    private val RdRenameFileResult = structdef {
+        field("success", bool)
+        field("oldPath", string)
+        field("newPath", string)
+        field("affectedFiles", immutableList(string))
+        field("changesCount", int)
+        field("message", string)
+        field("status", string)
+        field("verification", RdMutationVerification.nullable)
+    }
+
+    private val RdMoveFileRequest = structdef {
+        field("filePath", string)
+        field("destinationDirectory", string)
+    }
+
+    private val RdMoveFileResult = structdef {
+        field("success", bool)
+        field("oldPath", string)
+        field("newPath", string)
+        field("affectedFiles", immutableList(string))
+        field("changesCount", int)
+        field("message", string)
+        field("status", string)
+        field("verification", RdMutationVerification.nullable)
+    }
+
+    private val RdSafeDeleteRequest = structdef {
+        field("target", RdSemanticTarget)
+        field("targetType", string)
+        field("force", bool)
+    }
+
+    private val RdSafeDeleteBlockedUsage = structdef {
+        field("filePath", string)
+        field("line", int)
+        field("column", int)
+        field("context", string)
+        field("kind", string)
+    }
+
+    private val RdSafeDeleteResult = structdef {
+        field("success", bool)
+        field("affectedFiles", immutableList(string))
+        field("changesCount", int)
+        field("message", string)
+        field("status", string)
+        field("blockedUsages", immutableList(RdSafeDeleteBlockedUsage))
+        field("verification", RdMutationVerification.nullable)
     }
 
     // ── RPC Calls (frontend → backend) ──────────────────────────────────────
@@ -222,6 +298,7 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
     init {
         call("getBackendStatus", void, RdBackendStatusResult)
         call("findTypes", RdFindTypesRequest, RdFindTypesResult)
+        call("findSymbols", RdFindSymbolsRequest, RdFindSymbolsResult)
         call("findDefinition", RdFindDefinitionRequest, RdDefinitionResult.nullable)
         call("findReferences", RdFindReferencesRequest, RdFindReferencesResult)
         call("resolveSymbol", RdResolveSymbolRequest, RdSymbolInfo.nullable)
@@ -232,5 +309,8 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
         call("findSuperMethods", RdSuperMethodsRequest, RdSuperMethodsResult.nullable)
         call("getFileStructure", RdFileStructureRequest, RdFileStructureResult.nullable)
         call("renameSymbol", RdRenameSymbolRequest, RdRenameSymbolResult.nullable)
+        call("renameFile", RdRenameFileRequest, RdRenameFileResult.nullable)
+        call("moveFile", RdMoveFileRequest, RdMoveFileResult.nullable)
+        call("safeDelete", RdSafeDeleteRequest, RdSafeDeleteResult.nullable)
     }
 }

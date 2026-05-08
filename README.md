@@ -24,7 +24,7 @@ Advanced tools work across multiple languages based on available plugins:
 - **Go** - GoLand, IntelliJ IDEA Ultimate with Go plugin
 - **PHP** - PhpStorm, IntelliJ Ultimate with PHP plugin
 - **Rust** - RustRover, IntelliJ IDEA Ultimate with Rust plugin, CLion
-- **C# & F#** - Rider (via an in-process ReSharper backend bound through the rd protocol; resolves symbols, hierarchies, and rename/move directly against the ReSharper engine)
+- **C# & F#** - Rider (via an in-process ReSharper backend bound through the rd protocol; C# behavior remains the baseline, while F# support is capability-gated by the Rider F# plugin APIs; for F# references, `file + line + column` is the primary supported shape and `language + symbol` is best-effort/partial when safe resolution can be proven)
 - **Markdown** - heading outlines in file structure for IDEs with the bundled Markdown plugin
 
 **Universal Tools (All Supported JetBrains IDEs)**
@@ -234,7 +234,7 @@ These tools work in all supported JetBrains IDEs.
 
 | Tool | Description |
 |------|-------------|
-| `ide_find_references` | Find all references to a symbol across the entire project |
+| `ide_find_references` | Find all references to a symbol across the entire project; in Rider, C# remains stable, while F# references require the F# plugin APIs and prefer `file + line + column` over partial `language + symbol` lookup |
 | `ide_find_definition` | Find the definition/declaration location of a symbol |
 | `ide_find_class` | Search for classes/interfaces by name with camelCase/substring/wildcard matching |
 | `ide_find_file` | Search for files by name using IDE's file index |
@@ -295,6 +295,8 @@ These tools activate based on available language plugins:
 | DataGrip | ✓ 14 tools | ✓ 2 Markdown tools | ✓ rename + reformat |
 
 > **Note**: Navigation tools activate when language plugins are present. Markdown adds heading search and file-structure support when the bundled Markdown plugin is enabled. Go and Rust do not expose `ide_find_super_methods` due to language semantics, and Go does not expose `ide_find_implementations`. The rename and reformat tools work across all languages. `ide_convert_java_to_kotlin` is available only in IntelliJ IDEA and Android Studio, requires both Java and Kotlin plugins, and is disabled by default.
+
+> **Rider F# note**: `ide_find_references` supports F# only when the required F# plugin APIs are available. For F#, use `file + line + column` as the primary request shape; `language + symbol` is intentionally partial and may return an explicit limitation that recommends position lookup when the target cannot be resolved safely.
 
 For detailed tool documentation with parameters and examples, see [USAGE.md](USAGE.md).
 

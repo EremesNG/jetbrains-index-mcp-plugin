@@ -60,7 +60,10 @@ class GetDiagnosticsToolBehaviorTest : BasePlatformTestCase() {
         assertFalse("Diagnostics should succeed: ${renderResult(result)}", result.isError)
 
         val diagnostics = decodeDiagnostics(result)
-        assertTrue("Expected fresh file analysis", diagnostics.analysisFresh == true)
+        assertTrue(
+            "Expected fresh file analysis, but closed-file diagnostics remain supplementary evidence only",
+            diagnostics.analysisFresh == true
+        )
         assertFalse("Analysis should not time out", diagnostics.analysisTimedOut == true)
         assertTrue("Expected at least one problem", (diagnostics.problemCount ?: 0) > 0)
         assertTrue(
@@ -168,6 +171,35 @@ class GetDiagnosticsToolBehaviorTest : BasePlatformTestCase() {
         } finally {
             service.openFileAnalysisOverride = originalRunner
         }
+    }
+
+    fun testCSharpClosedFileDiagnosticsStayEligibilityBounded() = runBlocking {
+        createProjectFile(
+            "ReadOnlyBaselineDiagnostics.cs",
+            "namespace Demo.Services { public class ReadOnlyBaselineDiagnostics { } }"
+        )
+
+        val result = GetDiagnosticsTool().execute(project, buildJsonObject {
+            put("file", "src/ReadOnlyBaselineDiagnostics.cs")
+        })
+
+        assertFalse("C# diagnostics should report limitations in-band: ${renderResult(result)}", result.isError)
+
+        val diagnostics = decodeDiagnostics(result)
+        assertEquals(0, diagnostics.problemCount)
+        assertTrue(
+            "Current C# closed-file baseline may report fresh batch analysis, but that evidence remains supplementary only",
+            diagnostics.analysisFresh == true
+        )
+        assertFalse("Unsupported C# closed-file analysis should not claim timeout", diagnostics.analysisTimedOut == true)
+        assertTrue(
+            "C# diagnostics should report the current bounded batch-analysis caveat explicitly",
+            diagnostics.analysisMessage?.contains("Closed-file diagnostics use public batch analysis") == true
+        )
+        assertTrue(
+            "Closed-file C# diagnostics should still report missing live-editor intentions explicitly",
+            diagnostics.analysisMessage?.contains("Intentions are unavailable because the file is not open in an editor.") == true
+        )
     }
 
     fun testHighlightWaitFinishesAfterGracePeriodWhenDaemonStaysCompleted() {

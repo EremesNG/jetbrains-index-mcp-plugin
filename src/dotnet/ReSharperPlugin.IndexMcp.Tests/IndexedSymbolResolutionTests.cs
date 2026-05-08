@@ -1,16 +1,21 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
+using JetBrains.Core;
 using JetBrains.Lifetimes;
 using JetBrains.ReSharper.Psi;
+using JetBrains.ReSharper.Psi.Caches;
 using JetBrains.ReSharper.Psi.CSharp;
 using JetBrains.ReSharper.Psi.Tree;
 using JetBrains.Rider.Model.IndexMcp;
 using JetBrains.UI.RichText;
+using JetBrains.Util;
 using NUnit.Framework;
 
 namespace ReSharperPlugin.IndexMcp.Tests;
@@ -19,6 +24,15 @@ namespace ReSharperPlugin.IndexMcp.Tests;
 public class IndexedSymbolResolutionTests
 {
     private static readonly Type BackendHostType = typeof(IndexMcpBackendHost);
+    private static readonly string RepositoryRoot = FindRepositoryRoot();
+    private static readonly string MutationWorkspaceRoot = Path.Combine(
+        RepositoryRoot,
+        "src",
+        "dotnet",
+        "ReSharperPlugin.IndexMcp.Tests",
+        "testData",
+        "CSharpProductionReadiness",
+        "MutationWorkspace");
 
     [Test]
     public void ParseIndexedSymbol_RejectsInvalidMemberSeparator()
@@ -72,6 +86,172 @@ public class IndexedSymbolResolutionTests
             "unresolved");
 
         Assert.That(GetResolutionStatus(resolution), Is.EqualTo("ambiguous_match"));
+    }
+
+    [TestCase("System.String")]
+    [TestCase("System.Collections.IEnumerable")]
+    [TestCase("System.Collections.Generic.IEnumerable")]
+    public void ResolveSingleMatch_FSharpClrPredefinedWhitelist_DisambiguatesDuplicateSourceLessMatches(string qualifiedTypeName)
+    {
+        var firstCandidate = CreateTypeElementCandidate(
+            qualifiedTypeName.Split('.').Last(),
+            qualifiedName: qualifiedTypeName,
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+        var secondCandidate = CreateTypeElementCandidate(
+            qualifiedTypeName.Split('.').Last(),
+            qualifiedName: qualifiedTypeName,
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+
+        var resolution = InvokePrivateStatic(
+            "ResolveSingleMatch",
+            new List<IDeclaredElement> { firstCandidate, secondCandidate },
+            "ambiguous",
+            "unresolved",
+            "F#",
+            qualifiedTypeName,
+            true);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetResolutionStatus(resolution), Is.EqualTo("success"));
+            Assert.That(GetProperty<object>(resolution, "Element"), Is.SameAs(firstCandidate));
+        });
+    }
+
+    [Test]
+    public void ResolveSingleMatch_FSharpClrPredefinedWhitelist_PrefersExactClrNameBeforeArityVariant()
+    {
+        var exactCandidate = CreateTypeElementCandidate(
+            "IEnumerable",
+            qualifiedName: "System.Collections.Generic.IEnumerable",
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+        var arityCandidate = CreateTypeElementCandidate(
+            "IEnumerable",
+            qualifiedName: "System.Collections.Generic.IEnumerable`1",
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+
+        var resolution = InvokePrivateStatic(
+            "ResolveSingleMatch",
+            new List<IDeclaredElement> { arityCandidate, exactCandidate },
+            "ambiguous",
+            "unresolved",
+            "F#",
+            "System.Collections.Generic.IEnumerable",
+            true);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetResolutionStatus(resolution), Is.EqualTo("success"));
+            Assert.That(GetProperty<object>(resolution, "Element"), Is.SameAs(exactCandidate));
+        });
+    }
+
+    [Test]
+    public void ResolveSingleMatch_FSharpClrPredefinedDisambiguation_KeepsAmbiguousForNonWhitelistSymbols()
+    {
+        var firstCandidate = CreateTypeElementCandidate("Lens", qualifiedName: "FSharpPlus.Lens");
+        var secondCandidate = CreateTypeElementCandidate("Lens", qualifiedName: "FSharpPlus.Lens");
+
+        var resolution = InvokePrivateStatic(
+            "ResolveSingleMatch",
+            new List<IDeclaredElement> { firstCandidate, secondCandidate },
+            "ambiguous",
+            "unresolved",
+            "F#",
+            "FSharpPlus.Lens",
+            true);
+
+        Assert.That(GetResolutionStatus(resolution), Is.EqualTo("ambiguous_match"));
+    }
+
+    [Test]
+    public void ResolveSingleMatch_FSharpClrPredefinedDisambiguation_KeepsAmbiguousForMultipleSourceBackedWhitelistCandidates()
+    {
+        var firstCandidate = CreateTypeElementCandidate(
+            "String",
+            qualifiedName: "System.String",
+            declarations: new List<IDeclaration> { CreateDeclarationWithSourcePath("C:/repo/src/A.fs") },
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+        var secondCandidate = CreateTypeElementCandidate(
+            "String",
+            qualifiedName: "System.String",
+            declarations: new List<IDeclaration> { CreateDeclarationWithSourcePath("C:/repo/src/B.fs") },
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+
+        var resolution = InvokePrivateStatic(
+            "ResolveSingleMatch",
+            new List<IDeclaredElement> { firstCandidate, secondCandidate },
+            "ambiguous",
+            "unresolved",
+            "F#",
+            "System.String",
+            true);
+
+        Assert.That(GetResolutionStatus(resolution), Is.EqualTo("ambiguous_match"));
+    }
+
+    [Test]
+    public void ResolveSingleMatch_FSharpClrPredefinedDisambiguation_KeepsAmbiguousForMixedSourceLessAndSourceBackedCandidates()
+    {
+        var sourceLessCanonicalCandidate = CreateTypeElementCandidate(
+            "String",
+            qualifiedName: "System.String",
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+        var sourceBackedCandidate = CreateTypeElementCandidate(
+            "String",
+            qualifiedName: "System.String",
+            declarations: new List<IDeclaration> { CreateDeclarationWithSourcePath("C:/repo/src/String.fs") },
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+
+        var resolution = InvokePrivateStatic(
+            "ResolveSingleMatch",
+            new List<IDeclaredElement> { sourceLessCanonicalCandidate, sourceBackedCandidate },
+            "ambiguous",
+            "unresolved",
+            "F#",
+            "System.String",
+            true);
+
+        Assert.That(GetResolutionStatus(resolution), Is.EqualTo("ambiguous_match"));
+    }
+
+    [Test]
+    public void ResolveSingleMatch_FSharpClrPredefinedDisambiguation_KeepsUnresolvedForMissingCandidates()
+    {
+        var resolution = InvokePrivateStatic(
+            "ResolveSingleMatch",
+            new List<IDeclaredElement>(),
+            "ambiguous",
+            "unresolved",
+            "F#",
+            "System.String",
+            true);
+
+        Assert.That(GetResolutionStatus(resolution), Is.EqualTo("unresolved_symbol"));
     }
 
     [Test]
@@ -228,6 +408,33 @@ public class IndexedSymbolResolutionTests
     }
 
     [Test]
+    public void ResolveSingleMatch_CSharpParameterizedMemberTargetRemainsMemberScoped()
+    {
+        var matchingMember = CreateTypeMember("Run", "string");
+        var otherOverload = CreateTypeMember("Run", "int");
+        var container = CreateTypeElement(matchingMember, otherOverload);
+        var parseResult = InvokePrivateStatic("ParseIndexedSymbol", "C#", "Demo.Service#Run(string)");
+        var parsedSymbol = GetProperty<object>(parseResult, "Symbol");
+
+        var candidates = ((IEnumerable)InvokePrivateStatic("ResolveMemberCandidates", container, parsedSymbol))
+            .Cast<IDeclaredElement>()
+            .ToList();
+
+        var resolution = InvokePrivateStatic(
+            "ResolveSingleMatch",
+            candidates,
+            "ambiguous",
+            "unresolved");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetResolutionStatus(resolution), Is.EqualTo("success"));
+            Assert.That(GetProperty<object>(resolution, "Element"), Is.SameAs(matchingMember));
+            Assert.That(GetProperty<object>(resolution, "Element"), Is.Not.InstanceOf<ITypeElement>());
+        });
+    }
+
+    [Test]
     public void ResolveMemberCandidates_ResolvesFSharpInterfaceMemberDeterministically()
     {
         var matchingMember = CreateTypeMember("GetAllProducts");
@@ -363,7 +570,7 @@ public class IndexedSymbolResolutionTests
     public void ResolveCallableTarget_FSharpProductsControllerIndexPositionModeParityRemainsCallable()
     {
         var indexMethod = CreateTypeMember("Index", declarations: new List<IDeclaration> { CreateDeclaration() });
-        var otherMethod = CreateTypeMember("Details", new List<IDeclaration> { CreateDeclaration() }, "int");
+        var otherMethod = CreateTypeMember("Details", declarations: new List<IDeclaration> { CreateDeclaration() }, parameterTypes: "int");
         var container = CreateTypeElement(indexMethod, otherMethod);
         var parseResult = InvokePrivateStatic("ParseIndexedSymbol", "F#", "WebApplication1.Controllers.ProductsController#Index");
         var parsedSymbol = GetProperty<object>(parseResult, "Symbol");
@@ -431,6 +638,549 @@ public class IndexedSymbolResolutionTests
         var effectiveLimit = (int)InvokePrivateStatic("GetEffectiveResultLimit", request.Limit)!;
 
         Assert.That(effectiveLimit, Is.EqualTo(Math.Min(requestedLimit <= 0 ? 200 : requestedLimit, 200)));
+    }
+
+    [Test]
+    public void FindReferencesTraceSink_UsesStableTempFilePath()
+    {
+        var traceFilePath = (string)InvokePrivateNestedStatic("FindReferencesTraceSink", "BuildTraceFilePath")!;
+
+        Assert.That(traceFilePath, Is.EqualTo(Path.Combine(Path.GetTempPath(), "indexmcp-findreferences-trace.log")));
+    }
+
+    [Test]
+    public void FindReferencesTraceSink_AppendsTimestampedLines()
+    {
+        var traceFilePath = Path.Combine(Path.GetTempPath(), $"indexmcp-test-{Guid.NewGuid():N}.log");
+
+        try
+        {
+            InvokePrivateNestedStatic("FindReferencesTraceSink", "AppendLine", traceFilePath, "2026-05-05T12:00:00.0000000Z INFO [IndexMcp.FindReferences #42] start hello");
+            InvokePrivateNestedStatic("FindReferencesTraceSink", "AppendLine", traceFilePath, "2026-05-05T12:00:01.0000000Z WARN [IndexMcp.FindReferences #42] done");
+
+            var lines = File.ReadAllLines(traceFilePath);
+
+            Assert.That(lines, Is.EqualTo(new[]
+            {
+                "2026-05-05T12:00:00.0000000Z INFO [IndexMcp.FindReferences #42] start hello",
+                "2026-05-05T12:00:01.0000000Z WARN [IndexMcp.FindReferences #42] done"
+            }));
+        }
+        finally
+        {
+            if (File.Exists(traceFilePath))
+                File.Delete(traceFilePath);
+        }
+    }
+
+    [Test]
+    public void FindReferencesTraceSink_AppendLineSwallowsPathErrors()
+    {
+        Assert.That(
+            () => InvokePrivateNestedStatic("FindReferencesTraceSink", "AppendLine", "\0bad-path", "ignored"),
+            Throws.Nothing);
+    }
+
+    [Test]
+    public void RenameTraceSink_UsesStableTempFilePath()
+    {
+        var traceFilePath = (string)InvokePrivateNestedStatic("RenameTraceSink", "BuildTraceFilePath")!;
+
+        Assert.That(traceFilePath, Is.EqualTo(Path.Combine(Path.GetTempPath(), "indexmcp-rename-trace.log")));
+    }
+
+    [Test]
+    public void RenameTraceSink_AppendsTimestampedLines()
+    {
+        var traceFilePath = Path.Combine(Path.GetTempPath(), $"indexmcp-rename-test-{Guid.NewGuid():N}.log");
+
+        try
+        {
+            InvokePrivateNestedStatic("RenameTraceSink", "AppendLine", traceFilePath, "2026-05-07T12:00:00.0000000Z INFO [IndexMcp.Rename #7] frontend entry");
+            InvokePrivateNestedStatic("RenameTraceSink", "AppendLine", traceFilePath, "2026-05-07T12:00:01.0000000Z WARN [IndexMcp.Rename #7] timeout");
+
+            var lines = File.ReadAllLines(traceFilePath);
+
+            Assert.That(lines, Is.EqualTo(new[]
+            {
+                "2026-05-07T12:00:00.0000000Z INFO [IndexMcp.Rename #7] frontend entry",
+                "2026-05-07T12:00:01.0000000Z WARN [IndexMcp.Rename #7] timeout"
+            }));
+        }
+        finally
+        {
+            if (File.Exists(traceFilePath))
+                File.Delete(traceFilePath);
+        }
+    }
+
+    [Test]
+    public void RenameTraceSink_AppendLineSwallowsPathErrors()
+    {
+        Assert.That(
+            () => InvokePrivateNestedStatic("RenameTraceSink", "AppendLine", "\0bad-path", "ignored"),
+            Throws.Nothing);
+    }
+
+    [Test]
+    public void FormatRenameStageException_EmitsStageElapsedAndExceptionType()
+    {
+        var message = (string)InvokePrivateStatic(
+            "FormatRenameStageException",
+            "workflow.initialize",
+            null,
+            new InvalidOperationException("rename failed"))!;
+
+        Assert.That(message, Is.EqualTo(
+            "stage=workflow.initialize, elapsedMs=0, exception=System.InvalidOperationException: rename failed"));
+    }
+
+    [Test]
+    public void InspectSymbolRenameServiceExecutionPlan_FailsClosedWhenOnlyTextControlBoundOrUndocumentedEntrypointsExist()
+    {
+        var plan = InvokePrivateStatic("InspectSymbolRenameServiceExecutionPlan");
+        var signatures = GetProperty<IReadOnlyList<string>>(plan, "AvailableMethodSignatures");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<bool>(plan, "IsSupported"), Is.False,
+                "The spike must fail closed until a headless service-backed rename entry point is proven in this runtime.");
+            Assert.That(GetProperty<bool>(plan, "RequiresTextControl"), Is.True,
+                "The discovered documented service lane still requires ITextControl, which is unavailable in the headless mutation flow.");
+            Assert.That(GetProperty<string?>(plan, "SelectedMethodSignature"), Does.Contain("JetBrains.TextControl.ITextControl"));
+            Assert.That(GetProperty<string?>(plan, "SelectedMethodSignature"), Does.Not.Contain("RenameFromContext("),
+                "A discoverable IDataContext overload is NOT sufficient proof that backend symbol rename is safe to restore in production.");
+            Assert.That(signatures, Has.Some.Contains("System.String Rename(").And.Contains("JetBrains.TextControl.ITextControl"));
+            Assert.That(signatures, Has.Some.Contains("RenameAndGetConflicts").And.Contains("JetBrains.TextControl.ITextControl"));
+            Assert.That(signatures, Has.Some.Contains("RenameFromDrivenContext").And.Contains("JetBrains.TextControl.ITextControl"));
+            Assert.That(signatures, Has.Some.Contains("RenameFromContext(JetBrains.Application.DataContext.IDataContext context)"),
+                "Keep the raw runtime surface visible in the trace even when the lane remains unsupported.");
+            Assert.That(GetProperty<string>(plan, "Message"),
+                Does.Contain("fail-closed")
+                    .And.Contain("ITextControl")
+                    .And.Contain("RenameWorkflow.Initialize")
+                    .And.Contain("workflow.construct.end")
+                    .And.Contain("workflow.initialize.end"));
+        });
+    }
+
+    [TestCase("Renames/RenameTargets.cs", 9, 13, "local", "total")]
+    [TestCase("Renames/RenameTargets.cs", 7, 33, "parameter", "increment")]
+    [TestCase("Renames/RenameTargets.cs", 5, 17, "member", "_counter")]
+    [TestCase("Renames/TypeRenameTarget.cs", 3, 21, "type", "TypeRenameTarget")]
+    public void PlanExactSymbolRename_EmitsExactTargetMetadata(string relativePath, int line, int column, string expectedTargetKind, string expectedName)
+    {
+        var plannerType = BackendHostType.Assembly.GetType("ReSharperPlugin.IndexMcp.Mutations.RenameMutationPlanner");
+        Assert.That(plannerType, Is.Not.Null, "Missing RenameMutationPlanner type for exact-target backend planning.");
+
+        var method = plannerType!.GetMethod("PlanExactSymbolRename", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.That(method, Is.Not.Null, "Missing RenameMutationPlanner.PlanExactSymbolRename method.");
+
+        var plan = method!.Invoke(null, new object[]
+        {
+            Path.Combine(MutationWorkspaceRoot, relativePath.Replace('/', Path.DirectorySeparatorChar)),
+            line,
+            column
+        });
+
+        Assert.That(plan, Is.Not.Null, "Exact symbol rename planning must remain available as backend target-resolution authority.");
+
+        var resolution = GetProperty<object>(plan!, "Resolution");
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(plan!, "OperationKind"), Is.EqualTo("symbol"));
+            Assert.That(GetProperty<string>(resolution, "Status"), Is.EqualTo("resolved"));
+            Assert.That(GetProperty<string?>(resolution, "TargetKind"), Is.EqualTo(expectedTargetKind));
+            Assert.That(GetProperty<string?>(resolution, "ResolvedName"), Is.EqualTo(expectedName));
+            Assert.That(GetProperty<string?>(resolution, "SourceTokenText"), Is.EqualTo(expectedName),
+                "Backend exact-target planning must preserve the declaration token it resolved so the frontend can reject widening.");
+            Assert.That(GetProperty<string?>(resolution, "Message"), Does.Contain("Resolved exact").And.Contain(expectedTargetKind));
+            Assert.That(GetProperty<string?>(plan!, "OldPath"), Does.EndWith(relativePath.Replace('/', Path.DirectorySeparatorChar)));
+            Assert.That(GetProperty<string?>(plan!, "NewPath"), Does.EndWith(relativePath.Replace('/', Path.DirectorySeparatorChar)));
+        });
+    }
+
+    [Test]
+    public void SymbolRenameLane_NoLongerInvokesManualRenameWorkflowForSymbols()
+    {
+        var sourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..",
+            "ReSharperPlugin.IndexMcp",
+            "IndexMcpBackendHost.cs"));
+        var source = File.ReadAllText(sourcePath);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(source, Does.Contain("service-rename.inspect"),
+                "The symbol rename lane should emit explicit service-inspection trace stages for smoke validation.");
+            Assert.That(source, Does.Contain("service-rename.text-control.acquire"),
+                "Regression guard: symbol rename should first probe for an editor-backed ITextControl before fail-closing.");
+            Assert.That(source, Does.Contain("TryExecuteTextControlRename(element, newName, targetTextControl)"),
+                "Regression guard: the Rider backend must attempt RenameRefactoringService through an acquired ITextControl when one exists.");
+            Assert.That(source, Does.Not.Contain("var driver = ExecuteRenameWorkflow(element, dataProvider, trace);"),
+                "Regression guard: symbol rename must not re-enter the manual RenameWorkflow.Initialize lane in this spike.");
+        });
+    }
+
+    [Test]
+    public void RenameRefactoringService_Rename_NullTriplet_FailsFast()
+    {
+        var method = GetPublicStaticMethod(
+            typeof(JetBrains.ReSharper.Feature.Services.Refactorings.Specific.Rename.RenameRefactoringService),
+            "Rename",
+            3);
+
+        var outcome = CaptureInvocationFailure(method, null, null, null);
+
+        TestContext.Progress.WriteLine($"PROBE Rename(null,null,null): elapsedMs={outcome.ElapsedMilliseconds}, exception={outcome.Exception.GetType().FullName}: {outcome.Exception.Message}");
+
+        Assert.That(outcome.ElapsedMilliseconds, Is.LessThan(500));
+        Assert.That(outcome.Exception, Is.Not.Null);
+    }
+
+    [Test]
+    public void RenameRefactoringService_RenameAndGetConflicts_NullTriplet_FailsFast()
+    {
+        var method = GetPublicStaticMethod(
+            typeof(JetBrains.ReSharper.Feature.Services.Refactorings.Specific.Rename.RenameRefactoringService),
+            "RenameAndGetConflicts",
+            3);
+
+        var outcome = CaptureInvocationFailure(method, null, null, null);
+
+        TestContext.Progress.WriteLine($"PROBE RenameAndGetConflicts(null,null,null): elapsedMs={outcome.ElapsedMilliseconds}, exception={outcome.Exception.GetType().FullName}: {outcome.Exception.Message}");
+
+        Assert.That(outcome.ElapsedMilliseconds, Is.LessThan(500));
+        Assert.That(outcome.Exception, Is.Not.Null);
+    }
+
+    [Test]
+    public void RenameRefactoringService_RenameFromContext_NullContext_FailsFast()
+    {
+        var method = GetPublicStaticMethod(
+            typeof(JetBrains.ReSharper.Feature.Services.Refactorings.Specific.Rename.RenameRefactoringService),
+            "RenameFromContext",
+            1);
+
+        var outcome = CaptureInvocationFailure(method, new object?[] { null });
+
+        TestContext.Progress.WriteLine($"PROBE RenameFromContext(null): elapsedMs={outcome.ElapsedMilliseconds}, exception={outcome.Exception.GetType().FullName}: {outcome.Exception.Message}");
+
+        Assert.That(outcome.ElapsedMilliseconds, Is.LessThan(500));
+        Assert.That(outcome.Exception, Is.Not.Null);
+    }
+
+    [Test]
+    public void RenameRefactoringService_RenameFromDrivenContext_NullQuintet_FailsFast_AndStillRequiresDriverAndTextControl()
+    {
+        var method = GetPublicStaticMethod(
+            typeof(JetBrains.ReSharper.Feature.Services.Refactorings.Specific.Rename.RenameRefactoringService),
+            "RenameFromDrivenContext",
+            5);
+
+        var outcome = CaptureInvocationFailure(method, null, null, null, null, null);
+        var parameters = method.GetParameters();
+
+        TestContext.Progress.WriteLine(
+            $"PROBE RenameFromDrivenContext(null,...): elapsedMs={outcome.ElapsedMilliseconds}, exception={outcome.Exception.GetType().FullName}: {outcome.Exception.Message}, driverType={parameters[0].ParameterType.FullName}, driverIsInterface={parameters[0].ParameterType.IsInterface}, textControlType={parameters[3].ParameterType.FullName}, textControlIsInterface={parameters[3].ParameterType.IsInterface}");
+
+        Assert.That(outcome.ElapsedMilliseconds, Is.LessThan(500));
+        Assert.That(outcome.Exception, Is.Not.Null);
+        Assert.That(parameters[0].ParameterType.IsInterface, Is.True);
+        Assert.That(parameters[3].ParameterType.FullName, Is.EqualTo("JetBrains.TextControl.ITextControl"));
+        Assert.That(parameters[3].ParameterType.IsInterface, Is.True);
+    }
+
+    [Test]
+    public void DescribeFindReferencesResolvedTarget_SourceLessClrType_EmitsExplicitMetadata()
+    {
+        var libraryType = CreateTypeElementCandidate(
+            "String",
+            qualifiedName: "System.String",
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+
+        var description = (string)InvokePrivateStatic("DescribeFindReferencesResolvedTarget", libraryType, "clr_predefined_fallback")!;
+
+        Assert.That(description, Does.Contain("origin=clr_predefined_fallback"));
+        Assert.That(description, Does.Contain("qualifiedName=System.String"));
+        Assert.That(description, Does.Contain("elementType=ITypeElement"));
+        Assert.That(description, Does.Contain("presentationLanguage="));
+        Assert.That(description, Does.Contain("hasSourcePath=false"));
+        Assert.That(description, Does.Contain("sourceFilePath=<absent>"));
+    }
+
+    [Test]
+    public void FormatFindReferencesUnresolvedTargetMessage_UsesExplicitResolutionStatusInsteadOfZeroResults()
+    {
+        var resolutionType = BackendHostType.Assembly.GetType("ReSharperPlugin.IndexMcp.IndexedSymbolResolution");
+        Assert.That(resolutionType, Is.Not.Null, "Missing type 'IndexedSymbolResolution'.");
+
+        var unresolvedFactory = resolutionType!.GetMethod("Unresolved", BindingFlags.Public | BindingFlags.Static);
+        Assert.That(unresolvedFactory, Is.Not.Null, "Missing factory 'IndexedSymbolResolution.Unresolved'.");
+
+        var unresolved = unresolvedFactory!.Invoke(null, new object[]
+        {
+            "No Rider declaration matches container 'System.String'."
+        });
+
+        var message = (string)InvokePrivateStatic(
+            "FormatFindReferencesUnresolvedTargetMessage",
+            "F#",
+            "System.String",
+            "project_and_libraries",
+            unresolved!)!;
+
+        Assert.That(message, Does.Contain("status=unresolved_symbol"));
+        Assert.That(message, Does.Contain("language=F#"));
+        Assert.That(message, Does.Contain("symbol=System.String"));
+        Assert.That(message, Does.Contain("scope=project_and_libraries"));
+        Assert.That(message, Does.Contain("No Rider declaration matches container 'System.String'."));
+    }
+
+    [Test]
+    public void DetectFSharpCapability_MissingPluginZone_ReturnsUnavailableDiagnostic()
+    {
+        Func<string, Type?> typeResolver = _ => null;
+
+        var capability = InvokePrivateStatic("DetectFSharpCapability", typeResolver);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<bool>(capability!, "IsAvailable"), Is.False);
+            Assert.That(GetProperty<string>(capability!, "FailureStatus"), Is.EqualTo("unsupported_language_capability"));
+            Assert.That(GetProperty<string>(capability!, "FailureMessage"), Does.Contain("F# find_references is unavailable"));
+        });
+    }
+
+    [Test]
+    public void DetectFSharpCapability_PluginZoneAvailable_ReturnsAvailableCapability()
+    {
+        Func<string, Type?> typeResolver = _ => typeof(object);
+
+        var capability = InvokePrivateStatic("DetectFSharpCapability", typeResolver);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<bool>(capability!, "IsAvailable"), Is.True);
+            Assert.That(GetProperty<string?>(capability!, "FailureStatus"), Is.Null);
+            Assert.That(GetProperty<string?>(capability!, "FailureMessage"), Is.Null);
+        });
+    }
+
+    [Test]
+    public void GetPresentableTypeName_FSharpPreferredLanguage_PrefersResolvedFSharpPresentation()
+    {
+        var declaredType = CreateType("csharp-name");
+        var fsharpLanguage = new object();
+
+        var presentableName = (string)InvokePrivateStatic(
+            "GetPresentableTypeName",
+            declaredType,
+            "F#",
+            (Func<string, object?>)(_ => fsharpLanguage),
+            (Func<IType, object, string?>)((_, language) => ReferenceEquals(language, fsharpLanguage) ? "fsharp-name" : "unexpected"))!;
+
+        Assert.That(presentableName, Is.EqualTo("fsharp-name"));
+    }
+
+    [Test]
+    public void GetPresentableTypeName_FSharpPreferredLanguage_FallsBackDeterministicallyWhenUnavailable()
+    {
+        var declaredType = CreateType("csharp-name");
+        var invokerCalled = false;
+
+        var presentableName = (string)InvokePrivateStatic(
+            "GetPresentableTypeName",
+            declaredType,
+            "F#",
+            (Func<string, object?>)(_ => null),
+            (Func<IType, object, string?>)((_, _) =>
+            {
+                invokerCalled = true;
+                return "unexpected";
+            }))!;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(presentableName, Is.EqualTo("csharp-name"));
+            Assert.That(invokerCalled, Is.False);
+        });
+    }
+
+    [Test]
+    public void ResolveRequestedPresentationLanguage_FSharpPreferredLanguage_PrefersResolvedFSharpLanguage()
+    {
+        var fsharpLanguage = new object();
+
+        var presentationLanguage = InvokePrivateStatic(
+            "ResolveRequestedPresentationLanguage",
+            "F#",
+            (Func<string, object?>)(_ => fsharpLanguage));
+
+        Assert.That(presentationLanguage, Is.SameAs(fsharpLanguage));
+    }
+
+    [Test]
+    public void ResolveRequestedPresentationLanguage_FSharpPreferredLanguage_FallsBackToCSharpWhenUnavailable()
+    {
+        var presentationLanguage = InvokePrivateStatic(
+            "ResolveRequestedPresentationLanguage",
+            "F#",
+            (Func<string, object?>)(_ => null));
+
+        Assert.That(presentationLanguage, Is.SameAs(CSharpLanguage.Instance));
+    }
+
+    [Test]
+    public void GetPresentableTypeName_CSharpPreferredLanguage_PreservesCSharpPresentation()
+    {
+        var declaredType = CreateType("csharp-name");
+        var resolverCalled = false;
+
+        var presentableName = (string)InvokePrivateStatic(
+            "GetPresentableTypeName",
+            declaredType,
+            "C#",
+            (Func<string, object?>)(_ =>
+            {
+                resolverCalled = true;
+                return new object();
+            }),
+            (Func<IType, object, string?>)((_, _) => "unexpected"))!;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(presentableName, Is.EqualTo("csharp-name"));
+            Assert.That(resolverCalled, Is.False);
+        });
+    }
+
+    [Test]
+    public void ResolveFindReferencesCapabilityFailure_FSharpPositionTargetMissingCapability_ReturnsDeterministicFailure()
+    {
+        Func<string, Type?> typeResolver = _ => null;
+
+        var failure = InvokePrivateStatic(
+            "ResolveFindReferencesCapabilityFailure",
+            new RdSemanticTarget("src/FSharpPlus/Lens.fs", 44, 1, null, null),
+            typeResolver);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(failure, Is.Not.Null);
+            Assert.That(GetProperty<string>(failure!, "Status"), Is.EqualTo("unsupported_language_capability"));
+            Assert.That(GetProperty<string>(failure!, "Origin"), Is.EqualTo("fsharp_capability"));
+            Assert.That(GetProperty<string>(failure!, "Message"), Does.Contain("F# find_references is unavailable"));
+        });
+    }
+
+    [Test]
+    public void ResolveFindReferencesCapabilityFailure_FSharpSymbolTargetMissingCapability_ReturnsDeterministicFailure()
+    {
+        Func<string, Type?> typeResolver = _ => null;
+
+        var failure = InvokePrivateStatic(
+            "ResolveFindReferencesCapabilityFailure",
+            new RdSemanticTarget(null, null, null, "F#", "FSharpPlus.Lens#view"),
+            typeResolver);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(failure, Is.Not.Null);
+            Assert.That(GetProperty<string>(failure!, "Status"), Is.EqualTo("unsupported_language_capability"));
+            Assert.That(GetProperty<string>(failure!, "Origin"), Is.EqualTo("fsharp_capability"));
+            Assert.That(GetProperty<string>(failure!, "Message"), Does.Contain("F# find_references is unavailable"));
+        });
+    }
+
+    [Test]
+    public void ResolveFindReferencesCapabilityFailure_CSharpPositionTarget_IgnoresMissingFSharpCapability()
+    {
+        Func<string, Type?> typeResolver = _ => null;
+
+        var failure = InvokePrivateStatic(
+            "ResolveFindReferencesCapabilityFailure",
+            new RdSemanticTarget("src/Demo/Service.cs", 10, 5, null, null),
+            typeResolver);
+
+        Assert.That(failure, Is.Null);
+    }
+
+    [Test]
+    public void ShouldRaiseFindReferencesTargetResolutionFailure_FSharpCapabilityFailureOnPositionTarget_IsTrue()
+    {
+        var shouldRaise = (bool)InvokePrivateStatic(
+            "ShouldRaiseFindReferencesTargetResolutionFailure",
+            new RdSemanticTarget("src/FSharpPlus/Lens.fs", 44, 1, null, null),
+            "unsupported_language_capability")!;
+
+        Assert.That(shouldRaise, Is.True);
+    }
+
+    [TestCase("unsupported_target")]
+    [TestCase("ambiguous_match")]
+    [TestCase("unresolved_target")]
+    public void ShouldRaiseFindReferencesTargetResolutionFailure_FSharpPositionSafetyFailure_IsTrue(string status)
+    {
+        var shouldRaise = (bool)InvokePrivateStatic(
+            "ShouldRaiseFindReferencesTargetResolutionFailure",
+            new RdSemanticTarget("src/FSharpPlus/Lens.fs", 44, 1, null, null),
+            status)!;
+
+        Assert.That(shouldRaise, Is.True);
+    }
+
+    [Test]
+    public void FormatFindReferencesTargetResolutionFailureMessage_PositionTarget_UsesExplicitPositionContext()
+    {
+        var message = (string)InvokePrivateStatic(
+            "FormatFindReferencesTargetResolutionFailureMessage",
+            new RdSemanticTarget("src/FSharpPlus/Lens.fs", 44, 1, null, null),
+            "project_files",
+            "unsupported_language_capability",
+            "F# find_references is unavailable because the Rider F# plugin APIs are not loaded.",
+            "fsharp_capability")!;
+
+        Assert.That(message, Does.Contain("status=unsupported_language_capability"));
+        Assert.That(message, Does.Contain("target=src/FSharpPlus/Lens.fs:44:1"));
+        Assert.That(message, Does.Contain("origin=fsharp_capability"));
+    }
+
+    [Test]
+    public void FormatBoundedFindReferencesSkipMessage_IncludesSearchRouteAndTargetContext()
+    {
+        var libraryType = CreateTypeElementCandidate(
+            "String",
+            qualifiedName: "System.String",
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+
+        var message = (string)InvokePrivateStatic(
+            "FormatBoundedFindReferencesSkipMessage",
+            "bounded-file",
+            libraryType,
+            "cancellation",
+            1,
+            3,
+            "src/A.fs",
+            "System.TimeoutException",
+            "usage cache cold",
+            1200L,
+            400L,
+            0)!;
+
+        Assert.That(message, Does.Contain("searchRoute=bounded-file"));
+        Assert.That(message, Does.Contain("qualifiedName=System.String"));
+        Assert.That(message, Does.Contain("presentationLanguage="));
+        Assert.That(message, Does.Contain("category=cancellation"));
+        Assert.That(message, Does.Contain("descriptor=src/A.fs"));
+        Assert.That(message, Does.Contain("collectedCount=0"));
     }
 
     [Test]
@@ -546,6 +1296,67 @@ public class IndexedSymbolResolutionTests
     }
 
     [Test]
+    public void ParseIndexedSymbol_CSharpAliases_CanonicalizeToCSharp()
+    {
+        foreach (var language in new[] { "C#", "CSharp", "CSHARP" })
+        {
+            var parseResult = InvokePrivateStatic("ParseIndexedSymbol", language, "Demo.Service#Run(string)");
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(GetProperty<bool>(parseResult!, "IsSuccess"), Is.True, $"Expected alias '{language}' to be accepted.");
+                var parsedSymbol = GetProperty<object>(parseResult!, "Symbol");
+                Assert.That(GetProperty<string>(parsedSymbol, "Language"), Is.EqualTo("C#"));
+                Assert.That(GetProperty<string>(parsedSymbol, "ContainerQualifiedName"), Is.EqualTo("Demo.Service"));
+                Assert.That(GetProperty<string>(parsedSymbol, "MemberName"), Is.EqualTo("Run"));
+            });
+        }
+    }
+
+    [Test]
+    public void BuildFindSymbolsResult_CSharpAliases_PreserveMemberLevelResults()
+    {
+        var containingType = CreateTypeElementCandidate(
+            "ReadOnlyBaselineService",
+            qualifiedName: "Demo.ReadOnlyBaselineService",
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+        var property = CreateDeclaredElement(
+            shortName: "Current",
+            declarations: new List<IDeclaration> { CreateDeclarationWithSourcePath("C:/repo/src/ReadOnlyBaselineService.cs") },
+            kind: DeclaredElementKind.Property,
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance,
+                ["get_ContainingType"] = containingType,
+                ["get_Parameters"] = new List<IParameter>()
+            });
+
+        var aliasResults = new[]
+        {
+            (RdFindSymbolsResult)InvokePrivateStatic("BuildFindSymbolsResult", new List<IDeclaredElement> { property }, "Current", "project_files", "C#", 25)!,
+            (RdFindSymbolsResult)InvokePrivateStatic("BuildFindSymbolsResult", new List<IDeclaredElement> { property }, "Current", "project_files", "CSharp", 25)!,
+            (RdFindSymbolsResult)InvokePrivateStatic("BuildFindSymbolsResult", new List<IDeclaredElement> { property }, "Current", "project_files", "CSHARP", 25)!
+        };
+
+        Assert.That(aliasResults.Select(result => result.TotalCount).ToArray(), Is.EqualTo(new[] { 1, 1, 1 }));
+
+        var firstSymbol = aliasResults[0].Symbols.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstSymbol.Name, Is.EqualTo("Current"));
+            Assert.That(firstSymbol.QualifiedName, Is.EqualTo("Demo.ReadOnlyBaselineService.Current"));
+            Assert.That(firstSymbol.Kind, Is.EqualTo("PROPERTY"));
+            Assert.That(firstSymbol.Language, Is.EqualTo("C#"));
+        });
+
+        Assert.That(aliasResults[1].Symbols.Single(), Is.EqualTo(firstSymbol));
+        Assert.That(aliasResults[2].Symbols.Single(), Is.EqualTo(firstSymbol));
+    }
+
+    [Test]
     public void BuildFindTypesSearchPlan_FSharpProjectAndLibraries_KeepsLibraryFallback()
     {
         var plan = InvokePrivateStatic("BuildFindTypesSearchPlan", "F#", "project_and_libraries", "exact", "FSharpPlus.Lens.Lens");
@@ -560,7 +1371,7 @@ public class IndexedSymbolResolutionTests
     }
 
     [Test]
-    public void BuildFindReferencesResolutionPlan_FSharpProjectFilesTypeOnlyQualified_UsesProjectQualifiedLookupWithoutLibraryFallback()
+    public void BuildFindReferencesResolutionPlan_FSharpProjectFilesTypeOnlyQualified_UsesBoundedProjectSearchWithoutRejecting()
     {
         var parseResult = InvokePrivateStatic("ParseIndexedSymbol", "F#", "FSharpPlus.Lens");
         var parsedSymbol = GetProperty<object>(parseResult!, "Symbol");
@@ -569,27 +1380,279 @@ public class IndexedSymbolResolutionTests
 
         Assert.Multiple(() =>
         {
+            Assert.That(GetProperty<string>(plan!, "TargetKind"), Is.EqualTo("symbol"));
+            Assert.That(GetProperty<bool>(plan!, "IsFSharpPositionTarget"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "IsFSharpSymbolTarget"), Is.True);
             Assert.That(GetProperty<bool>(plan!, "UseProjectQualifiedTypeLookup"), Is.True);
+            Assert.That(GetProperty<bool>(plan!, "UseBoundedProjectFileSearch"), Is.True);
             Assert.That(GetProperty<bool>(plan!, "AllowLibraryFallback"), Is.False);
-            Assert.That(GetProperty<bool>(plan!, "RejectUnboundedReferenceSearch"), Is.True);
-            Assert.That(GetProperty<IReadOnlyList<string>>(plan!, "AllowedProjectFileExtensions"),
-                Is.EqualTo(new[] { ".fs", ".fsi", ".fsx" }));
+            Assert.That(GetProperty<bool>(plan!, "RejectUnboundedReferenceSearch"), Is.False);
+            Assert.That(GetProperty<IReadOnlyList<string>?>(plan!, "AllowedProjectFileExtensions"), Is.EqualTo(new[] { ".fs", ".fsi", ".fsx" }));
         });
     }
 
     [Test]
-    public void EnsureFindReferencesSearchIsSupported_FSharpProjectFilesTypeOnlyQualified_ThrowsFastFailure()
+    public void BuildFindReferencesResolutionPlan_FSharpPositionTarget_ProjectFiles_UsesDedicatedPlanningMetadata()
+    {
+        var target = new RdSemanticTarget("src/FSharpPlus/Lens.fs", 44, 1, null, null);
+
+        var plan = InvokePrivateStatic("BuildFindReferencesResolutionPlan", target, "project_files", null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(plan!, "TargetKind"), Is.EqualTo("position"));
+            Assert.That(GetProperty<bool>(plan!, "IsFSharpPositionTarget"), Is.True);
+            Assert.That(GetProperty<bool>(plan!, "IsFSharpSymbolTarget"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "UseBoundedProjectFileSearch"), Is.True);
+            Assert.That(GetProperty<bool>(plan!, "UseProjectQualifiedTypeLookup"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "AllowLibraryFallback"), Is.False);
+            Assert.That(GetProperty<IReadOnlyList<string>?>(plan!, "AllowedProjectFileExtensions"), Is.EqualTo(new[] { ".fs", ".fsi", ".fsx" }));
+        });
+    }
+
+    [Test]
+    public void ClassifyFSharpPositionTargetResolution_SingleSafeCandidate_ReturnsSuccess()
+    {
+        var target = new RdSemanticTarget("src/FSharpPlus/Lens.fs", 44, 1, null, null);
+        var safeCandidate = CreateTypeMember("view");
+
+        var resolution = InvokePrivateStatic(
+            "ClassifyFSharpPositionTargetResolution",
+            target,
+            new List<IDeclaredElement> { safeCandidate },
+            safeCandidate);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(resolution!, "Status"), Is.EqualTo("success"));
+            Assert.That(GetProperty<string>(resolution!, "Origin"), Is.EqualTo("fsharp_position_safe"));
+            Assert.That(GetProperty<IDeclaredElement>(resolution!, "Element"), Is.SameAs(safeCandidate));
+        });
+    }
+
+    [Test]
+    public void ClassifyFSharpPositionTargetResolution_MultipleSafeCandidates_ReturnsAmbiguous()
+    {
+        var target = new RdSemanticTarget("src/FSharpPlus/Lens.fs", 44, 1, null, null);
+        var firstCandidate = CreateTypeMember("view");
+        var secondCandidate = CreateTypeElementCandidate("Lens", qualifiedName: "FSharpPlus.Lens");
+
+        var resolution = InvokePrivateStatic(
+            "ClassifyFSharpPositionTargetResolution",
+            target,
+            new List<IDeclaredElement> { firstCandidate, secondCandidate },
+            firstCandidate);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(resolution!, "Status"), Is.EqualTo("ambiguous_match"));
+            Assert.That(GetProperty<string>(resolution!, "Origin"), Is.EqualTo("fsharp_position_safe"));
+            Assert.That(GetProperty<string>(resolution!, "Message"), Does.Contain("multiple safe semantic targets"));
+        });
+    }
+
+    [Test]
+    public void ClassifyFSharpPositionTargetResolution_FallbackOnly_ReturnsUnsupported()
+    {
+        var target = new RdSemanticTarget("src/FSharpPlus/Lens.fs", 44, 1, null, null);
+        var fallbackCandidate = CreateTypeElementCandidate("Lens", qualifiedName: "FSharpPlus.Lens");
+
+        var resolution = InvokePrivateStatic(
+            "ClassifyFSharpPositionTargetResolution",
+            target,
+            new List<IDeclaredElement>(),
+            fallbackCandidate);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(resolution!, "Status"), Is.EqualTo("unsupported_target"));
+            Assert.That(GetProperty<string>(resolution!, "Origin"), Is.EqualTo("fsharp_position_safe"));
+            Assert.That(GetProperty<string>(resolution!, "Message"), Does.Contain("unsafe fallback"));
+        });
+    }
+
+    [Test]
+    public void ClassifyFSharpPositionTargetResolution_NoCandidates_ReturnsUnresolved()
+    {
+        var target = new RdSemanticTarget("src/FSharpPlus/Lens.fs", 44, 1, null, null);
+
+        var resolution = InvokePrivateStatic(
+            "ClassifyFSharpPositionTargetResolution",
+            target,
+            new List<IDeclaredElement>(),
+            null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(resolution!, "Status"), Is.EqualTo("unresolved_target"));
+            Assert.That(GetProperty<string>(resolution!, "Origin"), Is.EqualTo("fsharp_position_safe"));
+            Assert.That(GetProperty<string>(resolution!, "Message"), Does.Contain("No safe F# semantic target"));
+        });
+    }
+
+    [Test]
+    public void EnsureFindReferencesSearchIsSupported_FSharpProjectFilesTypeOnlyQualified_DoesNotFastFail()
     {
         var parseResult = InvokePrivateStatic("ParseIndexedSymbol", "F#", "FSharpPlus.Lens");
         var parsedSymbol = GetProperty<object>(parseResult!, "Symbol");
         var plan = InvokePrivateStatic("BuildFindReferencesResolutionPlan", "project_files", parsedSymbol);
 
-        var exception = Assert.Throws<TargetInvocationException>(() =>
+        Assert.DoesNotThrow(() =>
             InvokePrivateStatic("EnsureFindReferencesSearchIsSupported", plan!, parsedSymbol, "project_files"));
+    }
 
-        Assert.That(exception!.InnerException, Is.TypeOf<InvalidOperationException>());
-        Assert.That(exception.InnerException!.Message, Does.Contain("F#"));
-        Assert.That(exception.InnerException!.Message, Does.Contain("project_files"));
+    [Test]
+    public void BatchSourceFilePathsForBoundedFindReferences_PerFileMode_DeduplicatesAndOrdersDeterministically()
+    {
+        var batches = (IEnumerable<IEnumerable<string>>)InvokePrivateStatic(
+            "BatchSourceFilePathsForBoundedFindReferences",
+            new[] { "b.fs", "A.fs", "a.fs", "c.fsx" },
+            1)!;
+
+        Assert.That(
+            batches.Select(batch => batch.ToArray()).ToArray(),
+            Is.EqualTo(new[]
+            {
+                new[] { "A.fs" },
+                new[] { "b.fs" },
+                new[] { "c.fsx" }
+            }));
+    }
+
+    [Test]
+    public void BatchSourceFilePathsForBoundedFindReferences_SmallBatchMode_GroupsOrderedPaths()
+    {
+        var batches = (IEnumerable<IEnumerable<string>>)InvokePrivateStatic(
+            "BatchSourceFilePathsForBoundedFindReferences",
+            new[] { "d.fsi", "b.fs", "c.fsx", "A.fs" },
+            2)!;
+
+        Assert.That(
+            batches.Select(batch => batch.ToArray()).ToArray(),
+            Is.EqualTo(new[]
+            {
+                new[] { "A.fs", "b.fs" },
+                new[] { "c.fsx", "d.fsi" }
+            }));
+    }
+
+    [Test]
+    public void ClassifyBoundedFindReferencesException_DirectOperationCanceled_IsCancellation()
+    {
+        var classified = InvokePrivateStatic(
+            "ClassifyBoundedFindReferencesException",
+            new OperationCanceledException("cancelled"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(classified!, "Category"), Is.EqualTo("cancellation"));
+
+            var exception = GetProperty<Exception>(classified!, "Exception");
+            Assert.That(exception, Is.TypeOf<OperationCanceledException>());
+            Assert.That(exception.Message, Is.EqualTo("cancelled"));
+        });
+    }
+
+    [Test]
+    public void ClassifyBoundedFindReferencesException_AggregateWrappedCancellation_IsCancellation()
+    {
+        var classified = InvokePrivateStatic(
+            "ClassifyBoundedFindReferencesException",
+            new AggregateException(new OperationCanceledException("wrapped cancellation")));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(classified!, "Category"), Is.EqualTo("cancellation"));
+
+            var exception = GetProperty<Exception>(classified!, "Exception");
+            Assert.That(exception, Is.TypeOf<OperationCanceledException>());
+            Assert.That(exception.Message, Is.EqualTo("wrapped cancellation"));
+        });
+    }
+
+    [Test]
+    public void FindReferences_DeadlineProgressIndicator_CancelsExpiredSearch()
+    {
+        var indicator = CreateDeadlineProgressIndicator(DateTime.UtcNow.AddSeconds(-1));
+        var throwIfExpired = indicator.GetType().GetMethod("ThrowIfExpired", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        Assert.That(throwIfExpired, Is.Not.Null, "Missing method 'ThrowIfExpired'.");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<bool>(indicator, "IsCanceled"), Is.True);
+            Assert.That(
+                () => throwIfExpired!.Invoke(indicator, Array.Empty<object?>()),
+                Throws.TypeOf<TargetInvocationException>()
+                    .With.InnerException.TypeOf<TimeoutException>()
+                    .With.InnerException.Message.Contains("Rider F# find_references requires warmed ReSharper usage caches"));
+        });
+    }
+
+    [Test]
+    public void FindReferencesBounded_ExpiredDeadline_RethrowsTimeoutInsteadOfContinuing()
+    {
+        var indicator = CreateDeadlineProgressIndicator(DateTime.UtcNow.AddSeconds(-1));
+
+        var exception = Assert.Throws<TargetInvocationException>(() =>
+            InvokePrivateStatic(
+                "RethrowIfBoundedFindReferencesDeadlineExpired",
+                new OperationCanceledException("search cancelled"),
+                indicator));
+
+        Assert.That(exception!.InnerException, Is.TypeOf<TimeoutException>());
+        Assert.That(exception.InnerException!.Message, Does.Contain("module/type-only project_files searches"));
+    }
+
+    [Test]
+    public void RunBoundedFindReferencesStage_ExpiredDeadline_RethrowsTimeoutOnCancellation()
+    {
+        var indicator = CreateDeadlineProgressIndicator(DateTime.UtcNow.AddSeconds(-1));
+        var method = BackendHostType.GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .Single(candidate => candidate.Name == "RunBoundedFindReferencesStage" &&
+                                 candidate.GetParameters().Length == 2 &&
+                                 candidate.GetParameters()[1].ParameterType == typeof(Action));
+
+        var exception = Assert.Throws<TargetInvocationException>(() =>
+            method.Invoke(null, new object?[]
+            {
+                indicator,
+                (Action)(() => throw new OperationCanceledException("search cancelled"))
+            }));
+
+        Assert.That(exception!.InnerException, Is.TypeOf<TimeoutException>());
+        Assert.That(exception.InnerException!.Message, Does.Contain("module/type-only project_files searches"));
+    }
+
+    [Test]
+    public void FindReferences_LegacySearch_UsesNoOpProgressIndicator()
+    {
+        var method = BackendHostType.GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+            .Single(candidate => candidate.Name == "ResolveFindReferencesProgressIndicator" && candidate.GetParameters().Length == 1);
+        var resolved = method.Invoke(null, new object?[] { null });
+        var noOpIndicatorType = BackendHostType.Assembly.GetType("ReSharperPlugin.IndexMcp.NoOpProgressIndicator");
+        Assert.That(noOpIndicatorType, Is.Not.Null, "Missing type 'NoOpProgressIndicator'.");
+        var noOpInstance = noOpIndicatorType!.GetField("Instance", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+
+        Assert.That(resolved, Is.SameAs(noOpInstance));
+    }
+
+    [Test]
+    public void FormatSkippedFindReferencesDescriptors_TruncatesDeterministically()
+    {
+        var summary = (string)InvokePrivateStatic(
+            "FormatSkippedFindReferencesDescriptors",
+            new[]
+            {
+                "docsrc/content/lens.fsx",
+                "src/other.fs",
+                "src/third.fsx",
+                "src/fourth.fs"
+            },
+            3)!;
+
+        Assert.That(
+            summary,
+            Is.EqualTo("docsrc/content/lens.fsx, src/other.fs, src/third.fsx (+1 more)"));
     }
 
     [Test]
@@ -603,6 +1666,7 @@ public class IndexedSymbolResolutionTests
         Assert.Multiple(() =>
         {
             Assert.That(GetProperty<bool>(plan!, "UseProjectQualifiedTypeLookup"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "UseBoundedProjectFileSearch"), Is.False);
             Assert.That(GetProperty<bool>(plan!, "AllowLibraryFallback"), Is.True);
             Assert.That(GetProperty<bool>(plan!, "RejectUnboundedReferenceSearch"), Is.False);
             Assert.That(GetProperty<IReadOnlyList<string>?>(plan!, "AllowedProjectFileExtensions"), Is.Null);
@@ -619,7 +1683,11 @@ public class IndexedSymbolResolutionTests
 
         Assert.Multiple(() =>
         {
+            Assert.That(GetProperty<string>(plan!, "TargetKind"), Is.EqualTo("symbol"));
+            Assert.That(GetProperty<bool>(plan!, "IsFSharpPositionTarget"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "IsFSharpSymbolTarget"), Is.False);
             Assert.That(GetProperty<bool>(plan!, "UseProjectQualifiedTypeLookup"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "UseBoundedProjectFileSearch"), Is.False);
             Assert.That(GetProperty<bool>(plan!, "AllowLibraryFallback"), Is.True);
             Assert.That(GetProperty<bool>(plan!, "RejectUnboundedReferenceSearch"), Is.False);
             Assert.That(GetProperty<IReadOnlyList<string>?>(plan!, "AllowedProjectFileExtensions"), Is.Null);
@@ -627,28 +1695,45 @@ public class IndexedSymbolResolutionTests
     }
 
     [Test]
-    public void BuildFindReferencesResolutionPlan_FSharpProjectFilesMemberSymbol_DoesNotFastFail()
+    public void BuildFindReferencesResolutionPlan_CSharpPositionTarget_PreservesLegacyBaselineRoute()
+    {
+        var target = new RdSemanticTarget("src/Demo/Service.cs", 10, 5, null, null);
+
+        var plan = InvokePrivateStatic("BuildFindReferencesResolutionPlan", target, "project_files", null);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(plan!, "TargetKind"), Is.EqualTo("position"));
+            Assert.That(GetProperty<bool>(plan!, "IsFSharpPositionTarget"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "IsFSharpSymbolTarget"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "UseProjectQualifiedTypeLookup"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "UseBoundedProjectFileSearch"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "AllowLibraryFallback"), Is.True);
+            Assert.That(GetProperty<IReadOnlyList<string>?>(plan!, "AllowedProjectFileExtensions"), Is.Null);
+        });
+    }
+
+    [Test]
+    public void BuildFindReferencesResolutionPlan_FSharpProjectFilesMemberSymbol_DoesNotUseBoundedTypeOnlyPath()
     {
         var parseResult = InvokePrivateStatic("ParseIndexedSymbol", "F#", "FSharpPlus.Lens#map");
         var parsedSymbol = GetProperty<object>(parseResult!, "Symbol");
 
         var plan = InvokePrivateStatic("BuildFindReferencesResolutionPlan", "project_files", parsedSymbol);
 
-        Assert.That(GetProperty<bool>(plan!, "RejectUnboundedReferenceSearch"), Is.False);
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<bool>(plan!, "UseBoundedProjectFileSearch"), Is.False);
+            Assert.That(GetProperty<bool>(plan!, "RejectUnboundedReferenceSearch"), Is.False);
+            Assert.That(GetProperty<IReadOnlyList<string>?>(plan!, "AllowedProjectFileExtensions"), Is.Null);
+        });
     }
 
     [Test]
-    public void ResolveTargetForFindReferences_FSharpProjectFilesTypeOnlyQualified_ThrowsFastFailureBeforeResolution()
+    public void EnsureFindReferencesIndexedTargetIsSupported_FSharpProjectFilesTypeOnlyQualified_DoesNotFastFail()
     {
-        var backendHost = CreateUninitializedBackendHost();
-        var target = new RdSemanticTarget(null, null, null, "F#", "FSharpPlus.Lens");
-
-        var exception = Assert.Throws<TargetInvocationException>(() =>
-            InvokePrivateInstance(backendHost, "ResolveTargetForFindReferences", Lifetime.Eternal, target, "project_files"));
-
-        Assert.That(exception!.InnerException, Is.TypeOf<InvalidOperationException>());
-        Assert.That(exception.InnerException!.Message, Does.Contain("F#"));
-        Assert.That(exception.InnerException!.Message, Does.Contain("project_files"));
+        Assert.DoesNotThrow(() =>
+            InvokePrivateStatic("EnsureFindReferencesIndexedTargetIsSupported", "F#", "FSharpPlus.Lens", "project_files"));
     }
 
     [Test]
@@ -682,6 +1767,47 @@ public class IndexedSymbolResolutionTests
 
         Assert.DoesNotThrow(() =>
             InvokePrivateStatic("EnsureFindReferencesSearchIsSupported", plan!, parsedSymbol, "project_and_libraries"));
+    }
+
+    [TestCase("invalid_symbol", "Rider symbol cannot be empty.")]
+    [TestCase("unresolved_symbol", "No Rider declaration matches symbol 'FSharpPlus.Lens#view'.")]
+    [TestCase("ambiguous_match", "Multiple Rider declarations match symbol 'FSharpPlus.Lens#view'.")]
+    [TestCase("unsupported_target", "Container 'FSharpPlus.Lens' does not support member lookup.")]
+    public void DecorateFSharpSymbolModeResolution_LimitationStatusesRecommendPositionLookup(string status, string baseMessage)
+    {
+        var decorated = InvokePrivateStatic(
+            "DecorateFSharpSymbolModeResolution",
+            CreateIndexedSymbolResolution(status, baseMessage),
+            "F#",
+            "FSharpPlus.Lens#view");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(decorated!, "Status"), Is.EqualTo(status));
+            Assert.That(GetProperty<string>(decorated!, "Message"), Does.Contain(baseMessage));
+            Assert.That(GetProperty<string>(decorated!, "Message"), Does.Contain("best-effort"));
+            Assert.That(GetProperty<string>(decorated!, "Message"), Does.Contain("file + line + column"));
+        });
+    }
+
+    [Test]
+    public void DecorateFSharpSymbolModeResolution_SuccessLeavesResolutionUntouched()
+    {
+        var resolvedElement = CreateTypeMember("view");
+        var success = CreateIndexedSymbolResolution("success", null, resolvedElement);
+
+        var decorated = InvokePrivateStatic(
+            "DecorateFSharpSymbolModeResolution",
+            success,
+            "F#",
+            "FSharpPlus.Lens#view");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(GetProperty<string>(decorated!, "Status"), Is.EqualTo("success"));
+            Assert.That(GetProperty<string?>(decorated!, "Message"), Is.Null);
+            Assert.That(GetProperty<object>(decorated!, "Element"), Is.SameAs(resolvedElement));
+        });
     }
 
     [Test]
@@ -742,10 +1868,170 @@ public class IndexedSymbolResolutionTests
         Assert.That(matches, Is.EqualTo(expected));
     }
 
+    [TestCase("System.String")]
+    [TestCase("System.Collections.IEnumerable")]
+    [TestCase("System.Collections.Generic.IEnumerable")]
+    public void MatchesLanguage_FSharp_AllowsSourceLessClrLibraryTypes(string qualifiedTypeName)
+    {
+        var libraryType = CreateTypeElementCandidate(
+            qualifiedTypeName.Split('.').Last(),
+            qualifiedTypeName,
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+
+        var matches = (bool)InvokePrivateStatic("MatchesLanguage", libraryType, "F#")!;
+
+        Assert.That(matches, Is.True);
+    }
+
+    [Test]
+    public void MatchesLanguageForSourcePath_FSharp_RejectsSourceBackedCSharpFiles()
+    {
+        var matches = (bool)InvokePrivateStatic("MatchesLanguageForSourcePath", "C:/repo/src/Demo/Service.cs", "F#")!;
+
+        Assert.That(matches, Is.False);
+    }
+
+    [TestCase("System.String")]
+    [TestCase("System.Collections.IEnumerable")]
+    [TestCase("System.Collections.Generic.IEnumerable")]
+    public void ResolveProjectQualifiedTypeCandidatesCore_FSharpClrTypeFallback_UsesFallbackWhenProjectLookupMisses(string qualifiedTypeName)
+    {
+        var fallbackType = CreateTypeElementCandidate(
+            qualifiedTypeName.Split('.').Last(),
+            qualifiedName: qualifiedTypeName,
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+
+        var resolved = ((IEnumerable)InvokePrivateStatic(
+                "ResolveProjectQualifiedTypeCandidatesCore",
+                "F#",
+                qualifiedTypeName,
+                (Func<IEnumerable<ITypeElement>>)(() => Array.Empty<ITypeElement>()),
+                (Func<IEnumerable<IDeclaredElement>>)(() => new[] { fallbackType }))!)
+            .Cast<IDeclaredElement>()
+            .ToList();
+
+        Assert.That(resolved, Is.EqualTo(new[] { fallbackType }));
+    }
+
+    [TestCase("System.String")]
+    [TestCase("System.Collections.IEnumerable")]
+    [TestCase("System.Collections.Generic.IEnumerable")]
+    public void ResolveContainerCandidatesCore_FSharpClrTypeFallback_UsesFallbackWhenPrimaryLookupMisses(string qualifiedTypeName)
+    {
+        var fallbackType = CreateTypeElementCandidate(
+            qualifiedTypeName.Split('.').Last(),
+            qualifiedName: qualifiedTypeName,
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+
+        var resolved = ((IEnumerable)InvokePrivateStatic(
+                "ResolveContainerCandidatesCore",
+                "F#",
+                qualifiedTypeName,
+                (Func<IEnumerable<IDeclaredElement>>)(() => Array.Empty<IDeclaredElement>()),
+                (Func<IEnumerable<IDeclaredElement>>)(() => new[] { fallbackType }))!)
+            .Cast<IDeclaredElement>()
+            .ToList();
+
+        Assert.That(resolved, Is.EqualTo(new[] { fallbackType }));
+    }
+
+    [Test]
+    public void ResolveContainerCandidatesCore_CSharpPrimaryMatch_DoesNotInvokeClrFallback()
+    {
+        var primaryType = CreateTypeElementCandidate("String", qualifiedName: "System.String");
+        var fallbackInvoked = false;
+
+        var resolved = ((IEnumerable)InvokePrivateStatic(
+                "ResolveContainerCandidatesCore",
+                "C#",
+                "System.String",
+                (Func<IEnumerable<IDeclaredElement>>)(() => new[] { primaryType }),
+                (Func<IEnumerable<IDeclaredElement>>)(() =>
+                {
+                    fallbackInvoked = true;
+                    return Array.Empty<IDeclaredElement>();
+                }))!)
+            .Cast<IDeclaredElement>()
+            .ToList();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved, Is.EqualTo(new[] { primaryType }));
+            Assert.That(fallbackInvoked, Is.False);
+        });
+    }
+
+    [Test]
+    public void EnumerateClrPredefinedLookupNames_GenericIEnumerable_AddsArityVariant()
+    {
+        var candidates = ((IEnumerable)InvokePrivateStatic(
+                "EnumerateClrPredefinedLookupNames",
+                "System.Collections.Generic.IEnumerable")!)
+            .Cast<string>()
+            .ToList();
+
+        Assert.That(candidates, Is.EqualTo(new[]
+        {
+            "System.Collections.Generic.IEnumerable",
+            "System.Collections.Generic.IEnumerable`1"
+        }));
+    }
+
+    [TestCase("System.String")]
+    [TestCase("System.Collections.IEnumerable")]
+    [TestCase("System.Collections.Generic.IEnumerable")]
+    public void ResolveContainerCandidatesFromScope_FSharp_PreservesSourceLessClrMatches(string qualifiedTypeName)
+    {
+        var backendHost = CreateUninitializedBackendHost();
+        var libraryType = CreateTypeElementCandidate(
+            qualifiedTypeName.Split('.').Last(),
+            qualifiedTypeName,
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_PresentationLanguage"] = CSharpLanguage.Instance
+            });
+        var symbolScope = CreateSymbolScope(qualifiedTypeName, libraryType);
+
+        var resolved = ((IEnumerable)InvokePrivateInstance(
+                backendHost,
+                "ResolveContainerCandidatesFromScope",
+                symbolScope,
+                qualifiedTypeName,
+                "F#")!)
+            .Cast<IDeclaredElement>()
+            .ToList();
+
+        Assert.That(resolved, Is.EqualTo(new[] { libraryType }));
+    }
+
     private static string GetResolutionStatus(object? resolution)
     {
         Assert.That(resolution, Is.Not.Null);
         return GetProperty<string>(resolution!, "Status");
+    }
+
+    private static object CreateIndexedSymbolResolution(string status, string? message, IDeclaredElement? element = null)
+    {
+        var resolutionType = BackendHostType.Assembly.GetType("ReSharperPlugin.IndexMcp.IndexedSymbolResolution");
+        Assert.That(resolutionType, Is.Not.Null, "Missing type 'IndexedSymbolResolution'.");
+
+        var constructor = resolutionType!.GetConstructor(
+            BindingFlags.Instance | BindingFlags.NonPublic,
+            null,
+            new[] { typeof(string), typeof(string), typeof(IDeclaredElement) },
+            null);
+        Assert.That(constructor, Is.Not.Null, "Missing IndexedSymbolResolution(string, string?, IDeclaredElement?) constructor.");
+
+        return constructor!.Invoke(new object?[] { status, message, element });
     }
 
     private static T GetProperty<T>(object target, string name)
@@ -777,9 +2063,62 @@ public class IndexedSymbolResolutionTests
         return methodInfo.Invoke(target, args);
     }
 
+    private static object? InvokePrivateNestedStatic(string nestedTypeName, string methodName, params object?[] args)
+    {
+        var nestedType = BackendHostType.GetNestedType(nestedTypeName, BindingFlags.NonPublic);
+        Assert.That(nestedType, Is.Not.Null, $"Missing nested type '{nestedTypeName}'.");
+
+        var methods = nestedType!.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+            .Where(method => method.Name == methodName)
+            .ToList();
+        Assert.That(methods, Is.Not.Empty, $"Missing method '{methodName}' on nested type '{nestedTypeName}'.");
+
+        var methodInfo = methods.Single(method => method.GetParameters().Length == args.Length);
+        return methodInfo.Invoke(null, args);
+    }
+
+    private static MethodInfo GetPublicStaticMethod(Type declaringType, string methodName, int parameterCount)
+    {
+        var methods = declaringType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Where(method => method.Name == methodName)
+            .ToList();
+        Assert.That(methods, Is.Not.Empty, $"Missing public static method '{methodName}' on {declaringType.FullName}.");
+
+        var method = methods.Single(candidate => candidate.GetParameters().Length == parameterCount);
+        return method;
+    }
+
+    private static (Exception Exception, long ElapsedMilliseconds) CaptureInvocationFailure(MethodInfo method, params object?[] args)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var exception = Assert.Throws<TargetInvocationException>(() => method.Invoke(null, args));
+        stopwatch.Stop();
+
+        return (exception!.InnerException ?? exception, stopwatch.ElapsedMilliseconds);
+    }
+
     private static object CreateUninitializedBackendHost()
     {
         return FormatterServices.GetUninitializedObject(BackendHostType);
+    }
+
+    private static object CreateDeadlineProgressIndicator(DateTime deadlineUtc)
+    {
+        var indicatorType = BackendHostType.Assembly.GetType("ReSharperPlugin.IndexMcp.DeadlineProgressIndicator");
+        Assert.That(indicatorType, Is.Not.Null, "Missing type 'DeadlineProgressIndicator'.");
+
+        var constructor = indicatorType!.GetConstructor(
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            null,
+            new[] { typeof(DateTime), typeof(string) },
+            null);
+        Assert.That(constructor, Is.Not.Null, "Missing DeadlineProgressIndicator(DateTime, string) constructor.");
+
+        return constructor!.Invoke(new object[]
+        {
+            deadlineUtc,
+            "Rider F# find_references requires warmed ReSharper usage caches; module/type-only project_files searches should retry after IDE warm-up or use a position/member target."
+        });
     }
 
     private static IDeclaredElement CreateDeclaredElement(
@@ -810,6 +2149,22 @@ public class IndexedSymbolResolutionTests
         });
     }
 
+    private static IDeclaration CreateDeclarationWithSourcePath(string filePath, IDeclaredElement? declaredElement = null, ITreeNode? parent = null)
+    {
+        var sourceFile = ProxyFactory.Create<IPsiSourceFile>(new Dictionary<string, object?>
+        {
+            ["GetLocation"] = VirtualFileSystemPath.Parse(filePath, InteractionContext.SolutionContext)
+        });
+
+        return ProxyFactory.Create<IDeclaration>(new Dictionary<string, object?>
+        {
+            ["get_DeclaredElement"] = declaredElement,
+            ["get_Parent"] = parent,
+            ["GetSourceFile"] = sourceFile,
+            ["get_SourceFile"] = sourceFile
+        });
+    }
+
     private static ITypeDeclaration CreateTypeDeclaration(IDeclaredElement? declaredElement = null, ITreeNode? parent = null)
     {
         return ProxyFactory.Create<ITypeDeclaration>(new Dictionary<string, object?>
@@ -835,13 +2190,65 @@ public class IndexedSymbolResolutionTests
         });
     }
 
-    private static ITypeElement CreateTypeElementCandidate(string shortName)
+    private static ITypeElement CreateTypeElementCandidate(
+        string shortName,
+        string? qualifiedName = null,
+        IList<IDeclaration>? declarations = null,
+        IDictionary<string, object?>? handlers = null)
     {
-        return ProxyFactory.Create<ITypeElement>(new Dictionary<string, object?>
+        var configuredHandlers = new Dictionary<string, object?>(handlers ?? new Dictionary<string, object?>())
         {
             ["get_ShortName"] = shortName,
-            ["GetMembers"] = new List<ITypeMember>()
+            ["GetMembers"] = new List<ITypeMember>(),
+            ["GetDeclarations"] = declarations ?? new List<IDeclaration>(),
+            ["GetClrName"] = CreateClrName(qualifiedName ?? shortName)
+        };
+
+        return ProxyFactory.Create<ITypeElement>(configuredHandlers);
+    }
+
+    private static ISymbolScope CreateSymbolScope(string qualifiedName, params IDeclaredElement[] elements)
+    {
+        return ProxyFactory.Create<ISymbolScope>(new Dictionary<string, object?>
+        {
+            ["GetElementsByQualifiedName"] = (Func<object?[], object?>)(args =>
+            {
+                var requestedName = args.FirstOrDefault() as string;
+                return string.Equals(requestedName, qualifiedName, StringComparison.Ordinal)
+                    ? elements.Cast<IClrDeclaredElement>().ToList()
+                    : new List<IClrDeclaredElement>();
+            })
         });
+    }
+
+    private static object CreateClrName(string qualifiedName)
+    {
+        var clrNameType = typeof(ITypeElement).GetMethod("GetClrName")!.ReturnType;
+
+        if (clrNameType.IsInterface)
+        {
+            return ProxyFactory.Create(clrNameType, new Dictionary<string, object?>
+            {
+                ["get_FullName"] = qualifiedName,
+                ["ToString"] = qualifiedName
+            });
+        }
+
+        var stringConstructor = clrNameType.GetConstructor(new[] { typeof(string) });
+        if (stringConstructor != null)
+            return stringConstructor.Invoke(new object[] { qualifiedName });
+
+        var parseMethod = clrNameType.GetMethod(
+            "Parse",
+            BindingFlags.Public | BindingFlags.Static,
+            null,
+            new[] { typeof(string) },
+            null);
+        if (parseMethod != null)
+            return parseMethod.Invoke(null, new object[] { qualifiedName })!;
+
+        Assert.Fail($"Unable to construct CLR name for '{qualifiedName}' using {clrNameType.FullName}.");
+        return null!;
     }
 
     private static INamespace CreateNamespaceElement(string qualifiedName)
@@ -856,6 +2263,7 @@ public class IndexedSymbolResolutionTests
     private static ITypeMember CreateTypeMember(
         string shortName,
         IList<IDeclaration>? declarations = null,
+        ITypeElement? containingType = null,
         params string[] parameterTypes)
     {
         var parameters = parameterTypes.Select(CreateParameter).ToList();
@@ -865,13 +2273,14 @@ public class IndexedSymbolResolutionTests
                 ["get_ShortName"] = shortName,
                 ["GetDeclarations"] = declarations ?? new List<IDeclaration>(),
                 ["get_PresentationLanguage"] = CSharpLanguage.Instance,
+                ["get_ContainingType"] = containingType,
                 ["get_Parameters"] = parameters
             });
     }
 
     private static ITypeMember CreateTypeMember(string shortName, params string[] parameterTypes)
     {
-        return CreateTypeMember(shortName, null, parameterTypes);
+        return CreateTypeMember(shortName, null, null, parameterTypes);
     }
 
     private static IParameter CreateParameter(string presentableTypeName)
@@ -895,9 +2304,21 @@ public class IndexedSymbolResolutionTests
         public static T Create<T>(IDictionary<string, object?> handlers)
             where T : class
         {
-            var proxy = DispatchProxy.Create<T, InterfaceDispatchProxy>();
-            var dispatchProxy = (InterfaceDispatchProxy)(object)proxy;
-            dispatchProxy.Configure(typeof(T), handlers);
+            return (T)Create(typeof(T), handlers);
+        }
+
+        public static object Create(Type interfaceType, IDictionary<string, object?> handlers)
+        {
+            var createMethod = typeof(DispatchProxy)
+                .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .Single(method => method.Name == nameof(DispatchProxy.Create) &&
+                                  method.IsGenericMethodDefinition &&
+                                  method.GetGenericArguments().Length == 2);
+
+            var proxy = createMethod.MakeGenericMethod(interfaceType, typeof(InterfaceDispatchProxy))
+                .Invoke(null, null)!;
+            var dispatchProxy = (InterfaceDispatchProxy)proxy;
+            dispatchProxy.Configure(interfaceType, handlers);
             return proxy;
         }
     }
@@ -967,5 +2388,20 @@ public class IndexedSymbolResolutionTests
 
     private interface ITestTypeMember : ITypeMember, IParametersOwner
     {
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        var current = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
+        while (current != null)
+        {
+            var candidate = Path.Combine(current.FullName, "src", "dotnet", "ReSharperPlugin.IndexMcp.Tests", "testData", "CSharpProductionReadiness", "MutationWorkspace", "fixture-index.json");
+            if (File.Exists(candidate))
+                return current.FullName;
+
+            current = current.Parent;
+        }
+
+        throw new AssertionException("Could not locate repository root for C# production-readiness fixtures.");
     }
 }

@@ -518,6 +518,17 @@ class ToolsUnitTest : TestCase() {
         assertTrue("Description should mention only file required for file mode", description.contains("REQUIRED: file only"))
     }
 
+    fun testRefactoringToolSchemasDoNotExposeOutputOnlyMutationFields() {
+        val tools = listOf(RenameSymbolTool(), MoveFileTool(), SafeDeleteTool())
+
+        tools.forEach { tool ->
+            val properties = tool.inputSchema[SchemaConstants.PROPERTIES]?.jsonObject
+            assertNotNull("${tool.name} should define properties", properties)
+            assertNull("${tool.name} should not expose output-only status input", properties?.get("status"))
+            assertNull("${tool.name} should not expose output-only verification input", properties?.get("verification"))
+        }
+    }
+
     // New navigation tools
 
     fun testFindSymbolToolSchema() {
@@ -583,6 +594,15 @@ class ToolsUnitTest : TestCase() {
         assertNotNull("Should have endLine property", properties?.get(ParamNames.END_LINE))
         assertNotNull("Should have optimizeImports property", properties?.get(ParamNames.OPTIMIZE_IMPORTS))
         assertNotNull("Should have rearrangeCode property", properties?.get(ParamNames.REARRANGE_CODE))
+        assertTrue(
+            "Rearrange code description should document conservative default",
+            properties?.get(ParamNames.REARRANGE_CODE)
+                ?.jsonObject
+                ?.get(SchemaConstants.DESCRIPTION)
+                ?.jsonPrimitive
+                ?.content
+                ?.contains("Default: false") == true
+        )
 
         val required = schema[SchemaConstants.REQUIRED]
         assertNotNull("Should have required array", required)
