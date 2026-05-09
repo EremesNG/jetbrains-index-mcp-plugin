@@ -42,6 +42,7 @@ import java.nio.file.Files
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
@@ -746,6 +747,7 @@ class ToolsTest : BasePlatformTestCase() {
         )
 
         val payload = json.parseToJsonElement((result.content.first() as ContentBlock.Text).text).jsonObject
+        assertEquals(false, payload["success"]?.jsonPrimitive?.boolean)
         assertEquals("no_op", payload["status"]?.jsonPrimitive?.content)
         assertEquals(0, payload["changesCount"]?.jsonPrimitive?.int)
         assertEquals(
@@ -798,6 +800,7 @@ class ToolsTest : BasePlatformTestCase() {
         )
 
         val payload = json.parseToJsonElement((result.content.first() as ContentBlock.Text).text).jsonObject
+        assertEquals(true, payload["success"]?.jsonPrimitive?.boolean)
         assertEquals("success", payload["status"]?.jsonPrimitive?.content)
         assertEquals(1, payload["changesCount"]?.jsonPrimitive?.int)
         assertEquals(

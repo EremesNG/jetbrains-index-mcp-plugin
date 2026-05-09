@@ -342,6 +342,134 @@ class RiderMutationRoutingUnitTest : TestCase() {
         assertFalse(backend.contains("ValidateFSharpOptimizeImportsProcessMethod"))
     }
 
+    fun testReformatCodeToolRoutesRiderDotNetFilesThroughFrontendManualEquivalentBeforeGenericProcessors() {
+        val source = refactoringSource("ReformatCodeTool.kt")
+
+        assertContains(
+            source,
+            "shouldUseRiderFrontendReformat(file)",
+            "Rider .cs/.fs reformat should detect Rider-backed .NET files before the generic IntelliJ processor lane"
+        )
+        assertContains(
+            source,
+            "ACTION_EDITOR_REFORMAT",
+            "Rider .cs/.fs reformat should probe ACTION_EDITOR_REFORMAT first when available"
+        )
+        assertContains(
+            source,
+            "ACTION_REFORMAT_CODE",
+            "Rider .cs/.fs reformat may keep ACTION_REFORMAT_CODE as an additional compatibility candidate"
+        )
+        assertContains(
+            source,
+            "\"ReformatCode\"",
+            "Rider .cs/.fs reformat should keep the stable ReformatCode fallback action id"
+        )
+        assertContains(
+            source,
+            "\"RearrangeCode\"",
+            "Rider .cs/.fs reformat should keep the stable RearrangeCode action id for rearrangeCode=true"
+        )
+        assertContains(
+            source,
+            "AnActionEvent.createEvent(",
+            "Rider .cs/.fs reformat should use the stable action-event factory instead of the deprecated constructor"
+        )
+        assertContains(
+            source,
+            "ActionUtil.invokeAction(action, event, null)",
+            "Rider .cs/.fs reformat should execute through the official action-system runner instead of calling OverrideOnly AnAction methods directly"
+        )
+        assertContains(
+            source,
+            "private suspend fun invokeOptionalRiderAction",
+            "Rider .cs/.fs reformat should model action invocation as a suspending helper so EDT can be enforced consistently"
+        )
+        assertContains(
+            source,
+            "return edtAction {",
+            "Rider .cs/.fs reformat should resolve and invoke Rider actions on EDT"
+        )
+        assertContains(
+            source,
+            "dispatchRiderReformatShortcut",
+            "Rider .cs/.fs reformat should keep a manual-equivalent keyboard fallback when no action id resolves"
+        )
+        assertContains(
+            source,
+            "KeyEvent.VK_L",
+            "Rider .cs/.fs reformat shortcut fallback should dispatch Ctrl+Alt+L"
+        )
+        assertContains(
+            source,
+            "awaitObservableRiderMutation(",
+            "Rider .cs/.fs reformat should wait for an observable post-invocation mutation before deciding no_op"
+        )
+        assertContains(
+            source,
+            "OptimizeImportsProcessor(processor)",
+            "Non-.NET reformat should keep the generic IntelliJ OptimizeImportsProcessor chain"
+        )
+        assertContains(
+            source,
+            "RearrangeCodeProcessor(processor)",
+            "Non-.NET reformat should keep the generic IntelliJ RearrangeCodeProcessor chain"
+        )
+        assertContains(
+            source,
+            "ReformatCodeProcessor(psiFile, false)",
+            "Non-.NET reformat should keep the generic IntelliJ ReformatCodeProcessor lane"
+        )
+        assertFalse(source.contains("AnActionEvent("))
+        assertFalse(source.contains("action.update(event)"))
+        assertFalse(source.contains("action.actionPerformed(event)"))
+    }
+
+    fun testReformatCodeToolFailsClosedForRiderDotNetPartialRange() {
+        val source = refactoringSource("ReformatCodeTool.kt")
+
+        assertContains(
+            source,
+            "shouldUseRiderFrontendReformat(file) && textRange != null",
+            "Rider .cs/.fs reformat should branch explicitly on partial-range requests before invoking frontend actions"
+        )
+        assertContains(
+            source,
+            "startLine/endLine is not supported when optimizeImports or rearrangeCode is enabled because those actions are file-wide",
+            "Rider .cs/.fs reformat should fail closed for partial range plus file-wide optimize/rearrange actions"
+        )
+        assertContains(
+            source,
+            "startLine/endLine is not supported because the frontend reformat action cannot guarantee selection-scoped formatting",
+            "Rider .cs/.fs reformat should fail closed for selection-only partial range when scope guarantees are not strong enough"
+        )
+    }
+
+    fun testReformatCodeToolReportsHonestNoOpPayloads() {
+        val source = refactoringSource("ReformatCodeTool.kt")
+
+        assertContains(
+            source,
+            "success = changed",
+            "Reformat should only report success when an observable diff actually happened"
+        )
+        assertContains(
+            source,
+            "affectedFiles = if (changed) listOf(file) else emptyList()",
+            "Reformat should not claim affected files for no-op executions"
+        )
+        assertContains(
+            source,
+            "changesCount = if (changed) 1 else 0",
+            "Reformat should keep changesCount at zero for no-op executions"
+        )
+        assertContains(
+            source,
+            "status = if (changed) \"success\" else \"no_op\"",
+            "Reformat should map zero-diff executions to no_op instead of synthetic success"
+        )
+    }
+
     fun testRiderMutationToolsUseSharedVerificationSummaryMapper() {
         val renameSource = refactoringSource("RenameSymbolTool.kt")
         val moveSource = refactoringSource("MoveFileTool.kt")
