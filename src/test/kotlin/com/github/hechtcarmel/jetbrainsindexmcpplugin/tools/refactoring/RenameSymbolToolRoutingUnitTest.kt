@@ -4,8 +4,96 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderBacke
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.MutationVerification
 import junit.framework.TestCase
 import java.io.File
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 class RenameSymbolToolRoutingUnitTest : TestCase() {
+
+    fun testRenameModeTreatsOmittedLineAndColumnAsFileRename() {
+        val mode = RenameSymbolTool().resolveRenameMode(buildJsonObject {
+            put("file", JsonPrimitive("src/File.cs"))
+            put("newName", JsonPrimitive("Renamed.cs"))
+        })
+
+        assertTrue(mode.isFileRename)
+        assertNull(mode.line)
+        assertNull(mode.column)
+        assertNull(mode.error)
+    }
+
+    fun testRenameModeTreatsZeroLineAndColumnAsFileRename() {
+        val mode = RenameSymbolTool().resolveRenameMode(buildJsonObject {
+            put("file", JsonPrimitive("src/File.cs"))
+            put("line", JsonPrimitive(0))
+            put("column", JsonPrimitive(0))
+            put("newName", JsonPrimitive("Renamed.cs"))
+        })
+
+        assertTrue(mode.isFileRename)
+        assertNull(mode.line)
+        assertNull(mode.column)
+        assertNull(mode.error)
+    }
+
+    fun testRenameModeTreatsBlankLineAndColumnStringsAsFileRename() {
+        val mode = RenameSymbolTool().resolveRenameMode(buildJsonObject {
+            put("file", JsonPrimitive("src/File.cs"))
+            put("line", JsonPrimitive("   "))
+            put("column", JsonPrimitive(""))
+            put("newName", JsonPrimitive("Renamed.cs"))
+        })
+
+        assertTrue(mode.isFileRename)
+        assertNull(mode.line)
+        assertNull(mode.column)
+        assertNull(mode.error)
+    }
+
+    fun testRenameModeTreatsPositiveLineAndColumnAsSymbolRename() {
+        val mode = RenameSymbolTool().resolveRenameMode(buildJsonObject {
+            put("file", JsonPrimitive("src/File.cs"))
+            put("line", JsonPrimitive(12))
+            put("column", JsonPrimitive(8))
+            put("newName", JsonPrimitive("RenamedSymbol"))
+        })
+
+        assertFalse(mode.isFileRename)
+        assertEquals(12, mode.line)
+        assertEquals(8, mode.column)
+        assertNull(mode.error)
+    }
+
+    fun testRenameModeRejectsMixedPositiveAndNonPositiveCoordinates() {
+        listOf(
+            buildJsonObject {
+                put("line", JsonPrimitive(12))
+                put("column", JsonPrimitive(0))
+            },
+            buildJsonObject {
+                put("line", JsonPrimitive(0))
+                put("column", JsonPrimitive(8))
+            },
+            buildJsonObject {
+                put("line", JsonPrimitive(12))
+            },
+            buildJsonObject {
+                put("column", JsonPrimitive(8))
+            }
+        ).forEach { coordinatesOnly ->
+            val mode = RenameSymbolTool().resolveRenameMode(buildJsonObject {
+                put("file", JsonPrimitive("src/File.cs"))
+                put("newName", JsonPrimitive("RenamedSymbol"))
+                coordinatesOnly.forEach { (key, value) -> put(key, value) }
+            })
+
+            assertFalse(mode.isFileRename)
+            assertEquals(
+                "Both 'line' and 'column' must be provided for symbol rename, or both omitted for file rename.",
+                mode.error
+            )
+        }
+    }
 
     fun testRiderFrontendFallbackRejectsContainerLikeTargets() {
         assertTrue(RenameSymbolTool.isUnsupportedRiderFrontendFallbackTargetClass(null))
@@ -246,12 +334,38 @@ class RenameSymbolToolRoutingUnitTest : TestCase() {
     fun testFileRenameLaneDoesNotUseFrontendFallbackStatusPolicy() {
         val source = renameToolSource()
 
-        assertTrue(source.contains("tryExecuteRiderFileRename(project, file, newName)"))
-        assertTrue(source.contains("return mapRiderRenameResult(project, result, trace, allowFrontendFallback = false)"))
-        assertFalse(
-            "file rename lane must stay backend-terminal and avoid frontend fallback policy",
-            source.contains("tryExecuteRiderFileRename(project, file, newName, allowFrontendFallback")
-        )
+        assertFalse(RenameSymbolTool.shouldUseRiderBackendRename("src/Service.cs", isFileRename = true))
+        assertTrue(source.contains("if (targetElement !is PsiFile && relatedRenamingStrategy != \"none\")"))
+        assertTrue(source.contains("if (targetElement !is PsiFile) {"))
+        assertTrue(source.contains("addParameterFieldRelations(project, targetElement, effectiveNewName, renameProcessor)"))
+    }
+
+    fun testZeroCoordinatesRouteRiderDotNetFilesToGenericFrontendFileRename() {
+        val source = renameToolSource()
+
+        assertTrue(source.contains("if (isFileRename) {"))
+        assertTrue(source.contains("shouldUseRiderBackendRename(file, isFileRename)"))
+        assertTrue(source.contains("validateAndPrepareFileRename(project, file, newName)"))
+        assertTrue(source.contains("val result = executeRename(project, element, newName, overrideStrategy, relatedRenamingStrategy, affectedFiles)"))
+        assertFalse(source.contains("tryExecuteRiderFileRename(project, file, newName)"))
+        assertFalse(source.contains("tryExecuteRiderSymbolRename(project, file, line, column, newName"))
+    }
+
+    fun testRiderBackendRenameRoutingKeepsDotNetSymbolsButNotDotNetFileRenames() {
+        assertTrue(RenameSymbolTool.shouldUseRiderBackendRename("src/Service.cs", isFileRename = false))
+        assertFalse(RenameSymbolTool.shouldUseRiderBackendRename("src/Service.cs", isFileRename = true))
+        assertFalse(RenameSymbolTool.shouldUseRiderBackendRename("src/Service.kt", isFileRename = false))
+    }
+
+    fun testFileRenameRoutingNormalizesCoordinatesBeforeBranching() {
+        val source = renameToolSource()
+
+        assertTrue(source.contains("val renameMode = resolveRenameMode(arguments)"))
+        assertTrue(source.contains("val isFileRename = renameMode.isFileRename"))
+        assertTrue(source.contains("if (isFileRename) {"))
+        assertTrue(source.contains("validateAndPrepareFileRename(project, file, newName)"))
+        assertFalse(source.contains("val line = arguments[\"line\"]?.jsonPrimitive?.int"))
+        assertFalse(source.contains("val column = arguments[\"column\"]?.jsonPrimitive?.int"))
     }
 
     fun testNonRiderSymbolRenameKeepsGenericProcessorLane() {
@@ -262,6 +376,26 @@ class RenameSymbolToolRoutingUnitTest : TestCase() {
         assertTrue(source.contains("val result = executeRename(project, element, newName, overrideStrategy, relatedRenamingStrategy, affectedFiles)"))
         assertTrue(source.contains("RenameProcessor(project, targetElement, effectiveNewName, false, false)"))
         assertTrue(source.contains("HeadlessRenameProcessor(project, targetElement, effectiveNewName, false, false)"))
+    }
+
+    fun testDotNetFileRenameDeclaredTypeContractAcceptsFileOnlyRename() {
+        val verification = RenameSymbolTool.verifyDotNetFileRenameDeclaredTypeIdentity(
+            beforeFileText = "namespace Demo; public class Service {}",
+            afterFileText = "namespace Demo; public class Service {}"
+        )
+
+        assertNull(verification)
+    }
+
+    fun testDotNetFileRenameDeclaredTypeContractRejectsTypeRename() {
+        val verification = RenameSymbolTool.verifyDotNetFileRenameDeclaredTypeIdentity(
+            beforeFileText = "namespace Demo; public class Service {}",
+            afterFileText = "namespace Demo; public class CustomerService {}"
+        )
+
+        assertNotNull(verification)
+        assertEquals("failed", verification!!.status)
+        assertTrue(verification.warnings.any { it.contains("declared type identity", ignoreCase = true) })
     }
 
     fun testFallbackTracingStagesArePresentInSource() {

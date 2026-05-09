@@ -63,7 +63,6 @@ import javax.swing.Timer
 import javax.swing.JTextField
 import javax.swing.text.JTextComponent
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonPrimitive
 
 /**
@@ -192,6 +191,10 @@ class RenameSymbolTool : AbstractMcpTool() {
                 "unsupported", "not_supported", "unsupported_context" -> true
                 else -> false
             }
+        }
+
+        internal fun shouldUseRiderBackendRename(file: String, isFileRename: Boolean): Boolean {
+            return !isFileRename && RiderBackendSemanticService.isDotNetFile(file)
         }
 
         internal fun shouldAwaitSecondDialogAfterPrimarySubmit(buttonText: String?): Boolean {
@@ -503,6 +506,43 @@ class RenameSymbolTool : AbstractMcpTool() {
             }
 
             return FrontendRenameMutationCheck(false, "target name and containing file text remained unchanged")
+        }
+
+        internal fun verifyDotNetFileRenameDeclaredTypeIdentity(
+            beforeFileText: String?,
+            afterFileText: String?
+        ): MutationVerification? {
+            val declaredTypeNamesBefore = extractDotNetDeclaredTypeNames(beforeFileText)
+            val declaredTypeNamesAfter = extractDotNetDeclaredTypeNames(afterFileText)
+
+            if (declaredTypeNamesBefore == declaredTypeNamesAfter) {
+                return null
+            }
+
+            return MutationVerification(
+                status = STATUS_FAILED,
+                checksRun = listOf("rename_execution", "declared_type_identity"),
+                warnings = listOf(
+                    "Declared type identity changed during .NET file rename: before [${declaredTypeNamesBefore.joinToString(", ").ifBlank { "<none>" }}], after [${declaredTypeNamesAfter.joinToString(", ").ifBlank { "<none>" }}]"
+                )
+            )
+        }
+
+        private fun extractDotNetDeclaredTypeNames(fileText: String?): List<String> {
+            if (fileText.isNullOrBlank()) {
+                return emptyList()
+            }
+
+            val declarationPattern = Regex(
+                """\b(?:class|struct|interface|enum|delegate|record(?:\s+class|\s+struct)?)\s+(@?[A-Za-z_][A-Za-z0-9_]*)"""
+            )
+
+            return declarationPattern.findAll(fileText)
+                .map { match -> match.groupValues[1].trim().trimStart('@') }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .sorted()
+                .toList()
         }
 
         internal fun evaluateRiderFrontendFeasibility(
@@ -845,14 +885,48 @@ class RenameSymbolTool : AbstractMcpTool() {
         val error: String? = null
     )
 
+    internal data class RenameModeResolution(
+        val isFileRename: Boolean,
+        val line: Int?,
+        val column: Int?,
+        val error: String? = null
+    )
+
+    internal fun resolveRenameMode(arguments: JsonObject): RenameModeResolution {
+        val normalizedLine = optionalIntArg(arguments, "line")?.takeIf { it > 0 }
+        val normalizedColumn = optionalIntArg(arguments, "column")?.takeIf { it > 0 }
+
+        return when {
+            normalizedLine == null && normalizedColumn == null -> RenameModeResolution(
+                isFileRename = true,
+                line = null,
+                column = null
+            )
+
+            normalizedLine != null && normalizedColumn != null -> RenameModeResolution(
+                isFileRename = false,
+                line = normalizedLine,
+                column = normalizedColumn
+            )
+
+            else -> RenameModeResolution(
+                isFileRename = false,
+                line = normalizedLine,
+                column = normalizedColumn,
+                error = "Both 'line' and 'column' must be provided for symbol rename, or both omitted for file rename."
+            )
+        }
+    }
+
     override suspend fun doExecute(project: Project, arguments: JsonObject): ToolCallResult {
         val file = requiredStringArg(arguments, "file").getOrElse {
             return createErrorResult(it.message ?: "Missing required parameter: file")
         }
-        val line = arguments["line"]?.jsonPrimitive?.int
-        val column = arguments["column"]?.jsonPrimitive?.int
         val newName = arguments["newName"]?.jsonPrimitive?.content
             ?: return createErrorResult("Missing required parameter: newName")
+        val renameMode = resolveRenameMode(arguments)
+        val line = renameMode.line
+        val column = renameMode.column
 
         val overrideStrategy = arguments["overrideStrategy"]?.jsonPrimitive?.content ?: "rename_base"
         if (overrideStrategy !in listOf("rename_base", "rename_only_current", "ask")) {
@@ -868,22 +942,17 @@ class RenameSymbolTool : AbstractMcpTool() {
             return createErrorResult("newName cannot be blank")
         }
 
-        // Validate that line and column are either both present or both absent
-        val isFileRename = line == null && column == null
-        if (!isFileRename && (line == null || column == null)) {
-            return createErrorResult("Both 'line' and 'column' must be provided for symbol rename, or both omitted for file rename.")
+        if (renameMode.error != null) {
+            return createErrorResult(renameMode.error)
         }
+        val isFileRename = renameMode.isFileRename
 
         requireSmartMode(project)
 
         var riderFrontendFallback: RiderRenameOutcome.FallbackToFrontend? = null
 
-        if (RiderBackendSemanticService.isDotNetFile(file)) {
-            val riderOutcome = if (isFileRename) {
-                tryExecuteRiderFileRename(project, file, newName)
-            } else {
-                tryExecuteRiderSymbolRename(project, file, line!!, column!!, newName)
-            }
+        if (shouldUseRiderBackendRename(file, isFileRename)) {
+            val riderOutcome = tryExecuteRiderSymbolRename(project, file, line!!, column!!, newName)
 
             val riderResult = when (riderOutcome) {
                 is RiderRenameOutcome.Success -> riderOutcome.result
@@ -938,6 +1007,18 @@ class RenameSymbolTool : AbstractMcpTool() {
 
         val element = validation.element
         val oldName = validation.oldName
+        val dotNetFileRenameProbe = if (isFileRename && RiderBackendSemanticService.isDotNetFile(file)) {
+            suspendingReadAction {
+                (element as? PsiFile)?.let { psiFile ->
+                    DotNetFileRenameProbe(
+                        pointer = SmartPointerManager.getInstance(project).createSmartPsiElementPointer(psiFile),
+                        beforeFileText = psiFile.text
+                    )
+                }
+            }
+        } else {
+            null
+        }
 
         var riderExecutionPlan: RiderRenameExecutionPlan? = null
 
@@ -1047,6 +1128,19 @@ class RenameSymbolTool : AbstractMcpTool() {
             edtAction { FileDocumentManager.getInstance().saveAllDocuments() }
         }
 
+        val dotNetFileRenameVerification = if (errorMessage == null) {
+            dotNetFileRenameProbe?.let { probe ->
+                suspendingReadAction {
+                    verifyDotNetFileRenameDeclaredTypeIdentity(
+                        beforeFileText = probe.beforeFileText,
+                        afterFileText = probe.pointer.element?.text
+                    )
+                }
+            }
+        } else {
+            null
+        }
+
         return if (errorMessage != null) {
             val classification = classifyFrontendRenameFailure(errorMessage, errorClassName, riderFrontendFallback?.status)
             if (classification.status == STATUS_UNSUPPORTED_CONTEXT) {
@@ -1075,7 +1169,20 @@ class RenameSymbolTool : AbstractMcpTool() {
                 verification = riderFrontendFallback?.verification
             )
 
-            createJsonResult(summary)
+            if (dotNetFileRenameVerification != null) {
+                createJsonResult(
+                    RefactoringResult(
+                        success = false,
+                        affectedFiles = affectedFiles.toList(),
+                        changesCount = changesCount,
+                        message = "Rename changed declared type identity during .NET file rename, so the request failed closed.",
+                        status = STATUS_FAILED,
+                        verification = dotNetFileRenameVerification
+                    )
+                )
+            } else {
+                createJsonResult(summary)
+            }
         }
     }
 
@@ -1096,6 +1203,11 @@ class RenameSymbolTool : AbstractMcpTool() {
         val pointer: com.intellij.psi.SmartPsiElementPointer<PsiElement>,
         val beforeName: String?,
         val targetFilePath: String?,
+        val beforeFileText: String?
+    )
+
+    private data class DotNetFileRenameProbe(
+        val pointer: com.intellij.psi.SmartPsiElementPointer<PsiFile>,
         val beforeFileText: String?
     )
 
@@ -2096,8 +2208,10 @@ class RenameSymbolTool : AbstractMcpTool() {
         }
 
         // Register automatic renamers based on the relatedRenamingStrategy.
+        // File rename requests stay file-scoped: do not attach symbol-related automatic renamers
+        // or parameter/field coupling because the contract is to preserve declared type names.
         // Factories with null option names are already handled automatically by RenameProcessor.
-        if (relatedRenamingStrategy != "none") {
+        if (targetElement !is PsiFile && relatedRenamingStrategy != "none") {
             for (factory in AutomaticRenamerFactory.EP_NAME.extensionList) {
                 if (factory.optionName == null) continue
                 if (relatedRenamingStrategy == "accessors_and_tests" && !isAccessorOrTestFactory(factory)) continue
@@ -2106,7 +2220,9 @@ class RenameSymbolTool : AbstractMcpTool() {
         }
 
         // Add constructor parameter -> field relation up front.
-        addParameterFieldRelations(project, targetElement, effectiveNewName, renameProcessor)
+        if (targetElement !is PsiFile) {
+            addParameterFieldRelations(project, targetElement, effectiveNewName, renameProcessor)
+        }
 
         // Disable preview dialog for headless operation
         renameProcessor.setPreviewUsages(false)

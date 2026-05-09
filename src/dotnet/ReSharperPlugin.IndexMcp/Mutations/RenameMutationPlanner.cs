@@ -45,20 +45,6 @@ internal static class RenameMutationPlanner
         if (!string.Equals(fileResolution.Status, MutationResolutionStatuses.Resolved, StringComparison.OrdinalIgnoreCase))
             return new RenameMutationPlan("file", fileResolution, absoluteFilePath, newPath);
 
-        if (WouldRequireTypeWideningGuard(absoluteFilePath, currentFileName, newName))
-        {
-            return new RenameMutationPlan(
-                "file",
-                ExactTargetResolution.Failure(
-                    MutationResolutionStatuses.Unsupported,
-                    "File-scoped rename was rejected because the file base name matches a declared type and the backend must not widen this request into a type rename. Use the dedicated file workflow with RenameFile support or fail closed.",
-                    targetKind: MutationTargetKind.File.ToContractValue(),
-                    resolvedName: currentFileName,
-                    sourceTokenText: currentFileName),
-                absoluteFilePath,
-                newPath);
-        }
-
         return new RenameMutationPlan("file", fileResolution, absoluteFilePath, newPath);
     }
 
@@ -80,20 +66,4 @@ internal static class RenameMutationPlanner
         => string.IsNullOrWhiteSpace(directory)
             ? fileName
             : Path.Combine(directory, fileName);
-
-    private static bool WouldRequireTypeWideningGuard(string absoluteFilePath, string currentFileName, string newName)
-    {
-        var currentBaseName = Path.GetFileNameWithoutExtension(currentFileName);
-        var newBaseName = Path.GetFileNameWithoutExtension(newName);
-        if (string.IsNullOrWhiteSpace(currentBaseName) ||
-            string.IsNullOrWhiteSpace(newBaseName) ||
-            string.Equals(currentBaseName, newBaseName, StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        return ReadDeclaredTypeNames(absoluteFilePath)
-            .Select(name => name.TrimStart('@'))
-            .Any(name => string.Equals(name, currentBaseName, StringComparison.Ordinal));
-    }
 }

@@ -98,7 +98,7 @@ public class RiderMutationWorkflowTests
     }
 
     [Test]
-    public void FileRenamePlan_UsesDistinctFileLaneAndRejectsWideningCandidates()
+    public void FileRenamePlan_UsesDistinctFileLaneWithoutTypeWidening()
     {
         var safeFixture = GetCase("fileRename");
         var safePlan = PlanFileRename(Path.Combine(WorkspaceRoot, safeFixture.File), safeFixture.NewName!);
@@ -129,19 +129,56 @@ public class RiderMutationWorkflowTests
             Assert.That(safePlan.Status, Is.EqualTo("resolved"), safePlan.Message);
         }
 
-        var unsafePath = Path.Combine(WorkspaceRoot, GetCase("typeRename").File);
-        var unsafePlan = PlanFileRename(unsafePath, "RenamedTypeTarget.cs");
+        var sameBaseNameTypePath = Path.Combine(WorkspaceRoot, GetCase("typeRename").File);
+        var sameBaseNameTypePlan = PlanFileRename(sameBaseNameTypePath, "RenamedTypeTarget.cs");
 
         Assert.Multiple(() =>
         {
-            Assert.That(unsafePlan.OperationKind, Is.EqualTo("file"));
-            Assert.That(unsafePlan.Status, Is.Not.EqualTo("resolved"));
-            Assert.That(unsafePlan.TargetKind, Is.EqualTo("file"));
-            Assert.That(unsafePlan.Message,
-                Does.Contain("type").IgnoreCase.And.Contain("file-scoped").IgnoreCase
-                    .Or.Contain("fail-closed").IgnoreCase
-                    .Or.Contain("workflow").IgnoreCase
-                    .Or.Contain("symbol rename").IgnoreCase);
+            Assert.That(sameBaseNameTypePlan.OperationKind, Is.EqualTo("file"));
+            Assert.That(sameBaseNameTypePlan.Status, Is.EqualTo("resolved"), sameBaseNameTypePlan.Message);
+            Assert.That(sameBaseNameTypePlan.TargetKind, Is.EqualTo("file"));
+            Assert.That(sameBaseNameTypePlan.ResolvedName, Is.EqualTo("TypeRenameTarget.cs"));
+            Assert.That(sameBaseNameTypePlan.NewPath, Does.EndWith("RenamedTypeTarget.cs"));
+        });
+    }
+
+    [Test]
+    public void FileRenameExecution_SameBaseNameTypePreservesDeclaredTypeIdentityOrFailsClosed()
+    {
+        var fixture = GetCase("typeRename");
+        using var workspace = CreateWorkspaceCopy();
+        var sourcePath = Path.Combine(workspace.RootPath, fixture.File);
+        var renamedPath = Path.Combine(Path.GetDirectoryName(sourcePath)!, "RenamedTypeTarget.cs");
+        var consumerPath = Path.Combine(workspace.RootPath, "Renames", "TypeRenameConsumer.cs");
+        var originalSourceText = File.ReadAllText(sourcePath);
+        var originalConsumerText = File.ReadAllText(consumerPath);
+        var outcome = ReadOutcome(ExecuteFileRename(sourcePath, "RenamedTypeTarget.cs"));
+
+        if (string.Equals(outcome.Status, "unsupported_context", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(outcome.Status, "unsupported", StringComparison.OrdinalIgnoreCase))
+        {
+            Assert.Multiple(() =>
+            {
+                Assert.That(outcome.Status, Is.EqualTo("unsupported_context"));
+                Assert.That(File.Exists(sourcePath), Is.True);
+                Assert.That(File.Exists(renamedPath), Is.False);
+                Assert.That(File.ReadAllText(sourcePath), Is.EqualTo(originalSourceText));
+                Assert.That(File.ReadAllText(consumerPath), Is.EqualTo(originalConsumerText));
+            });
+            return;
+        }
+
+        var renamedFileText = File.ReadAllText(renamedPath);
+        var consumerText = File.ReadAllText(consumerPath);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(File.Exists(sourcePath), Is.False);
+            Assert.That(File.Exists(renamedPath), Is.True);
+            Assert.That(renamedFileText, Does.Contain("class TypeRenameTarget"));
+            Assert.That(renamedFileText, Does.Not.Contain("class RenamedTypeTarget"));
+            Assert.That(consumerText, Does.Contain("TypeRenameTarget"));
+            Assert.That(consumerText, Does.Not.Contain("RenamedTypeTarget"));
         });
     }
 

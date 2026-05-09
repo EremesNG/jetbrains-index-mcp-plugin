@@ -19,7 +19,6 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.ReadAction
-import com.intellij.openapi.application.TransactionGuard
 import com.intellij.openapi.application.asContextElement
 import com.intellij.openapi.application.readAction as platformReadAction
 import com.intellij.openapi.command.WriteCommandAction
@@ -147,24 +146,16 @@ abstract class AbstractMcpTool : McpTool {
     }
 
     /**
-     * Commits all documents in a write-safe context.
+     * Commits all documents in a write-safe EDT command.
      *
-     * [PsiDocumentManager.commitAllDocuments] requires a write-safe EDT context
-     * (enforced by [TransactionGuard]). Since MCP tools are invoked from HTTP handlers
-     * (not user actions), there is no inherent write-safe context.
-     * [TransactionGuard.submitTransactionAndWait] explicitly creates one.
-     *
-     * From EDT (e.g. inside [withContext]([Dispatchers.EDT])), falls back to
-     * [WriteCommandAction] which also provides write-safety.
+     * MCP tools are typically invoked from background HTTP/coroutine contexts, so
+     * document commits must hop to the EDT before entering a write command. Using the
+     * same EDT/write-command path from both background and already-EDT callers avoids
+     * write-unsafe synchronous transaction waits in Rider.
      */
-    @Suppress("DEPRECATION")
     protected suspend fun commitDocuments(project: Project) {
-        if (ApplicationManager.getApplication().isDispatchThread) {
+        edtAction {
             WriteCommandAction.runWriteCommandAction(project) {
-                PsiDocumentManager.getInstance(project).commitAllDocuments()
-            }
-        } else {
-            TransactionGuard.getInstance().submitTransactionAndWait {
                 PsiDocumentManager.getInstance(project).commitAllDocuments()
             }
         }
