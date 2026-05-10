@@ -6,6 +6,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.BuiltInSearchScop
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.BuiltInSearchScopeResolver
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.CallElementData
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.LanguageHandlerRegistry
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RIDER_CALL_HIERARCHY_SYMBOL_MODE_UNSUPPORTED
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderBackendSemanticService
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderBackendTimeoutException
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.models.ToolCallResult
@@ -15,7 +16,6 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.CallHierarchy
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.schema.SchemaBuilder
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.project.Project
-import com.intellij.psi.PsiElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonPrimitive
@@ -37,7 +37,7 @@ class CallHierarchyTool : AbstractMcpTool() {
         Languages: Java, Kotlin, Python, JavaScript, TypeScript, PHP, Rust, C#, F#.
 
         Rust note: "callers" direction works well; "callees" direction may have limited results due to Rust plugin PSI resolution constraints.
-        Rider note: C#/F# results use Rider's frontend navigation bridge to the ReSharper backend.
+        Rider note: C#/F# results use Rider's frontend navigation bridge to the ReSharper backend. Caller/callee scope separation between project_files and project_and_libraries is only guaranteed where backend APIs can enforce that distinction, and framework-routed endpoints can legitimately have empty static callers. For routed/reflection-driven entry points, an empty callers result is a static-analysis limitation and does not imply backend failure.
 
         Returns: recursive tree with method signatures, file locations (line/column), and nested call relationships.
 
@@ -64,7 +64,6 @@ class CallHierarchyTool : AbstractMcpTool() {
     companion object {
         private const val DEFAULT_DEPTH = 3
         private const val MAX_DEPTH = 5
-        private const val RIDER_SYMBOL_MODE_UNSUPPORTED = "Rider C#/F# symbol-mode call hierarchy requires backend-native symbol resolution and is unsupported for symbol requests the backend cannot map to source positions."
 
         internal fun riderTimeoutMessage(timeout: RiderBackendTimeoutException): String =
             timeout.message ?: "Rider backend timed out while resolving call hierarchy"
@@ -100,18 +99,42 @@ class CallHierarchyTool : AbstractMcpTool() {
         return suspendingReadAction {
             ProgressManager.checkCanceled() // Allow cancellation
 
-            val riderSymbolElement = resolveRiderSymbolModeElement(project, requestedLanguage, requestedSymbol, isRiderSymbolMode)
-            val element = (riderSymbolElement
-                ?: resolveElementFromArguments(project, arguments, allowLibraryFilesForPosition = true)).getOrElse {
+            if (isRiderSymbolMode) {
+                val riderHierarchy = RiderBackendSemanticService.getCallHierarchy(
+                    project = project,
+                    file = optionalStringArg(arguments, ParamNames.FILE),
+                    line = optionalIntArg(arguments, ParamNames.LINE),
+                    column = optionalIntArg(arguments, ParamNames.COLUMN),
+                    language = requestedLanguage,
+                    symbol = requestedSymbol,
+                    direction = direction,
+                    depth = depth,
+                    scope = scope
+                )
+                if (riderHierarchy.handled) {
+                    riderHierarchy.errorMessage?.let { return@suspendingReadAction createErrorResult(it) }
+                    riderHierarchy.value?.let {
+                        return@suspendingReadAction createJsonResult(
+                            CallHierarchyResult(
+                                element = convertToCallElement(it.element),
+                                calls = it.calls.map(::convertToCallElement),
+                                message = riderHierarchy.message
+                            )
+                        )
+                    }
+                    return@suspendingReadAction createErrorResult(noCallableMessage(isSymbolMode = true))
+                }
+
+                return@suspendingReadAction createErrorResult(RIDER_CALL_HIERARCHY_SYMBOL_MODE_UNSUPPORTED)
+            }
+
+            val element = resolveElementFromArguments(project, arguments, allowLibraryFilesForPosition = true).getOrElse {
                 return@suspendingReadAction createErrorResult(it.message ?: ErrorMessages.COULD_NOT_RESOLVE_SYMBOL)
             }
 
             // Find appropriate handler for this element's language
             val handler = LanguageHandlerRegistry.getCallHierarchyHandler(element)
             if (handler == null) {
-                if (isRiderSymbolMode) {
-                    return@suspendingReadAction createErrorResult(RIDER_SYMBOL_MODE_UNSUPPORTED)
-                }
                 return@suspendingReadAction createErrorResult(
                     "No call hierarchy handler registered for detected PSI language: ${element.language.id}. " +
                     "Supported languages: ${LanguageHandlerRegistry.getSupportedLanguagesForCallHierarchy()}"
@@ -133,24 +156,10 @@ class CallHierarchyTool : AbstractMcpTool() {
             // Convert handler result to tool result
             createJsonResult(CallHierarchyResult(
                 element = convertToCallElement(hierarchyData.element),
-                calls = hierarchyData.calls.map { convertToCallElement(it) }
+                calls = hierarchyData.calls.map { convertToCallElement(it) },
+                message = null
             ))
         }
-    }
-
-    private fun resolveRiderSymbolModeElement(
-        project: Project,
-        language: String?,
-        symbol: String?,
-        isRiderSymbolMode: Boolean
-    ): Result<PsiElement>? {
-        if (!isRiderSymbolMode || language == null || symbol == null) return null
-
-        val (file, line, column) = RiderBackendSemanticService.resolveSymbolToPosition(project, language, symbol)
-            ?: return Result.failure(UnsupportedOperationException(RIDER_SYMBOL_MODE_UNSUPPORTED))
-        val element = findNavigablePsiElement(project, file, line, column)
-            ?: return Result.failure(UnsupportedOperationException(RIDER_SYMBOL_MODE_UNSUPPORTED))
-        return Result.success(element)
     }
 
     /**

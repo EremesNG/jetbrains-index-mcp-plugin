@@ -142,7 +142,7 @@ public class IndexMcpBackendHost
                 .Where(type => MatchesName(type.ShortName, request.Query, request.MatchMode) ||
                                MatchesQualifiedName(GetQualifiedName(type), request.Query, request.MatchMode))
                 .Where(type => MatchesLanguage(type, request.Language))
-                .Where(type => MatchesScope(type, request.Scope))
+                .Where(type => MatchesScope(type, request.Scope, includeUnknownProjectCandidates: true))
                 .OrderBy(type => MatchRank(type.ShortName, request.Query, request.MatchMode))
                 .ThenBy(BestDeclarationRank)
                 .ThenBy(type => IsTestPath(GetDeclarationPath(type)) ? 1 : 0)
@@ -191,7 +191,7 @@ public class IndexMcpBackendHost
             .Where(IsSupportedFindSymbolElement)
             .Where(element => MatchesFindSymbolQuery(element, query))
             .Where(element => MatchesLanguage(element, language))
-            .Where(element => MatchesScope(element, scope))
+            .Where(element => MatchesScope(element, scope, includeUnknownProjectCandidates: true))
             .OrderBy(element => MatchRank(element.ShortName, query, "substring"))
             .ThenBy(BestDeclarationRank)
             .ThenBy(element => IsTestPath(GetDeclarationPath(element) ?? string.Empty) ? 1 : 0)
@@ -519,13 +519,18 @@ public class IndexMcpBackendHost
             if (element == null) return (RdDefinitionResult?)null;
 
             var navigationElement = PickPreferredDeclaration(element);
-            if (navigationElement == null) return (RdDefinitionResult?)null;
-
-            var preview = BuildPreview(navigationElement, request.FullElementPreview, request.MaxPreviewLines);
+            var location = BuildDefinitionLocation(element, navigationElement);
+            var locationKind = location.LocationKind;
+            var locationDisplayName = location.LocationDisplayName;
+            var preview = navigationElement != null
+                ? BuildPreview(navigationElement, request.FullElementPreview, request.MaxPreviewLines)
+                : string.Empty;
             return (RdDefinitionResult?)new RdDefinitionResult(
                 ToSymbolInfo(element),
                 preview,
-                BuildAstPath(navigationElement));
+                navigationElement != null ? BuildAstPath(navigationElement) : new List<string>(),
+                locationKind,
+                locationDisplayName);
         });
     }
 
@@ -568,21 +573,34 @@ public class IndexMcpBackendHost
                         throw new InvalidOperationException(unresolvedMessage);
                     }
 
-                    return new RdFindReferencesResult(new List<RdReferenceInfo>(), 0);
+                    return new RdFindReferencesResult(new List<RdReferenceInfo>(), 0, null);
                 }
 
-                var references = (plan?.UseBoundedProjectFileSearch == true
+                var orderedReferences = (plan?.UseBoundedProjectFileSearch == true
                         ? FindReferencesBounded(lt, element, plan.AllowedProjectFileExtensions, effectiveLimit)
                         : FindReferences(lt, element, effectiveLimit))
                     .Select(ToReferenceInfo)
                     .Where(reference => reference != null)
                     .Cast<RdReferenceInfo>()
-                    .Where(reference => MatchesScope(reference.FilePath, request.Scope))
-                    .GroupBy(reference => $"{reference.FilePath}:{reference.Line}:{reference.Column}")
-                    .Select(group => group.First())
+                    .Where(reference => MatchesPathScope(reference.FilePath, request.Scope))
+                    .GroupBy(reference => GetReferenceIdentityKey(reference), StringComparer.OrdinalIgnoreCase)
+                    .Select(group => group
+                        .OrderBy(ReferenceLocationBucket)
+                        .ThenBy(reference => NormalizeReferencePath(reference.FilePath), StringComparer.OrdinalIgnoreCase)
+                        .ThenBy(reference => reference.Line)
+                        .ThenBy(reference => reference.Column)
+                        .ThenBy(reference => reference.Kind, StringComparer.OrdinalIgnoreCase)
+                        .ThenBy(reference => reference.Context, StringComparer.OrdinalIgnoreCase)
+                        .First())
+                    .OrderBy(ReferenceLocationBucket)
+                    .ThenBy(reference => NormalizeReferencePath(reference.FilePath), StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(reference => reference.Line)
+                    .ThenBy(reference => reference.Column)
+                    .ThenBy(reference => reference.Kind, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(reference => reference.Context, StringComparer.OrdinalIgnoreCase)
                     .ToList();
 
-                return new RdFindReferencesResult(references.Take(effectiveLimit).ToList(), references.Count);
+                return new RdFindReferencesResult(orderedReferences.Take(effectiveLimit).ToList(), orderedReferences.Count, null);
             }
             catch
             {
@@ -1741,12 +1759,7 @@ public class IndexMcpBackendHost
         return Task.Run(() =>
         {
             var resolutionPlan = BuildCallHierarchyResolutionPlan(request.Target);
-            var callableTarget = resolutionPlan.UseDeclarationOnlyFastPath
-                ? ResolveCallableDeclarationTargetAt(new RdSourcePosition(
-                    request.Target.FilePath!,
-                    request.Target.Line!.Value,
-                    request.Target.Column!.Value))
-                : ResolveCallableTarget(ResolveTarget(request.Target));
+            var callableTarget = ResolveCallHierarchyTarget(request.Target, resolutionPlan);
             if (callableTarget == null) return null;
 
             var effectiveLimit = GetEffectiveResultLimit(request.Limit);
@@ -1771,6 +1784,7 @@ public class IndexMcpBackendHost
 
                             var containingCallable = ResolveContainingCallableElement(referenceResult.Reference.GetTreeNode());
                             if (containingCallable == null) continue;
+                            if (!MatchesScope(containingCallable, request.Scope)) continue;
 
                             var added = seenCallKeys.Add(GetDeclaredElementIdentityKey(containingCallable));
                             if (!added) continue;
@@ -1796,7 +1810,9 @@ public class IndexMcpBackendHost
                     foreach (var reference in node.GetReferences())
                     {
                         var invokedCallable = ResolveCallableTarget(reference.Resolve().DeclaredElement)?.Element;
-                        if (invokedCallable != null && !Equals(invokedCallable, callableTarget.Element))
+                        if (invokedCallable != null &&
+                            !Equals(invokedCallable, callableTarget.Element) &&
+                            MatchesScope(invokedCallable, request.Scope))
                             callElements.Add(invokedCallable);
                     }
                 }
@@ -1806,8 +1822,9 @@ public class IndexMcpBackendHost
                 .Take(effectiveLimit)
                 .Select(ToSymbolInfo)
                 .ToList();
+            var message = BuildCallHierarchyMessage(request.Direction, orderedCalls.Count);
 
-            return (RdCallHierarchyResult?)new RdCallHierarchyResult(root, orderedCalls);
+            return (RdCallHierarchyResult?)new RdCallHierarchyResult(root, orderedCalls, message);
         });
     }
 
@@ -1985,6 +2002,32 @@ public class IndexMcpBackendHost
             UseDeclarationOnlyFastPath: isFSharpPositionTarget);
     }
 
+    private CallableTarget? ResolveCallHierarchyTarget(
+        RdSemanticTarget target,
+        CallHierarchyResolutionPlan resolutionPlan)
+    {
+        if (resolutionPlan.UseDeclarationOnlyFastPath)
+        {
+            return ResolveCallableDeclarationTargetAt(new RdSourcePosition(
+                target.FilePath!,
+                target.Line!.Value,
+                target.Column!.Value));
+        }
+
+        if (!string.IsNullOrWhiteSpace(target.FilePath) &&
+            target.Line.HasValue &&
+            target.Column.HasValue)
+        {
+            return ResolveCallableTarget(ResolveTarget(target)) ??
+                   ResolveCallableDeclarationTargetAt(new RdSourcePosition(
+                       target.FilePath,
+                       target.Line.Value,
+                       target.Column.Value));
+        }
+
+        return ResolveCallableTarget(ResolveTarget(target));
+    }
+
     private static IEnumerable<IDeclaredElement> OrderDeclaredElementsDeterministically(
         IEnumerable<IDeclaredElement> elements)
     {
@@ -1995,6 +2038,49 @@ public class IndexMcpBackendHost
             .ThenBy(GetQualifiedName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(GetMemberSignatureSortKey, StringComparer.OrdinalIgnoreCase)
             .ThenBy(GetDeclarationPath, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static List<RdReferenceInfo> OrderReferenceInfosDeterministically(IEnumerable<RdReferenceInfo> references)
+    {
+        return references
+            .GroupBy(GetReferenceIdentityKey, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group
+                .OrderBy(ReferenceLocationBucket)
+                .ThenBy(reference => NormalizeReferencePath(reference.FilePath), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(reference => reference.Line)
+                .ThenBy(reference => reference.Column)
+                .ThenBy(reference => reference.Kind, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(reference => reference.Context, StringComparer.OrdinalIgnoreCase)
+                .First())
+            .OrderBy(ReferenceLocationBucket)
+            .ThenBy(reference => NormalizeReferencePath(reference.FilePath), StringComparer.OrdinalIgnoreCase)
+            .ThenBy(reference => reference.Line)
+            .ThenBy(reference => reference.Column)
+            .ThenBy(reference => reference.Kind, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(reference => reference.Context, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string GetReferenceIdentityKey(RdReferenceInfo reference)
+    {
+        return HasConcreteReferenceLocation(reference)
+            ? $"{NormalizeReferencePath(reference.FilePath)}:{reference.Line}:{reference.Column}:{reference.Kind}"
+            : $"<source-unavailable>:{reference.Kind}:{reference.Context}:{string.Join(">", reference.AstPath)}";
+    }
+
+    private static int ReferenceLocationBucket(RdReferenceInfo reference) => HasConcreteReferenceLocation(reference) ? 0 : 1;
+
+    private static bool HasConcreteReferenceLocation(RdReferenceInfo reference) =>
+        !string.IsNullOrWhiteSpace(reference.FilePath) && reference.Line > 0 && reference.Column > 0;
+
+    private static string NormalizeReferencePath(string? path) => string.IsNullOrWhiteSpace(path) ? "~" : path.Trim();
+
+    private static string? BuildCallHierarchyMessage(string direction, int resultCount)
+    {
+        if (!string.Equals(direction, "callers", StringComparison.OrdinalIgnoreCase) || resultCount > 0)
+            return null;
+
+        return "No static callers were found. For framework-routed endpoints (ASP.NET/WebAPI routing, reflection, or other framework dispatch), this is a static-analysis limitation and does not imply backend failure.";
     }
 
     private static string GetDeclaredElementIdentityKey(IDeclaredElement element)
@@ -3442,15 +3528,40 @@ public class IndexMcpBackendHost
         return 4;
     }
 
-    private static bool MatchesScope(IDeclaredElement element, string scope) =>
-        MatchesScope(GetDeclarationPath(element), scope);
+    private static bool MatchesScope(IDeclaredElement? element, string scope) =>
+        MatchesScope(element, scope, includeUnknownProjectCandidates: false);
 
-    private static bool MatchesScope(string? path, string scope)
+    private static bool MatchesScope(
+        IDeclaredElement? element,
+        string scope,
+        bool includeUnknownProjectCandidates)
     {
-        if (string.IsNullOrWhiteSpace(path)) return true;
+        if (element == null)
+            return MatchesPathScope(null, scope);
+
+        var path = GetDeclarationPath(element);
+        if (!string.IsNullOrWhiteSpace(path))
+            return MatchesPathScope(path, scope);
+
+        return scope switch
+        {
+            "project_and_libraries" => true,
+            "project_test_files" => false,
+            _ => includeUnknownProjectCandidates
+        };
+    }
+
+    private static bool MatchesPathScope(string? path, string scope)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return scope.Equals("project_and_libraries", StringComparison.OrdinalIgnoreCase);
+        }
+
         var isTest = IsTestPath(path);
         return scope switch
         {
+            "project_and_libraries" => true,
             "project_test_files" => isTest,
             "project_production_files" => !isTest,
             _ => true
@@ -3508,6 +3619,39 @@ public class IndexMcpBackendHost
 
     private static IDeclaration? PickPreferredDeclaration(IDeclaredElement element) =>
         element.GetDeclarations().OrderBy(DeclarationRank).FirstOrDefault();
+
+    private static DefinitionLocationInfo BuildDefinitionLocation(IDeclaredElement element, IDeclaration? declaration)
+    {
+        if (declaration == null)
+        {
+            return new DefinitionLocationInfo(
+                LocationKind: "sourceUnavailable",
+                LocationDisplayName: GetQualifiedName(element));
+        }
+
+        var sourceFile = declaration.GetSourceFile();
+        var fullPath = sourceFile?.GetLocation().FullPath;
+        if (!string.IsNullOrWhiteSpace(fullPath))
+        {
+            return new DefinitionLocationInfo(
+                LocationKind: IsDecompiledLocation(fullPath) ? "decompiled" : "source",
+                LocationDisplayName: fullPath);
+        }
+
+        return new DefinitionLocationInfo(
+            LocationKind: "metadata",
+            LocationDisplayName: GetQualifiedName(element));
+    }
+
+    private static bool IsDecompiledLocation(string fullPath)
+    {
+        var normalized = fullPath.Replace('\\', '/');
+        return normalized.Contains("/metadata/", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Contains("/decompiled/", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Contains("/assembly explorer/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private readonly record struct DefinitionLocationInfo(string LocationKind, string? LocationDisplayName);
 
     private static bool IsTestPath(string path)
     {

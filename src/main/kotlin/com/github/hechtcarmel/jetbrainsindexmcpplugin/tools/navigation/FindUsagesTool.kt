@@ -57,6 +57,8 @@ class FindUsagesTool : AbstractMcpTool() {
 
         Supports pagination: first call returns results + nextCursor. Pass cursor to get the next page.
 
+        Rider note: C#/F# reference lookups use the ReSharper backend. Position targets must resolve to a Rider source file; dependency-backed/source-less locations should use language+symbol when available. Scope filtering hides source-less/library-only declarations unless project_and_libraries is explicitly requested. Rider rows are deduplicated deterministically before truncation/pagination so over-limit results stay explainable.
+
         Target (mutually exclusive):
         - file + line + column: position-based lookup (necessary for fresh search, ignored when cursor is provided)
         - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#; necessary for fresh search, ignored when cursor is provided). Note: Rider F# module/type-only symbol-mode searches in project_files use a bounded, cache-aware search to stay agent-friendly; cold IDE caches can still make the first search expensive, while position/member targets remain the preferred option for more deterministic latency.
@@ -87,6 +89,7 @@ class FindUsagesTool : AbstractMcpTool() {
                 FindUsagesResult(
                     usages = items,
                     totalCount = page.totalCollected,
+                    message = null,
                     truncated = page.hasMore,
                     nextCursor = page.nextCursor,
                     hasMore = page.hasMore,
@@ -146,6 +149,7 @@ class FindUsagesTool : AbstractMcpTool() {
                 FindUsagesResult(
                     usages = items,
                     totalCount = page.totalCollected,
+                    message = riderReferences.message,
                     truncated = page.hasMore,
                     nextCursor = page.nextCursor,
                     hasMore = page.hasMore,
@@ -258,12 +262,13 @@ class FindUsagesTool : AbstractMcpTool() {
         if (errorResult != null) return errorResult
 
         return buildPaginatedResult<UsageLocation, FindUsagesResult>(getPageFromCache(token!!, pageSize, project)) { items, page ->
-            FindUsagesResult(
-                usages = items,
-                totalCount = page.totalCollected,
-                truncated = page.hasMore,
-                nextCursor = page.nextCursor,
-                hasMore = page.hasMore,
+                FindUsagesResult(
+                    usages = items,
+                    totalCount = page.totalCollected,
+                    message = null,
+                    truncated = page.hasMore,
+                    nextCursor = page.nextCursor,
+                    hasMore = page.hasMore,
                 totalCollected = page.totalCollected,
                 offset = page.offset,
                 pageSize = page.pageSize,

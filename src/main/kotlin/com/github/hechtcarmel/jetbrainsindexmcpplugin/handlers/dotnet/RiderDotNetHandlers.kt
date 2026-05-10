@@ -330,7 +330,8 @@ const val MODEL_PKG = "com.jetbrains.rd.ide.model"
 data class RiderBackendResponse<T>(
     val handled: Boolean,
     val value: T? = null,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val message: String? = null
 )
 
 sealed interface RdCallOutcome<out T> {
@@ -557,8 +558,9 @@ object RiderBackendSemanticService {
         val symbolTarget = language != null && symbol != null && canHandleLanguage(language)
         if (!canUseBackend(project) || (!positionTarget && !symbolTarget)) return RiderBackendResponse(handled = false)
 
-        val target = createSemanticTarget(project, file, line, column, language, symbol)
-            ?: return RiderBackendResponse(handled = true)
+        val semanticTarget = buildSemanticTarget(project, file, line, column, language, symbol)
+        semanticTarget.errorMessage?.let { return RiderBackendResponse(handled = true, errorMessage = it) }
+        val target = semanticTarget.target ?: return RiderBackendResponse(handled = true)
         val model = RdProtocolBridge.getModel(project) ?: return RiderBackendResponse(handled = true)
         val request = RdProtocolBridge.createStruct(
             "$MODEL_PKG.RdFindDefinitionRequest",
@@ -570,16 +572,34 @@ object RiderBackendSemanticService {
         val definition = RdProtocolBridge.getProperty(result, "definition") ?: return RiderBackendResponse(handled = true)
         @Suppress("UNCHECKED_CAST")
         val astPath = (RdProtocolBridge.getProperty(result, "astPath") as? List<String>) ?: emptyList()
+        val locationKind =
+            (RdProtocolBridge.getProperty(result, "locationKind") as? String)
+                ?: (RdProtocolBridge.getProperty(definition, "locationKind") as? String)
+        val locationDisplayName =
+            (RdProtocolBridge.getProperty(result, "locationDisplayName") as? String)
+                ?: (RdProtocolBridge.getProperty(definition, "locationDisplayName") as? String)
+        val message = riderDefinitionMessage(
+            symbolName = RdProtocolBridge.getProperty(definition, "name") as? String ?: "unknown",
+            locationKind = locationKind,
+            locationDisplayName = locationDisplayName
+        )
         return RiderBackendResponse(
             handled = true,
             value = DefinitionResult(
                 file = displayPath(project, RdProtocolBridge.getProperty(definition, "filePath") as? String),
                 line = RdProtocolBridge.getProperty(definition, "line") as? Int ?: 1,
                 column = RdProtocolBridge.getProperty(definition, "column") as? Int ?: 1,
-                preview = RdProtocolBridge.getProperty(result, "preview") as? String ?: "",
+                preview = riderDefinitionPreview(
+                    preview = RdProtocolBridge.getProperty(result, "preview") as? String ?: "",
+                    message = message
+                ),
                 symbolName = RdProtocolBridge.getProperty(definition, "name") as? String ?: "unknown",
-                astPath = astPath
-            )
+                astPath = astPath,
+                message = message,
+                locationKind = locationKind,
+                locationDisplayName = locationDisplayName
+            ),
+            message = message
         )
     }
 
@@ -597,8 +617,9 @@ object RiderBackendSemanticService {
         val symbolTarget = language != null && symbol != null && canHandleLanguage(language)
         if (!canUseBackend(project) || (!positionTarget && !symbolTarget)) return RiderBackendResponse(handled = false)
 
-        val target = createSemanticTarget(project, file, line, column, language, symbol)
-            ?: return RiderBackendResponse(handled = true)
+        val semanticTarget = buildSemanticTarget(project, file, line, column, language, symbol)
+        semanticTarget.errorMessage?.let { return RiderBackendResponse(handled = true, errorMessage = it) }
+        val target = semanticTarget.target ?: return RiderBackendResponse(handled = true)
         val model = RdProtocolBridge.getModel(project) ?: return RiderBackendResponse(handled = true)
         val request = RdProtocolBridge.createStruct("$MODEL_PKG.RdFindReferencesRequest", target, scope.wireValue, limit)
             ?: return RiderBackendResponse(handled = true)
@@ -619,7 +640,8 @@ object RiderBackendSemanticService {
         }
         @Suppress("UNCHECKED_CAST")
         val references = (RdProtocolBridge.getProperty(result, "references") as? List<Any>) ?: emptyList()
-        return RiderBackendResponse(handled = true, value = references.map { reference ->
+        val message = RdProtocolBridge.getProperty(result, "message") as? String
+        val orderedDistinctReferences = references.map { reference ->
             UsageLocation(
                 file = displayPath(project, RdProtocolBridge.getProperty(reference, "filePath") as? String),
                 line = RdProtocolBridge.getProperty(reference, "line") as? Int ?: 1,
@@ -628,7 +650,39 @@ object RiderBackendSemanticService {
                 type = RdProtocolBridge.getProperty(reference, "kind") as? String ?: "reference",
                 astPath = (RdProtocolBridge.getProperty(reference, "astPath") as? List<String>) ?: emptyList()
             )
-        })
+        }.distinctAndOrderUsageLocations()
+            .take(limit)
+        return RiderBackendResponse(handled = true, value = orderedDistinctReferences, message = message)
+    }
+
+    fun getCallHierarchy(
+        project: Project,
+        file: String?,
+        line: Int?,
+        column: Int?,
+        language: String?,
+        symbol: String?,
+        direction: String,
+        depth: Int,
+        scope: BuiltInSearchScope
+    ): RiderBackendResponse<CallHierarchyData> {
+        val positionTarget = file != null && line != null && column != null && isDotNetFile(file)
+        val symbolTarget = language != null && symbol != null && canHandleLanguage(language)
+        if (!canUseBackend(project) || (!positionTarget && !symbolTarget)) return RiderBackendResponse(handled = false)
+
+        val semanticTarget = buildSemanticTarget(project, file, line, column, language, symbol)
+        semanticTarget.errorMessage?.let { return RiderBackendResponse(handled = true, errorMessage = it) }
+        val target = semanticTarget.target ?: return RiderBackendResponse(
+            handled = true,
+            errorMessage = symbolTarget.thenUnsupportedCallHierarchy()
+        )
+        val model = RdProtocolBridge.getModel(project)
+            ?: return RiderBackendResponse(
+                handled = true,
+                errorMessage = symbolTarget.thenUnsupportedCallHierarchy()
+            )
+        val displayLanguage = language?.trim()?.takeIf { it.isNotEmpty() } ?: "C#"
+        return invokeSemanticCallHierarchy(model, target, direction, depth, scope, symbolTarget, displayLanguage)
     }
 
     fun getTypeHierarchy(
@@ -700,42 +754,73 @@ object RiderBackendSemanticService {
         column: Int?,
         language: String?,
         symbol: String?
-    ): Any? {
+    ): Any? = buildSemanticTarget(project, file, line, column, language, symbol).target
+
+    private fun buildSemanticTarget(
+        project: Project,
+        file: String?,
+        line: Int?,
+        column: Int?,
+        language: String?,
+        symbol: String?
+    ): RiderSemanticTargetBuildResult {
         val normalizedFile = file?.trim()?.takeIf { it.isNotEmpty() }
         val normalizedLanguage = language?.trim()?.takeIf { it.isNotEmpty() }
         val normalizedSymbol = symbol?.trim()?.takeIf { it.isNotEmpty() }
+        val hasPositionInput = normalizedFile != null || line != null || column != null
         val backendFile = normalizedFile?.let { resolveBackendFilePath(project, it) }
 
         if (backendFile != null && line != null && column != null) {
-            return RdProtocolBridge.createStruct(
-                "$MODEL_PKG.RdSemanticTarget",
-                backendFile,
-                line,
-                column,
-                null,
-                null
+            return RiderSemanticTargetBuildResult(
+                target = RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    backendFile,
+                    line,
+                    column,
+                    null,
+                    null
+                )
             )
         }
 
         if (normalizedLanguage != null && normalizedSymbol != null) {
-            return RdProtocolBridge.createStruct(
-                "$MODEL_PKG.RdSemanticTarget",
-                null,
-                null,
-                null,
-                normalizedLanguage,
-                normalizedSymbol
+            return RiderSemanticTargetBuildResult(
+                target = RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    null,
+                    null,
+                    null,
+                    normalizedLanguage,
+                    normalizedSymbol
+                )
             )
         }
 
-        return RdProtocolBridge.createStruct(
-            "$MODEL_PKG.RdSemanticTarget",
-            backendFile,
-            line,
-            column,
-            normalizedLanguage,
-            normalizedSymbol
+        if (hasPositionInput) {
+            return RiderSemanticTargetBuildResult(
+                errorMessage = buildUnresolvablePositionMessage(normalizedFile, line, column)
+            )
+        }
+
+        return RiderSemanticTargetBuildResult(
+            target = RdProtocolBridge.createStruct(
+                "$MODEL_PKG.RdSemanticTarget",
+                backendFile,
+                line,
+                column,
+                normalizedLanguage,
+                normalizedSymbol
+            )
         )
+    }
+
+    private fun buildUnresolvablePositionMessage(file: String?, line: Int?, column: Int?): String {
+        val targetLabel = listOfNotNull(file, line?.toString(), column?.toString())
+            .takeIf { it.isNotEmpty() }
+            ?.joinToString(":")
+            ?: "<unknown>"
+        return "Rider C#/F# position target '$targetLabel' could not be mapped to a Rider source file. " +
+            "Dependency-backed or source-less positions should use a language+symbol target when available."
     }
 
     private fun resolveBackendFilePath(project: Project, file: String): String? {
@@ -795,6 +880,17 @@ object RiderBackendSemanticService {
         return normalized
     }
 }
+
+private data class RiderSemanticTargetBuildResult(
+    val target: Any? = null,
+    val errorMessage: String? = null
+)
+
+internal const val RIDER_CALL_HIERARCHY_SYMBOL_MODE_UNSUPPORTED =
+    "Rider C#/F# symbol-mode call hierarchy requires the Rider backend-native path and is unsupported when that backend cannot resolve a callable semantic target."
+
+private fun Boolean.thenUnsupportedCallHierarchy(): String? =
+    if (this) RIDER_CALL_HIERARCHY_SYMBOL_MODE_UNSUPPORTED else null
 
 // ── Helper functions ────────────────────────────────────────────────────────
 
@@ -914,6 +1010,164 @@ private fun rdSymbolToCallElementData(symbol: Any, language: String): CallElemen
         language = language
     )
 }
+
+private fun invokeSemanticCallHierarchy(
+    model: Any,
+    target: Any,
+    direction: String,
+    depth: Int,
+    scope: BuiltInSearchScope,
+    symbolTarget: Boolean,
+    displayLanguage: String = "C#"
+): RiderBackendResponse<CallHierarchyData> {
+    val request = RdProtocolBridge.createStruct(
+        "$MODEL_PKG.RdCallHierarchyRequest",
+        target,
+        direction,
+        depth,
+        scope.wireValue,
+        CALL_HIERARCHY_RESULT_LIMIT
+    ) ?: return RiderBackendResponse(
+        handled = true,
+        errorMessage = symbolTarget.thenUnsupportedCallHierarchy()
+    )
+    val result = when (val outcome = RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", request)) {
+        is RdCallOutcome.Success -> outcome.value
+        is RdCallOutcome.Timeout -> {
+            return RiderBackendResponse(
+                handled = true,
+                errorMessage = outcome.toUserMessage("resolving call hierarchy")
+            )
+        }
+        is RdCallOutcome.Failure -> {
+            return RiderBackendResponse(
+                handled = true,
+                errorMessage = outcome.toUserMessage("resolving call hierarchy")
+            )
+        }
+    } ?: return RiderBackendResponse(handled = true)
+
+    val root = RdProtocolBridge.getProperty(result, "root")
+        ?.let { rdSymbolToCallElementData(it, displayLanguage) }
+        ?: return RiderBackendResponse(
+            handled = true,
+            errorMessage = symbolTarget.thenUnsupportedCallHierarchy()
+        )
+    @Suppress("UNCHECKED_CAST")
+    val calls = (RdProtocolBridge.getProperty(result, "calls") as? List<Any>) ?: emptyList()
+    val seen = mutableSetOf<String>()
+    val convertedCalls = calls.mapNotNull { rdSymbolToCallElementData(it, displayLanguage) }
+        .sortedCallElements()
+        .filter { seen.add(callHierarchyKey(it)) }
+        .take(CALL_HIERARCHY_RESULT_LIMIT)
+        .map { expandSemanticCallHierarchy(model, it, direction, depth - 1, scope, seen, displayLanguage) }
+    val message = RdProtocolBridge.getProperty(result, "message") as? String
+
+    return RiderBackendResponse(
+        handled = true,
+        value = CallHierarchyData(element = root, calls = convertedCalls),
+        message = message
+    )
+}
+
+private fun expandSemanticCallHierarchy(
+    model: Any,
+    call: CallElementData,
+    direction: String,
+    remainingDepth: Int,
+    scope: BuiltInSearchScope,
+    seen: MutableSet<String>,
+    displayLanguage: String
+): CallElementData {
+    if (remainingDepth <= 0) return call.copy(children = emptyList())
+
+    val target = createPositionTarget(call.file, call.line, call.column)
+        ?: return call.copy(children = emptyList())
+    val request = RdProtocolBridge.createStruct(
+        "$MODEL_PKG.RdCallHierarchyRequest",
+        target,
+        direction,
+        remainingDepth,
+        scope.wireValue,
+        CALL_HIERARCHY_RESULT_LIMIT
+    ) ?: return call.copy(children = emptyList())
+    val result = when (val outcome = RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", request)) {
+        is RdCallOutcome.Success -> outcome.value
+        else -> null
+    } ?: return call.copy(children = emptyList())
+
+    @Suppress("UNCHECKED_CAST")
+    val children = (RdProtocolBridge.getProperty(result, "calls") as? List<Any>) ?: emptyList()
+    val convertedChildren = children.mapNotNull { rdSymbolToCallElementData(it, displayLanguage) }
+        .sortedCallElements()
+        .filter { seen.add(callHierarchyKey(it)) }
+        .take(CALL_HIERARCHY_RESULT_LIMIT)
+        .map { expandSemanticCallHierarchy(model, it, direction, remainingDepth - 1, scope, seen, displayLanguage) }
+    return call.copy(children = convertedChildren)
+}
+
+private fun callHierarchyKey(call: CallElementData): String =
+    if (call.hasConcreteLocation()) {
+        "${call.file}:${call.line}:${call.column}:${call.name}"
+    } else {
+        "<source-unavailable>:${call.language}:${call.name}"
+    }
+
+private fun riderDefinitionMessage(symbolName: String, locationKind: String?, locationDisplayName: String?): String? =
+    when (locationKind) {
+        "metadata" ->
+            "Rider resolved '$symbolName' through metadata. Source is unavailable in this solution; use '${locationDisplayName ?: symbolName}' as the external declaration identity."
+        "decompiled" ->
+            "Rider resolved '$symbolName' through decompiled code. Treat '${locationDisplayName ?: symbolName}' as a best-available navigation surface, not a project-backed source file."
+        "sourceUnavailable" ->
+            "Rider resolved '$symbolName', but no source-backed declaration is available in this solution. Use '${locationDisplayName ?: symbolName}' as the external identity or retry with project_and_libraries for broader context."
+        else -> null
+    }
+
+private fun riderDefinitionPreview(preview: String, message: String?): String =
+    preview.ifBlank { message.orEmpty() }
+
+private fun List<UsageLocation>.distinctAndOrderUsageLocations(): List<UsageLocation> =
+    this.groupBy(::usageLocationKey)
+        .map { (_, group) -> group.minWithOrNull(compareByUsageLocation()) ?: group.first() }
+        .sortedWith(compareByUsageLocation())
+
+private fun usageLocationKey(location: UsageLocation): String =
+    if (location.hasConcreteLocation()) {
+        "${location.file}:${location.line}:${location.column}:${location.type}"
+    } else {
+        "<source-unavailable>:${location.type}:${location.context}:${location.astPath.joinToString(">")}" 
+    }
+
+private fun compareByUsageLocation(): Comparator<UsageLocation> =
+    compareBy<UsageLocation>(
+        { if (it.hasConcreteLocation()) 0 else 1 },
+        { sortableLocationPath(it.file) },
+        { if (it.line > 0) it.line else Int.MAX_VALUE },
+        { if (it.column > 0) it.column else Int.MAX_VALUE },
+        { it.type.lowercase() },
+        { it.context.lowercase() },
+        { it.astPath.joinToString(">") }
+    )
+
+private fun List<CallElementData>.sortedCallElements(): List<CallElementData> =
+    sortedWith(compareByCallElement())
+
+private fun compareByCallElement(): Comparator<CallElementData> =
+    compareBy<CallElementData>(
+        { if (it.hasConcreteLocation()) 0 else 1 },
+        { sortableLocationPath(it.file) },
+        { if (it.line > 0) it.line else Int.MAX_VALUE },
+        { if (it.column > 0) it.column else Int.MAX_VALUE },
+        { it.name.lowercase() },
+        { it.language.lowercase() }
+    )
+
+private fun sortableLocationPath(path: String): String = path.ifBlank { "~" }.lowercase()
+
+private fun UsageLocation.hasConcreteLocation(): Boolean = line > 0 && column > 0
+
+private fun CallElementData.hasConcreteLocation(): Boolean = line > 0 && column > 0
 
 private fun rdStructureKind(kind: String): StructureKind = when (kind.uppercase()) {
     "CLASS", "ABSTRACT_CLASS" -> StructureKind.CLASS

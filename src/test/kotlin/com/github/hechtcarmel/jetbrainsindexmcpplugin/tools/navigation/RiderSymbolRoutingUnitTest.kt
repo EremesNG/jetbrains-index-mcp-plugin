@@ -117,6 +117,74 @@ class RiderSymbolRoutingUnitTest : TestCase() {
         )
     }
 
+    fun testCallHierarchyDescriptionMakesRiderCallerScopeSemanticsExplicit() {
+        val description = CallHierarchyTool().description
+
+        assertTrue(
+            "CallHierarchyTool should keep the public scope names visible in the description",
+            description.contains("project_files") && description.contains("project_and_libraries")
+        )
+        assertTrue(
+            "CallHierarchyTool should explain that Rider C#/F# caller scope separation is only guaranteed where the backend can actually enforce project-only versus library-inclusive search domains.",
+            description.contains("where backend support exists") ||
+                description.contains("where backend APIs can enforce that distinction") ||
+                description.contains("where the backend can enforce that distinction")
+        )
+    }
+
+    fun testCallHierarchyDescriptionMakesFrameworkRoutedEmptyResultsActionableWithoutImplyingBackendFailure() {
+        val description = CallHierarchyTool().description
+
+        assertTrue(
+            "CallHierarchyTool should explain that empty Rider caller results for framework-routed endpoints do not automatically mean the backend failed.",
+            description.contains("does not imply backend failure") ||
+                description.contains("does not imply a backend failure")
+        )
+        assertTrue(
+            "CallHierarchyTool should point users toward framework routing/dispatch as the reason static callers can be empty.",
+            description.contains("routing") ||
+                description.contains("framework dispatch") ||
+                description.contains("reflection")
+        )
+    }
+
+    fun testFindUsagesDescriptionMakesRiderDeduplicationAndTruncationExplicit() {
+        val description = FindUsagesTool().description
+
+        assertTrue(
+            "FindUsagesTool should document that Rider reference rows are deduplicated deterministically before result limiting so truncation is explainable.",
+            description.contains("deduplicated deterministically") ||
+                description.contains("deduplicated before pagination") ||
+                description.contains("deduplicated before truncation")
+        )
+        assertTrue(
+            "FindUsagesTool should make Rider truncation semantics explicit instead of leaving maxResults/pageSize behavior implicit.",
+            description.contains("truncated") ||
+                description.contains("truncation")
+        )
+    }
+
+    fun testCallHierarchyRiderSymbolModeDoesNotRewriteSymbolsIntoSourcePositionsBeforeBackendRouting() {
+        val source = navigationSource("CallHierarchyTool.kt")
+
+        assertTrue(
+            "CallHierarchyTool should route Rider C#/F# symbol-mode requests through the backend-native semantic call hierarchy service",
+            source.contains("RiderBackendSemanticService.getCallHierarchy(")
+        )
+        assertFalse(
+            "CallHierarchyTool should send Rider C#/F# symbol-mode requests to backend semantic call hierarchy directly instead of rewriting them through resolveSymbolToPosition first",
+            source.contains("RiderBackendSemanticService.resolveSymbolToPosition(")
+        )
+        assertFalse(
+            "CallHierarchyTool should not require a frontend PSI lookup via findNavigablePsiElement before Rider backend semantic call hierarchy can run",
+            source.contains("findNavigablePsiElement(")
+        )
+        assertFalse(
+            "CallHierarchyTool should not keep a source-position-mapping unsupported message once Rider symbol-mode call hierarchy is backend-native",
+            source.contains("map to source positions")
+        )
+    }
+
     fun testSuperMethodsUseBackendNativeRiderSymbolRoutingForCSharpAndFSharp() {
         val source = navigationSource("FindSuperMethodsTool.kt")
 
@@ -156,19 +224,28 @@ class RiderSymbolRoutingUnitTest : TestCase() {
 
     fun testRiderSymbolModeUnsupportedMessagesStayDeterministicForPositionMappedTools() {
         val expectations = listOf(
-            "FindImplementationsTool.kt" to
+            Triple(
+                "FindImplementationsTool.kt",
                 "Rider C#/F# symbol-mode implementations require backend-native symbol resolution and are unsupported for symbol requests the backend cannot map to source positions.",
-            "CallHierarchyTool.kt" to
-                "Rider C#/F# symbol-mode call hierarchy requires backend-native symbol resolution and is unsupported for symbol requests the backend cannot map to source positions.",
-            "FindSuperMethodsTool.kt" to
-                "Rider C#/F# symbol-mode super methods require backend-native symbol resolution and are unsupported for symbol requests the backend cannot map to source positions."
+                null
+            ),
+            Triple(
+                "CallHierarchyTool.kt",
+                "Rider C#/F# symbol-mode call hierarchy requires the Rider backend-native path and is unsupported when that backend cannot resolve a callable semantic target.",
+                "RIDER_CALL_HIERARCHY_SYMBOL_MODE_UNSUPPORTED"
+            ),
+            Triple(
+                "FindSuperMethodsTool.kt",
+                "Rider C#/F# symbol-mode super methods require backend-native symbol resolution and are unsupported for symbol requests the backend cannot map to source positions.",
+                null
+            )
         )
 
-        expectations.forEach { (fileName, message) ->
-            assertContains(
-                navigationSource(fileName),
-                message,
-                "$fileName should keep a deterministic Rider unsupported message when backend symbol resolution cannot map to a source position"
+        expectations.forEach { (fileName, message, constantReference) ->
+            val source = navigationSource(fileName)
+            assertTrue(
+                "$fileName should keep a deterministic Rider unsupported message when backend symbol resolution cannot resolve the requested callable target",
+                source.contains(message) || (constantReference != null && source.contains(constantReference))
             )
         }
     }
@@ -315,10 +392,16 @@ class RiderSymbolRoutingUnitTest : TestCase() {
     }
 
     private fun assertBackendNativeRiderSymbolRouting(source: String, toolName: String, fallbackMarker: String) {
-        val riderBackendMarker = "RiderBackendSemanticService.resolveSymbolToPosition("
+        val riderBackendMarkers = listOf(
+            "RiderBackendSemanticService.resolveSymbolToPosition(",
+            "RiderBackendSemanticService.getCallHierarchy("
+        )
         val explicitUnsupportedMarker = "unsupported"
 
-        val backendIndex = source.indexOf(riderBackendMarker)
+        val backendIndex = riderBackendMarkers
+            .map { source.indexOf(it) }
+            .filter { it >= 0 }
+            .minOrNull() ?: -1
         val fallbackIndex = source.indexOf(fallbackMarker)
         val explicitUnsupportedIndex = source.indexOf(explicitUnsupportedMarker)
 

@@ -95,6 +95,8 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
         field("definition", RdSymbolInfo)
         field("preview", string)
         field("astPath", immutableList(string))
+        field("locationKind", string)
+        field("locationDisplayName", string.nullable)
     }
 
     private val RdReferenceInfo = structdef {
@@ -115,6 +117,7 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
     private val RdFindReferencesResult = structdef {
         field("references", immutableList(RdReferenceInfo))
         field("totalCount", int)
+        field("message", string.nullable)
     }
 
     private val RdResolveSymbolRequest = structdef {
@@ -171,6 +174,7 @@ object IndexMcpModel : Ext(SolutionModel.Solution) {
     private val RdCallHierarchyResult = structdef {
         field("root", RdSymbolInfo)
         field("calls", immutableList(RdSymbolInfo))
+        field("message", string.nullable)
     }
 
     // ── Super Methods ───────────────────────────────────────────────────────

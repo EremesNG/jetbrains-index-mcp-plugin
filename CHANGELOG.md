@@ -2,9 +2,15 @@
 
 # IDE Index MCP Server Changelog
 
-## [Unreleased]
+## [4.18.5] - 2026-05-10
+
+### Changed
+- **Rider C# / F# read-only navigation now reports bounded non-source outcomes more honestly.** `ide_find_definition` can surface `metadata`, `decompiled`, and explicit `source-unavailable` semantics with actionable messaging instead of collapsing every non-project declaration into a generic failure.
 
 ### Fixed
+- **Rider reference and caller result windows are now deterministic before truncation.** Duplicate caller/reference rows are collapsed in a stable way, source-unavailable placeholders no longer reshuffle real source hits, and the public limit is applied only after deterministic ordering.
+- **Framework-routed empty Rider caller results are now explained instead of implied as backend failure.** Empty caller lists for routing/reflection-driven endpoints carry an explicit static-analysis-limitation message, and the usage docs now document the new Rider semantics and limits.
+
 - **Rider rename documentation now matches the canonical external status contract.** `ide_refactor_rename` is documented with the terminal statuses `success`, `no_op`, `needs_active_editor`, `conflict`, `unsupported_context`, and `failed`; legacy verification terms now appear only as metadata/trace context.
 - **Usage docs now reflect the verified C# rename path and the current F# limitation boundary.** Local checkout paths were removed from the guidance, C# is documented as the supported Rider-backed mutation lane, and F# is called out as beta/unstable until Rider language support matures.
 

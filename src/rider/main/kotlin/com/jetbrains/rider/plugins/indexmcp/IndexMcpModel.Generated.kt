@@ -37,9 +37,9 @@ class IndexMcpModel private constructor(
     private val _safeDelete: RdCall<RdSafeDeleteRequest, RdSafeDeleteResult?>
 ) : RdExtBase() {
     //companion
-
+    
     companion object : ISerializersOwner {
-
+        
         override fun registerSerializersCore(serializers: ISerializers)  {
             val classLoader = javaClass.classLoader
             serializers.register(LazyCompanionMarshaller(RdId(-5977976679503629463), classLoader, "com.jetbrains.rd.ide.model.RdSourcePosition"))
@@ -81,10 +81,10 @@ class IndexMcpModel private constructor(
             serializers.register(LazyCompanionMarshaller(RdId(6616599642070861522), classLoader, "com.jetbrains.rd.ide.model.RdSafeDeleteBlockedUsage"))
             serializers.register(LazyCompanionMarshaller(RdId(-6590292944502201958), classLoader, "com.jetbrains.rd.ide.model.RdSafeDeleteResult"))
         }
-
-
-
-
+        
+        
+        
+        
         private val __RdDefinitionResultNullableSerializer = RdDefinitionResult.nullable()
         private val __RdSymbolInfoNullableSerializer = RdSymbolInfo.nullable()
         private val __RdTypeHierarchyResultNullableSerializer = RdTypeHierarchyResult.nullable()
@@ -96,13 +96,13 @@ class IndexMcpModel private constructor(
         private val __RdRenameFileResultNullableSerializer = RdRenameFileResult.nullable()
         private val __RdMoveFileResultNullableSerializer = RdMoveFileResult.nullable()
         private val __RdSafeDeleteResultNullableSerializer = RdSafeDeleteResult.nullable()
-
-        const val serializationHash = -1827364550291654001L
-
+        
+        const val serializationHash = -5717211913063562566L
+        
     }
     override val serializersOwner: ISerializersOwner get() = IndexMcpModel
     override val serializationHash: Long get() = IndexMcpModel.serializationHash
-
+    
     //fields
     val getBackendStatus: IRdCall<Unit, RdBackendStatusResult> get() = _getBackendStatus
     val findTypes: IRdCall<RdFindTypesRequest, RdFindTypesResult> get() = _findTypes
@@ -140,7 +140,7 @@ class IndexMcpModel private constructor(
         bindableChildren.add("moveFile" to _moveFile)
         bindableChildren.add("safeDelete" to _safeDelete)
     }
-
+    
     //secondary constructor
     internal constructor(
     ) : this(
@@ -161,7 +161,7 @@ class IndexMcpModel private constructor(
         RdCall<RdMoveFileRequest, RdMoveFileResult?>(RdMoveFileRequest, __RdMoveFileResultNullableSerializer),
         RdCall<RdSafeDeleteRequest, RdSafeDeleteResult?>(RdSafeDeleteRequest, __RdSafeDeleteResultNullableSerializer)
     )
-
+    
     //equals trait
     //hash code trait
     //pretty print
@@ -226,11 +226,11 @@ data class RdBackendStatusResult (
     val message: String
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdBackendStatusResult> {
         override val _type: KClass<RdBackendStatusResult> = RdBackendStatusResult::class
         override val id: RdId get() = RdId(5994498188749596030)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdBackendStatusResult  {
             val backendVersion = buffer.readString()
@@ -239,15 +239,15 @@ data class RdBackendStatusResult (
             val message = buffer.readString()
             return RdBackendStatusResult(backendVersion, solutionLoaded, psiServicesAvailable, message)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdBackendStatusResult)  {
             buffer.writeString(value.backendVersion)
             buffer.writeBool(value.solutionLoaded)
             buffer.writeBool(value.psiServicesAvailable)
             buffer.writeString(value.message)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -257,14 +257,14 @@ data class RdBackendStatusResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdBackendStatusResult
-
+        
         if (backendVersion != other.backendVersion) return false
         if (solutionLoaded != other.solutionLoaded) return false
         if (psiServicesAvailable != other.psiServicesAvailable) return false
         if (message != other.message) return false
-
+        
         return true
     }
     //hash code trait
@@ -294,7 +294,7 @@ data class RdBackendStatusResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:163]
+ * #### Generated from [IndexMcpModel.kt:165]
  */
 data class RdCallHierarchyRequest (
     val target: RdSemanticTarget,
@@ -304,11 +304,11 @@ data class RdCallHierarchyRequest (
     val limit: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdCallHierarchyRequest> {
         override val _type: KClass<RdCallHierarchyRequest> = RdCallHierarchyRequest::class
         override val id: RdId get() = RdId(1059166656247531101)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdCallHierarchyRequest  {
             val target = RdSemanticTarget.read(ctx, buffer)
@@ -318,7 +318,7 @@ data class RdCallHierarchyRequest (
             val limit = buffer.readInt()
             return RdCallHierarchyRequest(target, direction, depth, scope, limit)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdCallHierarchyRequest)  {
             RdSemanticTarget.write(ctx, buffer, value.target)
             buffer.writeString(value.direction)
@@ -326,8 +326,8 @@ data class RdCallHierarchyRequest (
             buffer.writeString(value.scope)
             buffer.writeInt(value.limit)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -337,15 +337,15 @@ data class RdCallHierarchyRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdCallHierarchyRequest
-
+        
         if (target != other.target) return false
         if (direction != other.direction) return false
         if (depth != other.depth) return false
         if (scope != other.scope) return false
         if (limit != other.limit) return false
-
+        
         return true
     }
     //hash code trait
@@ -377,31 +377,34 @@ data class RdCallHierarchyRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:171]
+ * #### Generated from [IndexMcpModel.kt:174]
  */
 data class RdCallHierarchyResult (
     val root: RdSymbolInfo,
-    val calls: List<RdSymbolInfo>
+    val calls: List<RdSymbolInfo>,
+    val message: String?
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdCallHierarchyResult> {
         override val _type: KClass<RdCallHierarchyResult> = RdCallHierarchyResult::class
         override val id: RdId get() = RdId(-5321339677649567089)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdCallHierarchyResult  {
             val root = RdSymbolInfo.read(ctx, buffer)
             val calls = buffer.readList { RdSymbolInfo.read(ctx, buffer) }
-            return RdCallHierarchyResult(root, calls)
+            val message = buffer.readNullable { buffer.readString() }
+            return RdCallHierarchyResult(root, calls, message)
         }
 
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdCallHierarchyResult)  {
             RdSymbolInfo.write(ctx, buffer, value.root)
             buffer.writeList(value.calls) { v -> RdSymbolInfo.write(ctx, buffer, v) }
+            buffer.writeNullable(value.message) { buffer.writeString(it) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -411,11 +414,12 @@ data class RdCallHierarchyResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdCallHierarchyResult
-
+        
         if (root != other.root) return false
         if (calls != other.calls) return false
+        if (message != other.message) return false
 
         return true
     }
@@ -424,6 +428,7 @@ data class RdCallHierarchyResult (
         var __r = 0
         __r = __r*31 + root.hashCode()
         __r = __r*31 + calls.hashCode()
+        __r = __r*31 + (message?.hashCode() ?: 0)
         return __r
     }
     //pretty print
@@ -432,6 +437,7 @@ data class RdCallHierarchyResult (
         printer.indent {
             print("root = "); root.print(printer); println()
             print("calls = "); calls.print(printer); println()
+            print("message = "); message.print(printer); println()
         }
         printer.print(")")
     }
@@ -447,29 +453,35 @@ data class RdCallHierarchyResult (
 data class RdDefinitionResult (
     val definition: RdSymbolInfo,
     val preview: String,
-    val astPath: List<String>
+    val astPath: List<String>,
+    val locationKind: String,
+    val locationDisplayName: String?
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdDefinitionResult> {
         override val _type: KClass<RdDefinitionResult> = RdDefinitionResult::class
         override val id: RdId get() = RdId(3534513108899072789)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdDefinitionResult  {
             val definition = RdSymbolInfo.read(ctx, buffer)
             val preview = buffer.readString()
             val astPath = buffer.readList { buffer.readString() }
-            return RdDefinitionResult(definition, preview, astPath)
+            val locationKind = buffer.readString()
+            val locationDisplayName = buffer.readNullable { buffer.readString() }
+            return RdDefinitionResult(definition, preview, astPath, locationKind, locationDisplayName)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdDefinitionResult)  {
             RdSymbolInfo.write(ctx, buffer, value.definition)
             buffer.writeString(value.preview)
             buffer.writeList(value.astPath) { v -> buffer.writeString(v) }
+            buffer.writeString(value.locationKind)
+            buffer.writeNullable(value.locationDisplayName) { buffer.writeString(it) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -479,13 +491,15 @@ data class RdDefinitionResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdDefinitionResult
-
+        
         if (definition != other.definition) return false
         if (preview != other.preview) return false
         if (astPath != other.astPath) return false
-
+        if (locationKind != other.locationKind) return false
+        if (locationDisplayName != other.locationDisplayName) return false
+        
         return true
     }
     //hash code trait
@@ -494,6 +508,8 @@ data class RdDefinitionResult (
         __r = __r*31 + definition.hashCode()
         __r = __r*31 + preview.hashCode()
         __r = __r*31 + astPath.hashCode()
+        __r = __r*31 + locationKind.hashCode()
+        __r = __r*31 + if (locationDisplayName != null) locationDisplayName.hashCode() else 0
         return __r
     }
     //pretty print
@@ -503,6 +519,8 @@ data class RdDefinitionResult (
             print("definition = "); definition.print(printer); println()
             print("preview = "); preview.print(printer); println()
             print("astPath = "); astPath.print(printer); println()
+            print("locationKind = "); locationKind.print(printer); println()
+            print("locationDisplayName = "); locationDisplayName.print(printer); println()
         }
         printer.print(")")
     }
@@ -513,28 +531,28 @@ data class RdDefinitionResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:197]
+ * #### Generated from [IndexMcpModel.kt:199]
  */
 data class RdFileStructureRequest (
     val filePath: String
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFileStructureRequest> {
         override val _type: KClass<RdFileStructureRequest> = RdFileStructureRequest::class
         override val id: RdId get() = RdId(-6049031805937391491)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFileStructureRequest  {
             val filePath = buffer.readString()
             return RdFileStructureRequest(filePath)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFileStructureRequest)  {
             buffer.writeString(value.filePath)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -544,11 +562,11 @@ data class RdFileStructureRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFileStructureRequest
-
+        
         if (filePath != other.filePath) return false
-
+        
         return true
     }
     //hash code trait
@@ -572,28 +590,28 @@ data class RdFileStructureRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:212]
+ * #### Generated from [IndexMcpModel.kt:214]
  */
 data class RdFileStructureResult (
     val nodes: List<RdFlatStructureNode>
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFileStructureResult> {
         override val _type: KClass<RdFileStructureResult> = RdFileStructureResult::class
         override val id: RdId get() = RdId(1590038723070745711)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFileStructureResult  {
             val nodes = buffer.readList { RdFlatStructureNode.read(ctx, buffer) }
             return RdFileStructureResult(nodes)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFileStructureResult)  {
             buffer.writeList(value.nodes) { v -> RdFlatStructureNode.write(ctx, buffer, v) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -603,11 +621,11 @@ data class RdFileStructureResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFileStructureResult
-
+        
         if (nodes != other.nodes) return false
-
+        
         return true
     }
     //hash code trait
@@ -639,11 +657,11 @@ data class RdFindDefinitionRequest (
     val maxPreviewLines: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFindDefinitionRequest> {
         override val _type: KClass<RdFindDefinitionRequest> = RdFindDefinitionRequest::class
         override val id: RdId get() = RdId(-869352042608296866)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFindDefinitionRequest  {
             val target = RdSemanticTarget.read(ctx, buffer)
@@ -651,14 +669,14 @@ data class RdFindDefinitionRequest (
             val maxPreviewLines = buffer.readInt()
             return RdFindDefinitionRequest(target, fullElementPreview, maxPreviewLines)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFindDefinitionRequest)  {
             RdSemanticTarget.write(ctx, buffer, value.target)
             buffer.writeBool(value.fullElementPreview)
             buffer.writeInt(value.maxPreviewLines)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -668,13 +686,13 @@ data class RdFindDefinitionRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFindDefinitionRequest
-
+        
         if (target != other.target) return false
         if (fullElementPreview != other.fullElementPreview) return false
         if (maxPreviewLines != other.maxPreviewLines) return false
-
+        
         return true
     }
     //hash code trait
@@ -702,7 +720,7 @@ data class RdFindDefinitionRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:109]
+ * #### Generated from [IndexMcpModel.kt:111]
  */
 data class RdFindReferencesRequest (
     val target: RdSemanticTarget,
@@ -710,11 +728,11 @@ data class RdFindReferencesRequest (
     val limit: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFindReferencesRequest> {
         override val _type: KClass<RdFindReferencesRequest> = RdFindReferencesRequest::class
         override val id: RdId get() = RdId(7995059252749119881)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFindReferencesRequest  {
             val target = RdSemanticTarget.read(ctx, buffer)
@@ -722,14 +740,14 @@ data class RdFindReferencesRequest (
             val limit = buffer.readInt()
             return RdFindReferencesRequest(target, scope, limit)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFindReferencesRequest)  {
             RdSemanticTarget.write(ctx, buffer, value.target)
             buffer.writeString(value.scope)
             buffer.writeInt(value.limit)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -739,13 +757,13 @@ data class RdFindReferencesRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFindReferencesRequest
-
+        
         if (target != other.target) return false
         if (scope != other.scope) return false
         if (limit != other.limit) return false
-
+        
         return true
     }
     //hash code trait
@@ -773,31 +791,34 @@ data class RdFindReferencesRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:115]
+ * #### Generated from [IndexMcpModel.kt:117]
  */
 data class RdFindReferencesResult (
     val references: List<RdReferenceInfo>,
-    val totalCount: Int
+    val totalCount: Int,
+    val message: String?
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFindReferencesResult> {
         override val _type: KClass<RdFindReferencesResult> = RdFindReferencesResult::class
         override val id: RdId get() = RdId(7993636522934682083)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFindReferencesResult  {
             val references = buffer.readList { RdReferenceInfo.read(ctx, buffer) }
             val totalCount = buffer.readInt()
-            return RdFindReferencesResult(references, totalCount)
+            val message = buffer.readNullable { buffer.readString() }
+            return RdFindReferencesResult(references, totalCount, message)
         }
 
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFindReferencesResult)  {
             buffer.writeList(value.references) { v -> RdReferenceInfo.write(ctx, buffer, v) }
             buffer.writeInt(value.totalCount)
+            buffer.writeNullable(value.message) { buffer.writeString(it) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -807,11 +828,12 @@ data class RdFindReferencesResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFindReferencesResult
-
+        
         if (references != other.references) return false
         if (totalCount != other.totalCount) return false
+        if (message != other.message) return false
 
         return true
     }
@@ -820,6 +842,7 @@ data class RdFindReferencesResult (
         var __r = 0
         __r = __r*31 + references.hashCode()
         __r = __r*31 + totalCount.hashCode()
+        __r = __r*31 + (message?.hashCode() ?: 0)
         return __r
     }
     //pretty print
@@ -828,6 +851,7 @@ data class RdFindReferencesResult (
         printer.indent {
             print("references = "); references.print(printer); println()
             print("totalCount = "); totalCount.print(printer); println()
+            print("message = "); message.print(printer); println()
         }
         printer.print(")")
     }
@@ -847,11 +871,11 @@ data class RdFindSymbolsRequest (
     val limit: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFindSymbolsRequest> {
         override val _type: KClass<RdFindSymbolsRequest> = RdFindSymbolsRequest::class
         override val id: RdId get() = RdId(-6674192697615603502)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFindSymbolsRequest  {
             val query = buffer.readString()
@@ -860,15 +884,15 @@ data class RdFindSymbolsRequest (
             val limit = buffer.readInt()
             return RdFindSymbolsRequest(query, scope, language, limit)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFindSymbolsRequest)  {
             buffer.writeString(value.query)
             buffer.writeString(value.scope)
             buffer.writeString(value.language)
             buffer.writeInt(value.limit)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -878,14 +902,14 @@ data class RdFindSymbolsRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFindSymbolsRequest
-
+        
         if (query != other.query) return false
         if (scope != other.scope) return false
         if (language != other.language) return false
         if (limit != other.limit) return false
-
+        
         return true
     }
     //hash code trait
@@ -922,24 +946,24 @@ data class RdFindSymbolsResult (
     val totalCount: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFindSymbolsResult> {
         override val _type: KClass<RdFindSymbolsResult> = RdFindSymbolsResult::class
         override val id: RdId get() = RdId(974815982251785594)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFindSymbolsResult  {
             val symbols = buffer.readList { RdSymbolInfo.read(ctx, buffer) }
             val totalCount = buffer.readInt()
             return RdFindSymbolsResult(symbols, totalCount)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFindSymbolsResult)  {
             buffer.writeList(value.symbols) { v -> RdSymbolInfo.write(ctx, buffer, v) }
             buffer.writeInt(value.totalCount)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -949,12 +973,12 @@ data class RdFindSymbolsResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFindSymbolsResult
-
+        
         if (symbols != other.symbols) return false
         if (totalCount != other.totalCount) return false
-
+        
         return true
     }
     //hash code trait
@@ -990,11 +1014,11 @@ data class RdFindTypesRequest (
     val limit: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFindTypesRequest> {
         override val _type: KClass<RdFindTypesRequest> = RdFindTypesRequest::class
         override val id: RdId get() = RdId(-4108457705209229324)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFindTypesRequest  {
             val query = buffer.readString()
@@ -1004,7 +1028,7 @@ data class RdFindTypesRequest (
             val limit = buffer.readInt()
             return RdFindTypesRequest(query, matchMode, scope, language, limit)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFindTypesRequest)  {
             buffer.writeString(value.query)
             buffer.writeString(value.matchMode)
@@ -1012,8 +1036,8 @@ data class RdFindTypesRequest (
             buffer.writeNullable(value.language) { buffer.writeString(it) }
             buffer.writeInt(value.limit)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1023,15 +1047,15 @@ data class RdFindTypesRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFindTypesRequest
-
+        
         if (query != other.query) return false
         if (matchMode != other.matchMode) return false
         if (scope != other.scope) return false
         if (language != other.language) return false
         if (limit != other.limit) return false
-
+        
         return true
     }
     //hash code trait
@@ -1070,24 +1094,24 @@ data class RdFindTypesResult (
     val totalCount: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFindTypesResult> {
         override val _type: KClass<RdFindTypesResult> = RdFindTypesResult::class
         override val id: RdId get() = RdId(4627919189821581848)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFindTypesResult  {
             val types = buffer.readList { RdSymbolInfo.read(ctx, buffer) }
             val totalCount = buffer.readInt()
             return RdFindTypesResult(types, totalCount)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFindTypesResult)  {
             buffer.writeList(value.types) { v -> RdSymbolInfo.write(ctx, buffer, v) }
             buffer.writeInt(value.totalCount)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1097,12 +1121,12 @@ data class RdFindTypesResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFindTypesResult
-
+        
         if (types != other.types) return false
         if (totalCount != other.totalCount) return false
-
+        
         return true
     }
     //hash code trait
@@ -1128,7 +1152,7 @@ data class RdFindTypesResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:203]
+ * #### Generated from [IndexMcpModel.kt:205]
  */
 data class RdFlatStructureNode (
     val name: String,
@@ -1139,11 +1163,11 @@ data class RdFlatStructureNode (
     val depth: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdFlatStructureNode> {
         override val _type: KClass<RdFlatStructureNode> = RdFlatStructureNode::class
         override val id: RdId get() = RdId(-994497033408018441)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdFlatStructureNode  {
             val name = buffer.readString()
@@ -1154,7 +1178,7 @@ data class RdFlatStructureNode (
             val depth = buffer.readInt()
             return RdFlatStructureNode(name, kind, signature, modifiers, line, depth)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdFlatStructureNode)  {
             buffer.writeString(value.name)
             buffer.writeString(value.kind)
@@ -1163,8 +1187,8 @@ data class RdFlatStructureNode (
             buffer.writeInt(value.line)
             buffer.writeInt(value.depth)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1174,16 +1198,16 @@ data class RdFlatStructureNode (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdFlatStructureNode
-
+        
         if (name != other.name) return false
         if (kind != other.kind) return false
         if (signature != other.signature) return false
         if (modifiers != other.modifiers) return false
         if (line != other.line) return false
         if (depth != other.depth) return false
-
+        
         return true
     }
     //hash code trait
@@ -1217,7 +1241,7 @@ data class RdFlatStructureNode (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:151]
+ * #### Generated from [IndexMcpModel.kt:153]
  */
 data class RdImplementationsRequest (
     val position: RdSourcePosition,
@@ -1225,11 +1249,11 @@ data class RdImplementationsRequest (
     val limit: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdImplementationsRequest> {
         override val _type: KClass<RdImplementationsRequest> = RdImplementationsRequest::class
         override val id: RdId get() = RdId(4312643375883653203)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdImplementationsRequest  {
             val position = RdSourcePosition.read(ctx, buffer)
@@ -1237,14 +1261,14 @@ data class RdImplementationsRequest (
             val limit = buffer.readInt()
             return RdImplementationsRequest(position, scope, limit)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdImplementationsRequest)  {
             RdSourcePosition.write(ctx, buffer, value.position)
             buffer.writeString(value.scope)
             buffer.writeInt(value.limit)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1254,13 +1278,13 @@ data class RdImplementationsRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdImplementationsRequest
-
+        
         if (position != other.position) return false
         if (scope != other.scope) return false
         if (limit != other.limit) return false
-
+        
         return true
     }
     //hash code trait
@@ -1288,28 +1312,28 @@ data class RdImplementationsRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:157]
+ * #### Generated from [IndexMcpModel.kt:159]
  */
 data class RdImplementationsResult (
     val implementations: List<RdSymbolInfo>
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdImplementationsResult> {
         override val _type: KClass<RdImplementationsResult> = RdImplementationsResult::class
         override val id: RdId get() = RdId(3709455090907832793)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdImplementationsResult  {
             val implementations = buffer.readList { RdSymbolInfo.read(ctx, buffer) }
             return RdImplementationsResult(implementations)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdImplementationsResult)  {
             buffer.writeList(value.implementations) { v -> RdSymbolInfo.write(ctx, buffer, v) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1319,11 +1343,11 @@ data class RdImplementationsResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdImplementationsResult
-
+        
         if (implementations != other.implementations) return false
-
+        
         return true
     }
     //hash code trait
@@ -1347,31 +1371,31 @@ data class RdImplementationsResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:256]
+ * #### Generated from [IndexMcpModel.kt:258]
  */
 data class RdMoveFileRequest (
     val filePath: String,
     val destinationDirectory: String
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdMoveFileRequest> {
         override val _type: KClass<RdMoveFileRequest> = RdMoveFileRequest::class
         override val id: RdId get() = RdId(-4180692821025388419)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdMoveFileRequest  {
             val filePath = buffer.readString()
             val destinationDirectory = buffer.readString()
             return RdMoveFileRequest(filePath, destinationDirectory)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdMoveFileRequest)  {
             buffer.writeString(value.filePath)
             buffer.writeString(value.destinationDirectory)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1381,12 +1405,12 @@ data class RdMoveFileRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdMoveFileRequest
-
+        
         if (filePath != other.filePath) return false
         if (destinationDirectory != other.destinationDirectory) return false
-
+        
         return true
     }
     //hash code trait
@@ -1412,7 +1436,7 @@ data class RdMoveFileRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:261]
+ * #### Generated from [IndexMcpModel.kt:263]
  */
 data class RdMoveFileResult (
     val success: Boolean,
@@ -1425,11 +1449,11 @@ data class RdMoveFileResult (
     val verification: RdMutationVerification?
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdMoveFileResult> {
         override val _type: KClass<RdMoveFileResult> = RdMoveFileResult::class
         override val id: RdId get() = RdId(-4895311142280643473)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdMoveFileResult  {
             val success = buffer.readBool()
@@ -1442,7 +1466,7 @@ data class RdMoveFileResult (
             val verification = buffer.readNullable { RdMutationVerification.read(ctx, buffer) }
             return RdMoveFileResult(success, oldPath, newPath, affectedFiles, changesCount, message, status, verification)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdMoveFileResult)  {
             buffer.writeBool(value.success)
             buffer.writeString(value.oldPath)
@@ -1453,8 +1477,8 @@ data class RdMoveFileResult (
             buffer.writeString(value.status)
             buffer.writeNullable(value.verification) { RdMutationVerification.write(ctx, buffer, it) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1464,9 +1488,9 @@ data class RdMoveFileResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdMoveFileResult
-
+        
         if (success != other.success) return false
         if (oldPath != other.oldPath) return false
         if (newPath != other.newPath) return false
@@ -1475,7 +1499,7 @@ data class RdMoveFileResult (
         if (message != other.message) return false
         if (status != other.status) return false
         if (verification != other.verification) return false
-
+        
         return true
     }
     //hash code trait
@@ -1513,7 +1537,7 @@ data class RdMoveFileResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:223]
+ * #### Generated from [IndexMcpModel.kt:225]
  */
 data class RdMutationVerification (
     val status: String,
@@ -1521,11 +1545,11 @@ data class RdMutationVerification (
     val warnings: List<String>
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdMutationVerification> {
         override val _type: KClass<RdMutationVerification> = RdMutationVerification::class
         override val id: RdId get() = RdId(-5136722195302102871)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdMutationVerification  {
             val status = buffer.readString()
@@ -1533,14 +1557,14 @@ data class RdMutationVerification (
             val warnings = buffer.readList { buffer.readString() }
             return RdMutationVerification(status, checksRun, warnings)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdMutationVerification)  {
             buffer.writeString(value.status)
             buffer.writeList(value.checksRun) { v -> buffer.writeString(v) }
             buffer.writeList(value.warnings) { v -> buffer.writeString(v) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1550,13 +1574,13 @@ data class RdMutationVerification (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdMutationVerification
-
+        
         if (status != other.status) return false
         if (checksRun != other.checksRun) return false
         if (warnings != other.warnings) return false
-
+        
         return true
     }
     //hash code trait
@@ -1584,7 +1608,7 @@ data class RdMutationVerification (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:100]
+ * #### Generated from [IndexMcpModel.kt:102]
  */
 data class RdReferenceInfo (
     val filePath: String,
@@ -1595,11 +1619,11 @@ data class RdReferenceInfo (
     val astPath: List<String>
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdReferenceInfo> {
         override val _type: KClass<RdReferenceInfo> = RdReferenceInfo::class
         override val id: RdId get() = RdId(-3032379611242238732)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdReferenceInfo  {
             val filePath = buffer.readString()
@@ -1610,7 +1634,7 @@ data class RdReferenceInfo (
             val astPath = buffer.readList { buffer.readString() }
             return RdReferenceInfo(filePath, line, column, context, kind, astPath)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdReferenceInfo)  {
             buffer.writeString(value.filePath)
             buffer.writeInt(value.line)
@@ -1619,8 +1643,8 @@ data class RdReferenceInfo (
             buffer.writeString(value.kind)
             buffer.writeList(value.astPath) { v -> buffer.writeString(v) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1630,16 +1654,16 @@ data class RdReferenceInfo (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdReferenceInfo
-
+        
         if (filePath != other.filePath) return false
         if (line != other.line) return false
         if (column != other.column) return false
         if (context != other.context) return false
         if (kind != other.kind) return false
         if (astPath != other.astPath) return false
-
+        
         return true
     }
     //hash code trait
@@ -1673,31 +1697,31 @@ data class RdReferenceInfo (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:240]
+ * #### Generated from [IndexMcpModel.kt:242]
  */
 data class RdRenameFileRequest (
     val filePath: String,
     val newName: String
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdRenameFileRequest> {
         override val _type: KClass<RdRenameFileRequest> = RdRenameFileRequest::class
         override val id: RdId get() = RdId(3365879169746377776)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdRenameFileRequest  {
             val filePath = buffer.readString()
             val newName = buffer.readString()
             return RdRenameFileRequest(filePath, newName)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdRenameFileRequest)  {
             buffer.writeString(value.filePath)
             buffer.writeString(value.newName)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1707,12 +1731,12 @@ data class RdRenameFileRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdRenameFileRequest
-
+        
         if (filePath != other.filePath) return false
         if (newName != other.newName) return false
-
+        
         return true
     }
     //hash code trait
@@ -1738,7 +1762,7 @@ data class RdRenameFileRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:245]
+ * #### Generated from [IndexMcpModel.kt:247]
  */
 data class RdRenameFileResult (
     val success: Boolean,
@@ -1751,11 +1775,11 @@ data class RdRenameFileResult (
     val verification: RdMutationVerification?
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdRenameFileResult> {
         override val _type: KClass<RdRenameFileResult> = RdRenameFileResult::class
         override val id: RdId get() = RdId(3678914310064694876)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdRenameFileResult  {
             val success = buffer.readBool()
@@ -1768,7 +1792,7 @@ data class RdRenameFileResult (
             val verification = buffer.readNullable { RdMutationVerification.read(ctx, buffer) }
             return RdRenameFileResult(success, oldPath, newPath, affectedFiles, changesCount, message, status, verification)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdRenameFileResult)  {
             buffer.writeBool(value.success)
             buffer.writeString(value.oldPath)
@@ -1779,8 +1803,8 @@ data class RdRenameFileResult (
             buffer.writeString(value.status)
             buffer.writeNullable(value.verification) { RdMutationVerification.write(ctx, buffer, it) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1790,9 +1814,9 @@ data class RdRenameFileResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdRenameFileResult
-
+        
         if (success != other.success) return false
         if (oldPath != other.oldPath) return false
         if (newPath != other.newPath) return false
@@ -1801,7 +1825,7 @@ data class RdRenameFileResult (
         if (message != other.message) return false
         if (status != other.status) return false
         if (verification != other.verification) return false
-
+        
         return true
     }
     //hash code trait
@@ -1839,31 +1863,31 @@ data class RdRenameFileResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:218]
+ * #### Generated from [IndexMcpModel.kt:220]
  */
 data class RdRenameSymbolRequest (
     val position: RdSourcePosition,
     val newName: String
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdRenameSymbolRequest> {
         override val _type: KClass<RdRenameSymbolRequest> = RdRenameSymbolRequest::class
         override val id: RdId get() = RdId(-1370157819129083564)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdRenameSymbolRequest  {
             val position = RdSourcePosition.read(ctx, buffer)
             val newName = buffer.readString()
             return RdRenameSymbolRequest(position, newName)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdRenameSymbolRequest)  {
             RdSourcePosition.write(ctx, buffer, value.position)
             buffer.writeString(value.newName)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1873,12 +1897,12 @@ data class RdRenameSymbolRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdRenameSymbolRequest
-
+        
         if (position != other.position) return false
         if (newName != other.newName) return false
-
+        
         return true
     }
     //hash code trait
@@ -1904,7 +1928,7 @@ data class RdRenameSymbolRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:229]
+ * #### Generated from [IndexMcpModel.kt:231]
  */
 data class RdRenameSymbolResult (
     val success: Boolean,
@@ -1917,11 +1941,11 @@ data class RdRenameSymbolResult (
     val verification: RdMutationVerification?
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdRenameSymbolResult> {
         override val _type: KClass<RdRenameSymbolResult> = RdRenameSymbolResult::class
         override val id: RdId get() = RdId(-5994761243749120840)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdRenameSymbolResult  {
             val success = buffer.readBool()
@@ -1934,7 +1958,7 @@ data class RdRenameSymbolResult (
             val verification = buffer.readNullable { RdMutationVerification.read(ctx, buffer) }
             return RdRenameSymbolResult(success, oldName, newName, affectedFiles, changesCount, message, status, verification)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdRenameSymbolResult)  {
             buffer.writeBool(value.success)
             buffer.writeString(value.oldName)
@@ -1945,8 +1969,8 @@ data class RdRenameSymbolResult (
             buffer.writeString(value.status)
             buffer.writeNullable(value.verification) { RdMutationVerification.write(ctx, buffer, it) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -1956,9 +1980,9 @@ data class RdRenameSymbolResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdRenameSymbolResult
-
+        
         if (success != other.success) return false
         if (oldName != other.oldName) return false
         if (newName != other.newName) return false
@@ -1967,7 +1991,7 @@ data class RdRenameSymbolResult (
         if (message != other.message) return false
         if (status != other.status) return false
         if (verification != other.verification) return false
-
+        
         return true
     }
     //hash code trait
@@ -2005,31 +2029,31 @@ data class RdRenameSymbolResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:125]
+ * #### Generated from [IndexMcpModel.kt:127]
  */
 data class RdResolveSymbolIndexedRequest (
     val language: String,
     val symbol: String
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdResolveSymbolIndexedRequest> {
         override val _type: KClass<RdResolveSymbolIndexedRequest> = RdResolveSymbolIndexedRequest::class
         override val id: RdId get() = RdId(-7597324494782965955)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdResolveSymbolIndexedRequest  {
             val language = buffer.readString()
             val symbol = buffer.readString()
             return RdResolveSymbolIndexedRequest(language, symbol)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdResolveSymbolIndexedRequest)  {
             buffer.writeString(value.language)
             buffer.writeString(value.symbol)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2039,12 +2063,12 @@ data class RdResolveSymbolIndexedRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdResolveSymbolIndexedRequest
-
+        
         if (language != other.language) return false
         if (symbol != other.symbol) return false
-
+        
         return true
     }
     //hash code trait
@@ -2070,7 +2094,7 @@ data class RdResolveSymbolIndexedRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:130]
+ * #### Generated from [IndexMcpModel.kt:132]
  */
 data class RdResolveSymbolIndexedResult (
     val status: String,
@@ -2078,11 +2102,11 @@ data class RdResolveSymbolIndexedResult (
     val symbolInfo: RdSymbolInfo?
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdResolveSymbolIndexedResult> {
         override val _type: KClass<RdResolveSymbolIndexedResult> = RdResolveSymbolIndexedResult::class
         override val id: RdId get() = RdId(-5005525067240565329)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdResolveSymbolIndexedResult  {
             val status = buffer.readString()
@@ -2090,14 +2114,14 @@ data class RdResolveSymbolIndexedResult (
             val symbolInfo = buffer.readNullable { RdSymbolInfo.read(ctx, buffer) }
             return RdResolveSymbolIndexedResult(status, message, symbolInfo)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdResolveSymbolIndexedResult)  {
             buffer.writeString(value.status)
             buffer.writeNullable(value.message) { buffer.writeString(it) }
             buffer.writeNullable(value.symbolInfo) { RdSymbolInfo.write(ctx, buffer, it) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2107,13 +2131,13 @@ data class RdResolveSymbolIndexedResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdResolveSymbolIndexedResult
-
+        
         if (status != other.status) return false
         if (message != other.message) return false
         if (symbolInfo != other.symbolInfo) return false
-
+        
         return true
     }
     //hash code trait
@@ -2141,31 +2165,31 @@ data class RdResolveSymbolIndexedResult (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:120]
+ * #### Generated from [IndexMcpModel.kt:122]
  */
 data class RdResolveSymbolRequest (
     val language: String,
     val symbol: String
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdResolveSymbolRequest> {
         override val _type: KClass<RdResolveSymbolRequest> = RdResolveSymbolRequest::class
         override val id: RdId get() = RdId(8323260431033600144)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdResolveSymbolRequest  {
             val language = buffer.readString()
             val symbol = buffer.readString()
             return RdResolveSymbolRequest(language, symbol)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdResolveSymbolRequest)  {
             buffer.writeString(value.language)
             buffer.writeString(value.symbol)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2175,12 +2199,12 @@ data class RdResolveSymbolRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdResolveSymbolRequest
-
+        
         if (language != other.language) return false
         if (symbol != other.symbol) return false
-
+        
         return true
     }
     //hash code trait
@@ -2206,7 +2230,7 @@ data class RdResolveSymbolRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:278]
+ * #### Generated from [IndexMcpModel.kt:280]
  */
 data class RdSafeDeleteBlockedUsage (
     val filePath: String,
@@ -2216,11 +2240,11 @@ data class RdSafeDeleteBlockedUsage (
     val kind: String
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdSafeDeleteBlockedUsage> {
         override val _type: KClass<RdSafeDeleteBlockedUsage> = RdSafeDeleteBlockedUsage::class
         override val id: RdId get() = RdId(6616599642070861522)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdSafeDeleteBlockedUsage  {
             val filePath = buffer.readString()
@@ -2230,7 +2254,7 @@ data class RdSafeDeleteBlockedUsage (
             val kind = buffer.readString()
             return RdSafeDeleteBlockedUsage(filePath, line, column, context, kind)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdSafeDeleteBlockedUsage)  {
             buffer.writeString(value.filePath)
             buffer.writeInt(value.line)
@@ -2238,8 +2262,8 @@ data class RdSafeDeleteBlockedUsage (
             buffer.writeString(value.context)
             buffer.writeString(value.kind)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2249,15 +2273,15 @@ data class RdSafeDeleteBlockedUsage (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdSafeDeleteBlockedUsage
-
+        
         if (filePath != other.filePath) return false
         if (line != other.line) return false
         if (column != other.column) return false
         if (context != other.context) return false
         if (kind != other.kind) return false
-
+        
         return true
     }
     //hash code trait
@@ -2289,7 +2313,7 @@ data class RdSafeDeleteBlockedUsage (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:272]
+ * #### Generated from [IndexMcpModel.kt:274]
  */
 data class RdSafeDeleteRequest (
     val target: RdSemanticTarget,
@@ -2297,11 +2321,11 @@ data class RdSafeDeleteRequest (
     val force: Boolean
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdSafeDeleteRequest> {
         override val _type: KClass<RdSafeDeleteRequest> = RdSafeDeleteRequest::class
         override val id: RdId get() = RdId(-1384896468765046606)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdSafeDeleteRequest  {
             val target = RdSemanticTarget.read(ctx, buffer)
@@ -2309,14 +2333,14 @@ data class RdSafeDeleteRequest (
             val force = buffer.readBool()
             return RdSafeDeleteRequest(target, targetType, force)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdSafeDeleteRequest)  {
             RdSemanticTarget.write(ctx, buffer, value.target)
             buffer.writeString(value.targetType)
             buffer.writeBool(value.force)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2326,13 +2350,13 @@ data class RdSafeDeleteRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdSafeDeleteRequest
-
+        
         if (target != other.target) return false
         if (targetType != other.targetType) return false
         if (force != other.force) return false
-
+        
         return true
     }
     //hash code trait
@@ -2360,7 +2384,7 @@ data class RdSafeDeleteRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:286]
+ * #### Generated from [IndexMcpModel.kt:288]
  */
 data class RdSafeDeleteResult (
     val success: Boolean,
@@ -2372,11 +2396,11 @@ data class RdSafeDeleteResult (
     val verification: RdMutationVerification?
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdSafeDeleteResult> {
         override val _type: KClass<RdSafeDeleteResult> = RdSafeDeleteResult::class
         override val id: RdId get() = RdId(-6590292944502201958)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdSafeDeleteResult  {
             val success = buffer.readBool()
@@ -2388,7 +2412,7 @@ data class RdSafeDeleteResult (
             val verification = buffer.readNullable { RdMutationVerification.read(ctx, buffer) }
             return RdSafeDeleteResult(success, affectedFiles, changesCount, message, status, blockedUsages, verification)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdSafeDeleteResult)  {
             buffer.writeBool(value.success)
             buffer.writeList(value.affectedFiles) { v -> buffer.writeString(v) }
@@ -2398,8 +2422,8 @@ data class RdSafeDeleteResult (
             buffer.writeList(value.blockedUsages) { v -> RdSafeDeleteBlockedUsage.write(ctx, buffer, v) }
             buffer.writeNullable(value.verification) { RdMutationVerification.write(ctx, buffer, it) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2409,9 +2433,9 @@ data class RdSafeDeleteResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdSafeDeleteResult
-
+        
         if (success != other.success) return false
         if (affectedFiles != other.affectedFiles) return false
         if (changesCount != other.changesCount) return false
@@ -2419,7 +2443,7 @@ data class RdSafeDeleteResult (
         if (status != other.status) return false
         if (blockedUsages != other.blockedUsages) return false
         if (verification != other.verification) return false
-
+        
         return true
     }
     //hash code trait
@@ -2465,11 +2489,11 @@ data class RdSemanticTarget (
     val symbol: String?
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdSemanticTarget> {
         override val _type: KClass<RdSemanticTarget> = RdSemanticTarget::class
         override val id: RdId get() = RdId(4375242365750196220)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdSemanticTarget  {
             val filePath = buffer.readNullable { buffer.readString() }
@@ -2479,7 +2503,7 @@ data class RdSemanticTarget (
             val symbol = buffer.readNullable { buffer.readString() }
             return RdSemanticTarget(filePath, line, column, language, symbol)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdSemanticTarget)  {
             buffer.writeNullable(value.filePath) { buffer.writeString(it) }
             buffer.writeNullable(value.line) { buffer.writeInt(it) }
@@ -2487,8 +2511,8 @@ data class RdSemanticTarget (
             buffer.writeNullable(value.language) { buffer.writeString(it) }
             buffer.writeNullable(value.symbol) { buffer.writeString(it) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2498,15 +2522,15 @@ data class RdSemanticTarget (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdSemanticTarget
-
+        
         if (filePath != other.filePath) return false
         if (line != other.line) return false
         if (column != other.column) return false
         if (language != other.language) return false
         if (symbol != other.symbol) return false
-
+        
         return true
     }
     //hash code trait
@@ -2546,11 +2570,11 @@ data class RdSourcePosition (
     val column: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdSourcePosition> {
         override val _type: KClass<RdSourcePosition> = RdSourcePosition::class
         override val id: RdId get() = RdId(-5977976679503629463)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdSourcePosition  {
             val filePath = buffer.readString()
@@ -2558,14 +2582,14 @@ data class RdSourcePosition (
             val column = buffer.readInt()
             return RdSourcePosition(filePath, line, column)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdSourcePosition)  {
             buffer.writeString(value.filePath)
             buffer.writeInt(value.line)
             buffer.writeInt(value.column)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2575,13 +2599,13 @@ data class RdSourcePosition (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdSourcePosition
-
+        
         if (filePath != other.filePath) return false
         if (line != other.line) return false
         if (column != other.column) return false
-
+        
         return true
     }
     //hash code trait
@@ -2609,7 +2633,7 @@ data class RdSourcePosition (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:182]
+ * #### Generated from [IndexMcpModel.kt:184]
  */
 data class RdSuperMethodInfo (
     val symbol: RdSymbolInfo,
@@ -2619,11 +2643,11 @@ data class RdSuperMethodInfo (
     val depth: Int
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdSuperMethodInfo> {
         override val _type: KClass<RdSuperMethodInfo> = RdSuperMethodInfo::class
         override val id: RdId get() = RdId(-6175457339077949787)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdSuperMethodInfo  {
             val symbol = RdSymbolInfo.read(ctx, buffer)
@@ -2633,7 +2657,7 @@ data class RdSuperMethodInfo (
             val depth = buffer.readInt()
             return RdSuperMethodInfo(symbol, containingTypeName, containingTypeKind, isInterface, depth)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdSuperMethodInfo)  {
             RdSymbolInfo.write(ctx, buffer, value.symbol)
             buffer.writeString(value.containingTypeName)
@@ -2641,8 +2665,8 @@ data class RdSuperMethodInfo (
             buffer.writeBool(value.isInterface)
             buffer.writeInt(value.depth)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2652,15 +2676,15 @@ data class RdSuperMethodInfo (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdSuperMethodInfo
-
+        
         if (symbol != other.symbol) return false
         if (containingTypeName != other.containingTypeName) return false
         if (containingTypeKind != other.containingTypeKind) return false
         if (isInterface != other.isInterface) return false
         if (depth != other.depth) return false
-
+        
         return true
     }
     //hash code trait
@@ -2692,28 +2716,28 @@ data class RdSuperMethodInfo (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:178]
+ * #### Generated from [IndexMcpModel.kt:180]
  */
 data class RdSuperMethodsRequest (
     val position: RdSourcePosition
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdSuperMethodsRequest> {
         override val _type: KClass<RdSuperMethodsRequest> = RdSuperMethodsRequest::class
         override val id: RdId get() = RdId(-3118716768245179149)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdSuperMethodsRequest  {
             val position = RdSourcePosition.read(ctx, buffer)
             return RdSuperMethodsRequest(position)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdSuperMethodsRequest)  {
             RdSourcePosition.write(ctx, buffer, value.position)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2723,11 +2747,11 @@ data class RdSuperMethodsRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdSuperMethodsRequest
-
+        
         if (position != other.position) return false
-
+        
         return true
     }
     //hash code trait
@@ -2751,31 +2775,31 @@ data class RdSuperMethodsRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:190]
+ * #### Generated from [IndexMcpModel.kt:192]
  */
 data class RdSuperMethodsResult (
     val method: RdSymbolInfo,
     val hierarchy: List<RdSuperMethodInfo>
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdSuperMethodsResult> {
         override val _type: KClass<RdSuperMethodsResult> = RdSuperMethodsResult::class
         override val id: RdId get() = RdId(-3670941329370988231)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdSuperMethodsResult  {
             val method = RdSymbolInfo.read(ctx, buffer)
             val hierarchy = buffer.readList { RdSuperMethodInfo.read(ctx, buffer) }
             return RdSuperMethodsResult(method, hierarchy)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdSuperMethodsResult)  {
             RdSymbolInfo.write(ctx, buffer, value.method)
             buffer.writeList(value.hierarchy) { v -> RdSuperMethodInfo.write(ctx, buffer, v) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2785,12 +2809,12 @@ data class RdSuperMethodsResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdSuperMethodsResult
-
+        
         if (method != other.method) return false
         if (hierarchy != other.hierarchy) return false
-
+        
         return true
     }
     //hash code trait
@@ -2830,11 +2854,11 @@ data class RdSymbolInfo (
     val modifiers: List<String>
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdSymbolInfo> {
         override val _type: KClass<RdSymbolInfo> = RdSymbolInfo::class
         override val id: RdId get() = RdId(-1313392469938805269)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdSymbolInfo  {
             val name = buffer.readString()
@@ -2848,7 +2872,7 @@ data class RdSymbolInfo (
             val modifiers = buffer.readList { buffer.readString() }
             return RdSymbolInfo(name, qualifiedName, kind, filePath, line, column, language, signature, modifiers)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdSymbolInfo)  {
             buffer.writeString(value.name)
             buffer.writeString(value.qualifiedName)
@@ -2860,8 +2884,8 @@ data class RdSymbolInfo (
             buffer.writeNullable(value.signature) { buffer.writeString(it) }
             buffer.writeList(value.modifiers) { v -> buffer.writeString(v) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2871,9 +2895,9 @@ data class RdSymbolInfo (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdSymbolInfo
-
+        
         if (name != other.name) return false
         if (qualifiedName != other.qualifiedName) return false
         if (kind != other.kind) return false
@@ -2883,7 +2907,7 @@ data class RdSymbolInfo (
         if (language != other.language) return false
         if (signature != other.signature) return false
         if (modifiers != other.modifiers) return false
-
+        
         return true
     }
     //hash code trait
@@ -2923,31 +2947,31 @@ data class RdSymbolInfo (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:138]
+ * #### Generated from [IndexMcpModel.kt:140]
  */
 data class RdTypeHierarchyRequest (
     val position: RdSourcePosition,
     val scope: String
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdTypeHierarchyRequest> {
         override val _type: KClass<RdTypeHierarchyRequest> = RdTypeHierarchyRequest::class
         override val id: RdId get() = RdId(-1227020239591611591)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdTypeHierarchyRequest  {
             val position = RdSourcePosition.read(ctx, buffer)
             val scope = buffer.readString()
             return RdTypeHierarchyRequest(position, scope)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdTypeHierarchyRequest)  {
             RdSourcePosition.write(ctx, buffer, value.position)
             buffer.writeString(value.scope)
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -2957,12 +2981,12 @@ data class RdTypeHierarchyRequest (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdTypeHierarchyRequest
-
+        
         if (position != other.position) return false
         if (scope != other.scope) return false
-
+        
         return true
     }
     //hash code trait
@@ -2988,7 +3012,7 @@ data class RdTypeHierarchyRequest (
 
 
 /**
- * #### Generated from [IndexMcpModel.kt:143]
+ * #### Generated from [IndexMcpModel.kt:145]
  */
 data class RdTypeHierarchyResult (
     val element: RdSymbolInfo,
@@ -2996,11 +3020,11 @@ data class RdTypeHierarchyResult (
     val subtypes: List<RdSymbolInfo>
 ) : IPrintable {
     //companion
-
+    
     companion object : IMarshaller<RdTypeHierarchyResult> {
         override val _type: KClass<RdTypeHierarchyResult> = RdTypeHierarchyResult::class
         override val id: RdId get() = RdId(4720868785486666291)
-
+        
         @Suppress("UNCHECKED_CAST")
         override fun read(ctx: SerializationCtx, buffer: AbstractBuffer): RdTypeHierarchyResult  {
             val element = RdSymbolInfo.read(ctx, buffer)
@@ -3008,14 +3032,14 @@ data class RdTypeHierarchyResult (
             val subtypes = buffer.readList { RdSymbolInfo.read(ctx, buffer) }
             return RdTypeHierarchyResult(element, supertypes, subtypes)
         }
-
+        
         override fun write(ctx: SerializationCtx, buffer: AbstractBuffer, value: RdTypeHierarchyResult)  {
             RdSymbolInfo.write(ctx, buffer, value.element)
             buffer.writeList(value.supertypes) { v -> RdSymbolInfo.write(ctx, buffer, v) }
             buffer.writeList(value.subtypes) { v -> RdSymbolInfo.write(ctx, buffer, v) }
         }
-
-
+        
+        
     }
     //fields
     //methods
@@ -3025,13 +3049,13 @@ data class RdTypeHierarchyResult (
     override fun equals(other: Any?): Boolean  {
         if (this === other) return true
         if (other == null || other::class != this::class) return false
-
+        
         other as RdTypeHierarchyResult
-
+        
         if (element != other.element) return false
         if (supertypes != other.supertypes) return false
         if (subtypes != other.subtypes) return false
-
+        
         return true
     }
     //hash code trait

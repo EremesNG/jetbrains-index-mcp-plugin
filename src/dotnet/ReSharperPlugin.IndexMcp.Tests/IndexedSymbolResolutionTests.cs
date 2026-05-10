@@ -88,6 +88,25 @@ public class IndexedSymbolResolutionTests
         Assert.That(GetResolutionStatus(resolution), Is.EqualTo("ambiguous_match"));
     }
 
+    [Test]
+    public void FindDefinition_SourceLessResolvedSymbolsShouldNotShortCircuitToNull()
+    {
+        var sourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..",
+            "ReSharperPlugin.IndexMcp",
+            "IndexMcpBackendHost.cs"));
+        var source = File.ReadAllText(sourcePath);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(source, Does.Not.Contain("if (navigationElement == null) return (RdDefinitionResult?)null;"),
+                "Resolved framework/library symbols should be able to return a structured metadata/decompiled/source-unavailable definition result instead of failing when no source declaration exists.");
+            Assert.That(source, Does.Contain("locationKind"),
+                "Regression guard: the backend definition payload should describe whether Rider resolved source, metadata, decompiled, or source-unavailable navigation.");
+        });
+    }
+
     [TestCase("System.String")]
     [TestCase("System.Collections.IEnumerable")]
     [TestCase("System.Collections.Generic.IEnumerable")]
@@ -1117,6 +1136,161 @@ public class IndexedSymbolResolutionTests
     }
 
     [Test]
+    public void CallHierarchy_CSharpPositionTarget_GenericReturnTypePositions_ShouldFallbackToContainingDeclaration()
+    {
+        var sourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..",
+            "ReSharperPlugin.IndexMcp",
+            "IndexMcpBackendHost.cs"));
+        var source = File.ReadAllText(sourcePath);
+
+        StringAssert.IsMatch(
+            @"ResolveCallableTarget\(ResolveTarget\(target\)\)\s*\?\?\s*ResolveCallableDeclarationTargetAt\(|ResolveCallableDeclarationTargetAt\([^\)]*target\.[^\)]*\)\s*\?\?\s*ResolveCallableTarget\(ResolveTarget\(target\)\)",
+            source,
+            "C# position-based call hierarchy should keep semantic resolution for method identifiers AND fall back to the containing callable declaration when the caret lands on a generic return type token that resolves to a non-callable symbol.");
+    }
+
+    [Test]
+    public void CallHierarchy_CSharpPositionTarget_MethodIdentifierPositions_ShouldRetainSemanticCallableResolutionPath()
+    {
+        var sourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..",
+            "ReSharperPlugin.IndexMcp",
+            "IndexMcpBackendHost.cs"));
+        var source = File.ReadAllText(sourcePath);
+
+        Assert.That(source, Does.Contain("ResolveCallableTarget(ResolveTarget(target))"),
+            "Method-identifier call hierarchy should keep the direct semantic callable resolution path; the generic-return fallback must extend position handling, not replace the existing happy path.");
+    }
+
+    [Test]
+    public void CallHierarchy_CSharpPositionTarget_MethodIdentifierPositions_ShouldPreferDirectResolutionBeforeDeclarationFallback()
+    {
+        var sourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..",
+            "ReSharperPlugin.IndexMcp",
+            "IndexMcpBackendHost.cs"));
+        var source = File.ReadAllText(sourcePath);
+
+        var positionBranchStart = source.IndexOf("if (!string.IsNullOrWhiteSpace(target.FilePath)", StringComparison.Ordinal);
+        var positionBranchEnd = source.IndexOf("return ResolveCallableTarget(ResolveTarget(target));", positionBranchStart, StringComparison.Ordinal);
+        var positionBranch = source.Substring(positionBranchStart, positionBranchEnd - positionBranchStart);
+        var normalizedBranch = string.Join(" ", positionBranch
+            .Split(new[] { ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(positionBranchStart, Is.GreaterThanOrEqualTo(0), "Expected a dedicated position-target branch in ResolveCallHierarchyTarget.");
+            Assert.That(positionBranchEnd, Is.GreaterThan(positionBranchStart), "Expected the C# position-target branch to end before the non-position return path.");
+            Assert.That(normalizedBranch,
+                Does.Contain("return ResolveCallableTarget(ResolveTarget(target)) ?? ResolveCallableDeclarationTargetAt(new RdSourcePosition("),
+                "Expected the C# position-target branch to try direct semantic callable resolution first and only then fall back to the containing declaration.");
+        });
+    }
+
+    [Test]
+    public void MatchesScope_SourceLessPathsRemainHiddenFromProjectFilesUntilLibraryScopeIsRequested()
+    {
+        var projectOnly = (bool)InvokePrivateStatic("MatchesScope", null, "project_files")!;
+        var projectAndLibraries = (bool)InvokePrivateStatic("MatchesScope", null, "project_and_libraries")!;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(projectOnly, Is.False,
+                "Source-less/dependency-backed declarations should not be treated as project_files because that makes Rider caller/reference scope separation loose and misleading.");
+            Assert.That(projectAndLibraries, Is.True,
+                "Source-less/dependency-backed declarations should remain visible once the caller explicitly opts into project_and_libraries.");
+        });
+    }
+
+    [Test]
+    public void CallHierarchy_CallersScopeHandlingShouldBeExplicitInsteadOfWholeSolutionWide()
+    {
+        var sourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..",
+            "ReSharperPlugin.IndexMcp",
+            "IndexMcpBackendHost.cs"));
+        var source = File.ReadAllText(sourcePath);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(source, Does.Contain("request.Scope"),
+                "Regression guard: Rider caller-scope behavior must be expressed explicitly in the backend instead of being implicit or undocumented.");
+            Assert.That(
+                source.Contains("MatchesScope(containingCallable, request.Scope)") ||
+                source.Contains("CreateSearchDomainForCallHierarchy(request.Scope") ||
+                source.Contains("CreateCallHierarchySearchDomain(request.Scope"),
+                Is.True,
+                "Rider caller search should either filter caller rows by request.Scope or build a scope-aware search domain instead of using a whole-solution domain for every scope.");
+        });
+    }
+
+    [Test]
+    public void FindReferences_ResultOrderingAndTruncationShouldBeDeterministicAfterDeduplication()
+    {
+        var sourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..",
+            "ReSharperPlugin.IndexMcp",
+            "IndexMcpBackendHost.cs"));
+        var source = File.ReadAllText(sourcePath);
+        var groupByIndex = source.IndexOf(".GroupBy(reference =>", StringComparison.Ordinal);
+        var takeIndex = source.IndexOf(".Take(effectiveLimit)", StringComparison.Ordinal);
+        var orderByIndex = groupByIndex >= 0
+            ? source.IndexOf(".OrderBy(", groupByIndex, StringComparison.Ordinal)
+            : -1;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(source, Does.Contain("GroupBy(reference =>")
+                .And.Contain("Take(effectiveLimit)"),
+                "Regression guard: Rider reference results still need an explicit distinct phase before limiting.");
+            Assert.That(orderByIndex >= 0 && orderByIndex < takeIndex,
+                Is.True,
+                "Reference rows should be ordered deterministically after deduplication and before truncation; backend enumeration order is not a stable API contract.");
+        });
+    }
+
+    [Test]
+    public void CallHierarchyAndReferenceProtocols_ShouldExposeActionableFrameworkRoutedMessaging()
+    {
+        var backendSourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..",
+            "ReSharperPlugin.IndexMcp",
+            "IndexMcpBackendHost.cs"));
+        var protocolSourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..", "..", "..",
+            "protocol",
+            "src",
+            "main",
+            "kotlin",
+            "model",
+            "rider",
+            "IndexMcpModel.kt"));
+
+        var backendSource = File.ReadAllText(backendSourcePath);
+        var protocolSource = File.ReadAllText(protocolSourcePath);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(backendSource, Does.Contain("framework-routed")
+                .Or.Contain("framework routed")
+                .Or.Contain("does not imply backend failure"),
+                "Backend/user-facing Rider messaging should explicitly explain that empty WebAPI/controller callers can be caused by framework routing rather than a backend failure.");
+            Assert.That(protocolSource, Does.Contain("private val RdCallHierarchyResult = structdef {")
+                .And.Contain("field(\"message\"")
+                .Or.Contain("private val RdFindReferencesResult = structdef {\n        field(\"message\""),
+                "Protocol results need an explicit message channel for actionable empty-result guidance instead of forcing the frontend to guess from an empty list.");
+        });
+    }
+
+    [Test]
     public void BuildCallHierarchyResolutionPlan_FSharpSymbolTarget_DoesNotUseDeclarationOnlyFastPath()
     {
         var plan = InvokePrivateStatic(
@@ -1127,6 +1301,25 @@ public class IndexedSymbolResolutionTests
         {
             Assert.That(GetProperty<bool>(plan!, "UseDeclarationOnlyFastPath"), Is.False);
             Assert.That(GetProperty<bool>(plan!, "IsFSharpPositionTarget"), Is.False);
+        });
+    }
+
+    [Test]
+    public void CallHierarchy_SymbolTargetUsesSemanticResolutionInsteadOfFrontendSourceRewrite()
+    {
+        var sourcePath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..",
+            "ReSharperPlugin.IndexMcp",
+            "IndexMcpBackendHost.cs"));
+        var source = File.ReadAllText(sourcePath);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(source, Does.Contain("ResolveCallHierarchyTarget(request.Target, resolutionPlan)"),
+                "Call hierarchy should resolve semantic Rider symbol targets through a backend-native target resolver instead of relying on frontend source-position rewriting.");
+            Assert.That(source, Does.Not.Contain("ResolveCallableTarget(ResolveTarget(request.Target))"),
+                "Regression guard: general call hierarchy resolution should no longer inline the old declaration-only path for semantic symbol targets.");
         });
     }
 
@@ -1145,6 +1338,56 @@ public class IndexedSymbolResolutionTests
     }
 
     [Test]
+    public void CallHierarchy_CSharpPositionTarget_GenericReturnTypeToken_ShouldResolveNearestCallableDeclaration()
+    {
+        var callableElement = CreateDeclaredElement("LoadAsync", declarations: new List<IDeclaration>());
+        var callableDeclaration = CreateDeclaration(callableElement, declaredName: "LoadAsync");
+        var genericReturnTypeToken = CreateTreeNode(CreateTreeNode(callableDeclaration), new Dictionary<string, object?>
+        {
+            ["GetText"] = "Task"
+        });
+
+        var resolvedNode = InvokePrivateStatic("ResolveNearestCallableDeclarationNode", genericReturnTypeToken);
+
+        Assert.That(resolvedNode, Is.SameAs(callableDeclaration),
+            "When the caret lands on a generic return type token inside a method signature, call hierarchy fallback should climb to the containing callable declaration instead of failing or widening to an unrelated symbol.");
+    }
+
+    [Test]
+    public void CallHierarchy_CSharpPositionTarget_NonCallableBodyToken_ShouldResolveContainingMethod()
+    {
+        var methodElement = CreateDeclaredElement("LoadAsync", declarations: new List<IDeclaration>());
+        var methodDeclaration = CreateDeclaration(methodElement, declaredName: "LoadAsync");
+        var statementNode = CreateTreeNode(methodDeclaration);
+        var identifierToken = CreateTreeNode(statementNode, new Dictionary<string, object?>
+        {
+            ["GetText"] = "items"
+        });
+
+        var resolvedElement = InvokePrivateStatic("ResolveContainingCallableElement", identifierToken);
+
+        Assert.That(resolvedElement, Is.SameAs(methodElement),
+            "Non-callable tokens inside a method body should resolve to the containing method when call hierarchy is asked for a position target.");
+    }
+
+    [Test]
+    public void CallHierarchy_CSharpPositionTarget_NonCallableSignatureToken_ShouldResolveContainingMethod()
+    {
+        var methodElement = CreateDeclaredElement("LoadAsync", declarations: new List<IDeclaration>());
+        var methodDeclaration = CreateDeclaration(methodElement, declaredName: "LoadAsync");
+        var parameterListNode = CreateTreeNode(methodDeclaration);
+        var genericTypeToken = CreateTreeNode(parameterListNode, new Dictionary<string, object?>
+        {
+            ["GetText"] = "CancellationToken"
+        });
+
+        var resolvedElement = InvokePrivateStatic("ResolveContainingCallableElement", genericTypeToken);
+
+        Assert.That(resolvedElement, Is.SameAs(methodElement),
+            "Signature tokens that are not themselves callable declarations should still resolve to the containing method for position-based call hierarchy fallback.");
+    }
+
+    [Test]
     public void ResolveNearestCallableDeclarationNode_FSharpNonCallablePosition_ReturnsNull()
     {
         var typeElement = CreateTypeElementCandidate("Container");
@@ -1154,6 +1397,48 @@ public class IndexedSymbolResolutionTests
         var resolvedNode = InvokePrivateStatic("ResolveNearestCallableDeclarationNode", nestedNode);
 
         Assert.That(resolvedNode, Is.Null);
+    }
+
+    [Test]
+    public void CallHierarchy_CSharpPositionTarget_PropertyTokenOutsideCallable_ShouldNotResolveContainingMethod()
+    {
+        var propertyElement = CreateDeclaredElement(
+            "Current",
+            kind: DeclaredElementKind.Property,
+            handlers: new Dictionary<string, object?>
+            {
+                ["get_Parameters"] = new List<IParameter>()
+            });
+        var propertyDeclaration = CreateDeclaration(propertyElement, declaredName: "Current");
+        var propertyToken = CreateTreeNode(propertyDeclaration, new Dictionary<string, object?>
+        {
+            ["GetText"] = "Current"
+        });
+
+        var resolvedElement = InvokePrivateStatic("ResolveContainingCallableElement", propertyToken);
+
+        Assert.That(resolvedElement, Is.Null,
+            "Property tokens outside any callable must not be widened to an unrelated method by position-based call hierarchy fallback.");
+    }
+
+    [Test]
+    public void CallHierarchy_CSharpPositionTarget_FieldTokenOutsideCallable_ShouldNotResolveContainingMethod()
+    {
+        var fieldElement = ProxyFactory.Create<IField>(new Dictionary<string, object?>
+        {
+            ["get_ShortName"] = "_current",
+            ["GetDeclarations"] = new List<IDeclaration>()
+        });
+        var fieldDeclaration = CreateDeclaration(fieldElement, declaredName: "_current");
+        var fieldToken = CreateTreeNode(fieldDeclaration, new Dictionary<string, object?>
+        {
+            ["GetText"] = "_current"
+        });
+
+        var resolvedElement = InvokePrivateStatic("ResolveContainingCallableElement", fieldToken);
+
+        Assert.That(resolvedElement, Is.Null,
+            "Field tokens outside any callable must stay unresolved instead of being redirected to a containing callable that does not exist.");
     }
 
     [Test]

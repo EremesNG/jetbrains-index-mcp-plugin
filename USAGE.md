@@ -145,7 +145,7 @@ Some tools support identifying the target element by fully qualified symbol refe
 
 **Important:** The two parameter groups are **mutually exclusive** — provide either `file` + `line` + `column` OR `language` + `symbol`, not both.
 
-**Supported languages:** Java only today. Unsupported languages return an explicit error listing the currently supported symbol-reference languages.
+**Supported languages:** Java, plus Rider-backed C#/F# for tools whose current IDE/runtime exposes the shared semantic symbol lane. Unsupported languages return an explicit error listing the currently supported symbol-reference languages for the active IDE session.
 
 **Tools that support symbol references:** `ide_find_references`, `ide_find_definition`, `ide_call_hierarchy`, `ide_find_implementations`, `ide_find_super_methods`.
 
@@ -158,6 +158,8 @@ These tools work in all JetBrains IDEs (IntelliJ, PyCharm, WebStorm, GoLand, etc
 ### ide_find_references
 
 Finds all references to a symbol across the entire project using IntelliJ's semantic index.
+
+**Rider note:** Rider-backed C#/F# results are deduplicated deterministically before truncation/pagination. Source-unavailable/library-only placeholders are kept stable and sort after concrete source locations so over-limit responses remain explainable.
 
 **Use when:**
 - Locating where a method, class, variable, or field is called or accessed
@@ -235,6 +237,7 @@ Finds all references to a symbol across the entire project using IntelliJ's sema
     }
   ],
   "totalCount": 2,
+  "message": null,
   "truncated": false,
   "nextCursor": null,
   "hasMore": false,
@@ -258,6 +261,8 @@ Finds all references to a symbol across the entire project using IntelliJ's sema
 ### ide_find_definition
 
 Finds the definition/declaration location of a symbol at a given source location.
+
+**Rider note:** Rider-backed C#/F# symbol-mode definitions can resolve to `locationKind` values `source`, `metadata`, `decompiled`, or `sourceUnavailable`. Non-source outcomes include a `message` and `locationDisplayName` so callers can distinguish "resolved but not source-backed" from a hard failure.
 
 **Use when:**
 - Understanding where a method, class, variable, or field is declared
@@ -1366,6 +1371,8 @@ Retrieves the complete type hierarchy for a class or interface.
 
 Analyzes method call relationships to find callers or callees.
 
+**Rider note:** Rider-backed C#/F# caller results are ordered deterministically before truncation. When a framework-routed endpoint has no static callers, the tool returns an empty `calls` list with an explanatory `message`; this is a framework-routed static-analysis limitation, not automatic backend failure.
+
 **Use when:**
 - Tracing execution flow
 - Understanding code dependencies
@@ -1447,7 +1454,8 @@ Analyzes method call relationships to find callers or callees.
       "column": 17,
       "language": "Java"
     }
-  ]
+  ],
+  "message": null
 }
 ```
 
@@ -1898,3 +1906,18 @@ Before calling index-dependent tools, you can check the index status:
 ```
 
 If `isDumbMode` is `true`, wait and retry later.
+**Example Response (Rider metadata-backed definition):**
+
+```json
+{
+  "file": "jar://metadata/System.Web.Http/ApiController.cs",
+  "line": 1,
+  "column": 1,
+  "preview": "Rider resolved 'ApiController' through metadata. Source is unavailable in this solution; use 'System.Web.Http.ApiController' as the external declaration identity.",
+  "symbolName": "ApiController",
+  "astPath": [],
+  "message": "Rider resolved 'ApiController' through metadata. Source is unavailable in this solution; use 'System.Web.Http.ApiController' as the external declaration identity.",
+  "locationKind": "metadata",
+  "locationDisplayName": "System.Web.Http.ApiController"
+}
+```

@@ -3,6 +3,7 @@ package com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.LanguageHandlerRegistry
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.BuiltInSearchScope
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.DefinitionResult
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.UsageLocation
 import com.intellij.openapi.project.Project
 import io.mockk.every
 import io.mockk.mockk
@@ -555,6 +556,315 @@ class RiderDotNetHandlersUnitTest : TestCase() {
         }
     }
 
+    fun testFindDefinitionPreservesExplicitNonSourceLocationSemanticsForFrameworkSymbols() {
+        mockkObject(RdProtocolBridge)
+        try {
+            val project = mockk<Project>(relaxed = true)
+            val semanticTarget = Any()
+            val request = Any()
+            val model = Any()
+
+            every { RdProtocolBridge.getModel(project) } returns model
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    null,
+                    null,
+                    null,
+                    "C#",
+                    "System.Web.Http.ApiController"
+                )
+            } returns semanticTarget
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdFindDefinitionRequest",
+                    semanticTarget,
+                    false,
+                    50
+                )
+            } returns request
+            every {
+                RdProtocolBridge.invokeCall(model, "findDefinition", request)
+            } returns TestFindDefinitionResult(
+                definition = TestRdDefinition(
+                    filePath = "",
+                    line = 1,
+                    column = 1,
+                    name = "ApiController",
+                    locationKind = "metadata",
+                    locationDisplayName = "System.Web.Http.ApiController"
+                ),
+                astPath = emptyList(),
+                preview = ""
+            )
+
+            val result = RiderBackendSemanticService.findDefinition(
+                project = project,
+                file = null,
+                line = null,
+                column = null,
+                language = "C#",
+                symbol = "System.Web.Http.ApiController",
+                fullElementPreview = false,
+                maxPreviewLines = 50
+            )
+
+            assertTrue(result.handled)
+            assertNull(result.errorMessage)
+            assertNotNull(result.value)
+            assertHasGetter(
+                result.value!!,
+                "getLocationKind",
+                "DefinitionResult should expose explicit locationKind semantics so Rider framework/library definitions can return metadata/decompiled/source-unavailable results instead of generic failure"
+            )
+            assertHasGetter(
+                result.value!!,
+                "getLocationDisplayName",
+                "DefinitionResult should expose a human-meaningful non-source location label for Rider framework/library definitions"
+            )
+        } finally {
+            unmockkObject(RdProtocolBridge)
+        }
+    }
+
+    fun testFindReferencesDeduplicatesSourceUnavailableRowsDeterministically() {
+        mockkObject(RdProtocolBridge)
+        try {
+            val project = mockk<Project>(relaxed = true)
+            val semanticTarget = Any()
+            val request = Any()
+            val model = Any()
+
+            every { RdProtocolBridge.getModel(project) } returns model
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    null,
+                    null,
+                    null,
+                    "C#",
+                    "Demo.Service#Run()"
+                )
+            } returns semanticTarget
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdFindReferencesRequest",
+                    semanticTarget,
+                    BuiltInSearchScope.PROJECT_AND_LIBRARIES.wireValue,
+                    10
+                )
+            } returns request
+            every {
+                RdProtocolBridge.invokeCallResult(model, "findReferences", request)
+            } returns RdCallOutcome.Success(
+                TestFindReferencesResult(
+                    references = listOf(
+                        TestRdReference(filePath = "", line = 0, column = 0, context = "ApiController", kind = "reference"),
+                        TestRdReference(filePath = "", line = 20, column = 4, context = "Run()", kind = "method_call"),
+                        TestRdReference(filePath = "", line = 2, column = 1, context = "Run()", kind = "method_call"),
+                        TestRdReference(filePath = "", line = 0, column = 0, context = "ApiController", kind = "reference")
+                    )
+                )
+            )
+
+            val result = RiderBackendSemanticService.findReferences(
+                project = project,
+                file = null,
+                line = null,
+                column = null,
+                language = "C#",
+                symbol = "Demo.Service#Run()",
+                scope = BuiltInSearchScope.PROJECT_AND_LIBRARIES,
+                limit = 10
+            )
+
+            assertTrue(result.handled)
+            assertNull(result.errorMessage)
+            assertEquals(
+                "Rider reference rows should collapse duplicates deterministically and keep source-unavailable placeholders stable instead of echoing backend order.",
+                listOf(
+                    UsageLocation(file = "", line = 2, column = 1, context = "Run()", type = "method_call", astPath = emptyList()),
+                    UsageLocation(file = "", line = 20, column = 4, context = "Run()", type = "method_call", astPath = emptyList()),
+                    UsageLocation(file = "", line = 0, column = 0, context = "ApiController", type = "reference", astPath = emptyList())
+                ),
+                result.value
+            )
+        } finally {
+            unmockkObject(RdProtocolBridge)
+        }
+    }
+
+    fun testGetCallHierarchyAppliesDeterministicOrderingBeforeLimit() {
+        mockkObject(RdProtocolBridge)
+        try {
+            val project = mockk<Project>()
+            val semanticTarget = Any()
+            val request = Any()
+            val model = Any()
+
+            every { RdProtocolBridge.getModel(project) } returns model
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    null,
+                    null,
+                    null,
+                    "C#",
+                    "Demo.Service#Run()"
+                )
+            } returns semanticTarget
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdCallHierarchyRequest",
+                    semanticTarget,
+                    "callers",
+                    1,
+                    BuiltInSearchScope.PROJECT_AND_LIBRARIES.wireValue,
+                    20
+                )
+            } returns request
+            every {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", request)
+            } returns RdCallOutcome.Success(
+                TestCallHierarchyResult(
+                    root = TestRdSymbol(
+                        name = "Run",
+                        qualifiedName = "Demo.Service.Run",
+                        kind = "METHOD",
+                        filePath = "src/Service.cs",
+                        line = 12,
+                        column = 9,
+                        containerName = "Demo.Service"
+                    ),
+                    calls = (21 downTo 1).flatMap { index ->
+                        listOf(
+                            TestRdSymbol(
+                                name = "Caller${index.toString().padStart(2, '0')}",
+                                qualifiedName = "Demo.Caller${index.toString().padStart(2, '0')}.Invoke",
+                                kind = "METHOD",
+                                filePath = if (index == 21) "" else "src/Caller${index.toString().padStart(2, '0')}.cs",
+                                line = index,
+                                column = 1,
+                                containerName = "Demo.Caller${index.toString().padStart(2, '0')}"
+                            ),
+                            TestRdSymbol(
+                                name = "Caller${index.toString().padStart(2, '0')}",
+                                qualifiedName = "Demo.Caller${index.toString().padStart(2, '0')}.Invoke",
+                                kind = "METHOD",
+                                filePath = if (index == 21) "" else "src/Caller${index.toString().padStart(2, '0')}.cs",
+                                line = index,
+                                column = 1,
+                                containerName = "Demo.Caller${index.toString().padStart(2, '0')}"
+                            )
+                        )
+                    }
+                )
+            )
+
+            val result = RiderBackendSemanticService.getCallHierarchy(
+                project = project,
+                file = null,
+                line = null,
+                column = null,
+                language = "C#",
+                symbol = "Demo.Service#Run()",
+                direction = "callers",
+                depth = 1,
+                scope = BuiltInSearchScope.PROJECT_AND_LIBRARIES
+            )
+
+            assertTrue(result.handled)
+            assertNull(result.errorMessage)
+            val calls = result.value?.calls.orEmpty()
+            assertEquals("Rider call hierarchy should clamp to the public 20-result budget after deduplication.", 20, calls.size)
+            assertEquals(
+                "Rider call hierarchy should deduplicate repeated callers and order them deterministically before truncating, even when backend rows arrive in reverse order or include source-unavailable placeholders.",
+                (1..20).map { "Caller${it.toString().padStart(2, '0')}" },
+                calls.map { it.name }
+            )
+        } finally {
+            unmockkObject(RdProtocolBridge)
+        }
+    }
+
+    fun testGetCallHierarchyUsesSemanticSymbolTargetWithoutSourcePositionRewrite() {
+        mockkObject(RdProtocolBridge)
+        try {
+            val project = mockk<Project>()
+            val semanticTarget = Any()
+            val request = Any()
+            val model = Any()
+
+            every { RdProtocolBridge.getModel(project) } returns model
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    null,
+                    null,
+                    null,
+                    "C#",
+                    "Demo.ReadOnlyBaselineService#Run(System.String)"
+                )
+            } returns semanticTarget
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdCallHierarchyRequest",
+                    semanticTarget,
+                    "callers",
+                    3,
+                    BuiltInSearchScope.PROJECT_FILES.wireValue,
+                    20
+                )
+            } returns request
+            every {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", request)
+            } returns RdCallOutcome.Success(
+                TestCallHierarchyResult(
+                    root = TestRdSymbol(
+                        name = "Run",
+                        qualifiedName = "Demo.ReadOnlyBaselineService.Run",
+                        kind = "METHOD",
+                        filePath = "src/Service.cs",
+                        line = 12,
+                        column = 19,
+                        containerName = "Demo.ReadOnlyBaselineService"
+                    ),
+                    calls = listOf(
+                        TestRdSymbol(
+                            name = "HandleRequest",
+                            qualifiedName = "Demo.Consumer.HandleRequest",
+                            kind = "METHOD",
+                            filePath = "src/Consumer.cs",
+                            line = 21,
+                            column = 13,
+                            containerName = "Demo.Consumer"
+                        )
+                    )
+                )
+            )
+
+            val result = RiderBackendSemanticService.getCallHierarchy(
+                project = project,
+                file = null,
+                line = null,
+                column = null,
+                language = "C#",
+                symbol = "Demo.ReadOnlyBaselineService#Run(System.String)",
+                direction = "callers",
+                depth = 3,
+                scope = BuiltInSearchScope.PROJECT_FILES
+            )
+
+            assertTrue(result.handled)
+            assertNull(result.errorMessage)
+            assertNotNull(result.value)
+            assertEquals("Run", result.value?.element?.name)
+            assertEquals("src/Consumer.cs", result.value?.calls?.singleOrNull()?.file)
+        } finally {
+            unmockkObject(RdProtocolBridge)
+        }
+    }
+
     fun testSemanticTargetPrefersPositionWhenDualModeInputIsComplete() {
         val projectRoot = createTempDir(prefix = "rider-semantic-target-")
         val sourceFile = File(projectRoot, "src/Service.cs").apply {
@@ -626,6 +936,25 @@ class RiderDotNetHandlersUnitTest : TestCase() {
         assertNull(rdProperty(target, "column"))
         assertEquals("C#", rdProperty(target, "language"))
         assertEquals("Demo.Service#Run()", rdProperty(target, "symbol"))
+    }
+
+    fun testSemanticTargetFailsClosedForUnresolvablePositionOnlyInput() {
+        val project = mockk<Project>()
+        every { project.basePath } returns null
+
+        val target = invokeCreateSemanticTarget(
+            project = project,
+            file = "jar://metadata/System.Web.Http/ApiController.cs",
+            line = 27,
+            column = 9,
+            language = null,
+            symbol = null
+        )
+
+        assertNull(
+            "Dependency-backed/source-less Rider C# position targets should fail closed until the bridge can map them explicitly instead of emitting a malformed semantic target with a null backend file path.",
+            target
+        )
     }
 
     // ── Regression Tests for Deterministic C#/F# Symbol Parsing ──────────────────
@@ -775,6 +1104,17 @@ class RiderDotNetHandlersUnitTest : TestCase() {
 
     private data class TestFindTypesResult(val types: List<TestRdSymbol>)
 
+    private data class TestFindReferencesResult(val references: List<TestRdReference>)
+
+    private data class TestRdReference(
+        val filePath: String,
+        val line: Int,
+        val column: Int,
+        val context: String,
+        val kind: String,
+        val astPath: List<String> = emptyList()
+    )
+
     private data class TestRdSymbol(
         val name: String,
         val qualifiedName: String?,
@@ -791,11 +1131,18 @@ class RiderDotNetHandlersUnitTest : TestCase() {
         val preview: String
     )
 
+    private data class TestCallHierarchyResult(
+        val root: TestRdSymbol,
+        val calls: List<TestRdSymbol>
+    )
+
     private data class TestRdDefinition(
         val filePath: String,
         val line: Int,
         val column: Int,
-        val name: String
+        val name: String,
+        val locationKind: String? = null,
+        val locationDisplayName: String? = null
     )
 
     private fun requireRdStruct(simpleName: String, vararg args: Any?): Any {
@@ -827,4 +1174,8 @@ class RiderDotNetHandlersUnitTest : TestCase() {
     }
 
     private fun rdProperty(instance: Any, name: String): Any? = RdProtocolBridge.getProperty(instance, name)
+
+    private fun assertHasGetter(instance: Any, getterName: String, message: String) {
+        assertTrue(message, instance.javaClass.methods.any { it.name == getterName })
+    }
 }
