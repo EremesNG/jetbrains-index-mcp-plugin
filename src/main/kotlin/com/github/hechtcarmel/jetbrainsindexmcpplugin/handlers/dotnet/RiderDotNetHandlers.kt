@@ -897,14 +897,25 @@ private fun Boolean.thenUnsupportedCallHierarchy(): String? =
 private val CSHARP_EXTENSIONS = setOf("cs", "csx")
 private val FSHARP_EXTENSIONS = setOf("fs", "fsi", "fsx")
 internal const val CSHARP_CANONICAL_LANGUAGE_ID = "C#"
+internal const val FSHARP_CANONICAL_LANGUAGE_ID = "F#"
 private val CSHARP_LANGUAGE_IDS = setOf("C#", "CSHARP", "CSharp")
 private val FSHARP_LANGUAGE_IDS = setOf("F#", "FSHARP", "FSharp")
 internal const val IMPLEMENTATIONS_RESULT_LIMIT = PaginationService.DEFAULT_OVERCOLLECT
 internal const val CALL_HIERARCHY_RESULT_LIMIT = 20
+internal const val CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT = 5
+
+internal fun normalizeAcceptedRiderLanguageAlias(language: String?): String? =
+    language?.takeIf { it.isNotBlank() }?.let {
+        when {
+            isAcceptedLanguageAlias(it, CSHARP_LANGUAGE_IDS) -> CSHARP_CANONICAL_LANGUAGE_ID
+            isAcceptedLanguageAlias(it, FSHARP_LANGUAGE_IDS) -> FSHARP_CANONICAL_LANGUAGE_ID
+            else -> it
+        }
+    }
 
 internal fun normalizeAcceptedCSharpAlias(language: String?): String? =
-    language?.takeIf { it.isNotBlank() }?.let {
-        if (isAcceptedLanguageAlias(it, CSHARP_LANGUAGE_IDS)) CSHARP_CANONICAL_LANGUAGE_ID else it
+    normalizeAcceptedRiderLanguageAlias(language)?.let {
+        if (it == CSHARP_CANONICAL_LANGUAGE_ID) it else language?.takeIf(String::isNotBlank)
     }
 
 private fun isAcceptedLanguageAlias(language: String, aliases: Set<String>): Boolean =
@@ -1020,6 +1031,7 @@ private fun invokeSemanticCallHierarchy(
     symbolTarget: Boolean,
     displayLanguage: String = "C#"
 ): RiderBackendResponse<CallHierarchyData> {
+    val shouldBoundCallerExpansion = direction.equals("callers", ignoreCase = true) && depth > 1
     val request = RdProtocolBridge.createStruct(
         "$MODEL_PKG.RdCallHierarchyRequest",
         target,
@@ -1056,12 +1068,25 @@ private fun invokeSemanticCallHierarchy(
     @Suppress("UNCHECKED_CAST")
     val calls = (RdProtocolBridge.getProperty(result, "calls") as? List<Any>) ?: emptyList()
     val seen = mutableSetOf<String>()
-    val convertedCalls = calls.mapNotNull { rdSymbolToCallElementData(it, displayLanguage) }
+    val expansionState = RiderCallHierarchyExpansionState()
+    val distinctCalls = calls.mapNotNull { rdSymbolToCallElementData(it, displayLanguage) }
         .sortedCallElements()
         .filter { seen.add(callHierarchyKey(it)) }
         .take(CALL_HIERARCHY_RESULT_LIMIT)
-        .map { expandSemanticCallHierarchy(model, it, direction, depth - 1, scope, seen, displayLanguage) }
-    val message = RdProtocolBridge.getProperty(result, "message") as? String
+    val convertedCalls = distinctCalls.mapIndexed { index, call ->
+        when {
+            depth <= 1 -> call.copy(children = emptyList())
+            shouldBoundCallerExpansion && index >= CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT -> {
+                expansionState.truncated = true
+                call.copy(children = emptyList())
+            }
+            else -> expandSemanticCallHierarchy(model, call, direction, depth - 1, scope, seen, displayLanguage, expansionState)
+        }
+    }
+    val message = mergeCallHierarchyMessages(
+        RdProtocolBridge.getProperty(result, "message") as? String,
+        expansionState.noteOrNull()
+    )
 
     return RiderBackendResponse(
         handled = true,
@@ -1077,7 +1102,8 @@ private fun expandSemanticCallHierarchy(
     remainingDepth: Int,
     scope: BuiltInSearchScope,
     seen: MutableSet<String>,
-    displayLanguage: String
+    displayLanguage: String,
+    expansionState: RiderCallHierarchyExpansionState
 ): CallElementData {
     if (remainingDepth <= 0) return call.copy(children = emptyList())
 
@@ -1098,12 +1124,54 @@ private fun expandSemanticCallHierarchy(
 
     @Suppress("UNCHECKED_CAST")
     val children = (RdProtocolBridge.getProperty(result, "calls") as? List<Any>) ?: emptyList()
-    val convertedChildren = children.mapNotNull { rdSymbolToCallElementData(it, displayLanguage) }
+    val orderedChildren = children.mapNotNull { rdSymbolToCallElementData(it, displayLanguage) }
         .sortedCallElements()
         .filter { seen.add(callHierarchyKey(it)) }
         .take(CALL_HIERARCHY_RESULT_LIMIT)
-        .map { expandSemanticCallHierarchy(model, it, direction, remainingDepth - 1, scope, seen, displayLanguage) }
+    val convertedChildren = when {
+        direction.equals("callers", ignoreCase = true) -> {
+            val boundedChildren = boundExpandedCallerChildren(orderedChildren, expansionState)
+            if (remainingDepth == 1) {
+                boundedChildren.map { it.copy(children = emptyList()) }
+            } else {
+                boundedChildren.map { child ->
+                    expandSemanticCallHierarchy(model, child, direction, remainingDepth - 1, scope, seen, displayLanguage, expansionState)
+                }
+            }
+        }
+        remainingDepth == 1 -> orderedChildren.map { it.copy(children = emptyList()) }
+        else -> orderedChildren.map {
+            expandSemanticCallHierarchy(model, it, direction, remainingDepth - 1, scope, seen, displayLanguage, expansionState)
+        }
+    }
     return call.copy(children = convertedChildren)
+}
+
+private fun boundExpandedCallerChildren(
+    children: List<CallElementData>,
+    expansionState: RiderCallHierarchyExpansionState? = null
+): List<CallElementData> {
+    if (children.size > CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT) {
+        expansionState?.truncated = true
+    }
+    return children.take(CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT)
+}
+
+private data class RiderCallHierarchyExpansionState(
+    var truncated: Boolean = false
+) {
+    fun noteOrNull(): String? =
+        if (truncated) {
+            "Partial callers expansion: Rider recursively expands only the first $CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT children per node to keep backend requests bounded."
+        } else {
+            null
+        }
+}
+
+private fun mergeCallHierarchyMessages(primary: String?, secondary: String?): String? = when {
+    primary.isNullOrBlank() -> secondary
+    secondary.isNullOrBlank() -> primary
+    else -> "$primary $secondary"
 }
 
 private fun callHierarchyKey(call: CallElementData): String =
@@ -1354,7 +1422,10 @@ abstract class RiderCallHierarchyHandler(
             .filter { seen.add(callKey(it)) }
             .take(CALL_HIERARCHY_RESULT_LIMIT)
             .map { call ->
-                expandCallHierarchy(project, call, direction, depth - 1, scope, seen)
+                when {
+                    depth <= 1 -> call.copy(children = emptyList())
+                    else -> expandCallHierarchy(project, call, direction, depth - 1, scope, seen)
+                }
             }
 
         return CallHierarchyData(
@@ -1386,10 +1457,20 @@ abstract class RiderCallHierarchyHandler(
         val result = invokeCallHierarchy(model, request) ?: return call.copy(children = emptyList())
         @Suppress("UNCHECKED_CAST")
         val children = (RdProtocolBridge.getProperty(result, "calls") as? List<Any>) ?: emptyList()
-        val convertedChildren = children.mapNotNull { rdSymbolToCallElementData(it, displayLanguage) }
+        val orderedChildren = children.mapNotNull { rdSymbolToCallElementData(it, displayLanguage) }
             .filter { seen.add(callKey(it)) }
             .take(CALL_HIERARCHY_RESULT_LIMIT)
-            .map { child -> expandCallHierarchy(project, child, direction, remainingDepth - 1, scope, seen) }
+        val convertedChildren = when {
+            direction.equals("callers", ignoreCase = true) -> {
+                if (remainingDepth == 1) {
+                    orderedChildren.map { it.copy(children = emptyList()) }
+                } else {
+                    orderedChildren.map { child -> expandCallHierarchy(project, child, direction, remainingDepth - 1, scope, seen) }
+                }
+            }
+            remainingDepth == 1 -> orderedChildren.map { it.copy(children = emptyList()) }
+            else -> orderedChildren.map { child -> expandCallHierarchy(project, child, direction, remainingDepth - 1, scope, seen) }
+        }
         return call.copy(children = convertedChildren)
     }
 
@@ -1480,6 +1561,20 @@ internal object RiderSymbolParser {
                 normalizedSymbol = normalizedSymbol
             )
         )
+    }
+
+    internal fun callHierarchyCallableGuidance(languageName: String, symbol: String): String? {
+        val parsed = parse(languageName, symbol).getOrElse { return it.message ?: "Invalid Rider symbol format." }
+        if (parsed.memberName != null) return null
+
+        val normalizedSymbol = symbol.trim()
+        val dottedCallableSuggestion = suggestCallableHashSyntax(normalizedSymbol)
+        return if (dottedCallableSuggestion != null) {
+            "Rider $languageName call hierarchy needs a callable symbol. '$normalizedSymbol' looks like dotted member syntax; use '$dottedCallableSuggestion' instead."
+        } else {
+            val examples = symbolExamples(languageName).drop(1).joinToString(" or ")
+            "Rider $languageName call hierarchy needs a callable symbol. Use $examples."
+        }
     }
 
     private data class ParsedMember(val memberName: String, val parameterTypes: List<String>?, val isConstructor: Boolean)
@@ -1593,6 +1688,18 @@ internal object RiderSymbolParser {
             }
         }
         return result.toString()
+    }
+
+    private fun suggestCallableHashSyntax(symbol: String): String? {
+        if ('#' in symbol || '(' in symbol || ')' in symbol) return null
+        val normalized = normalizeQualifiedName(symbol)
+        if (normalized.count { it == '.' } < 2) return null
+        val separatorIndex = normalized.lastIndexOf('.')
+        if (separatorIndex <= 0 || separatorIndex == normalized.lastIndex) return null
+        val container = normalized.substring(0, separatorIndex)
+        val member = normalized.substring(separatorIndex + 1)
+        if (member.isBlank()) return null
+        return "$container#$member"
     }
 }
 

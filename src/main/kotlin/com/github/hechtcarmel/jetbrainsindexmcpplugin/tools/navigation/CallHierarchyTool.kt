@@ -8,7 +8,9 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.CallElementData
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.LanguageHandlerRegistry
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RIDER_CALL_HIERARCHY_SYMBOL_MODE_UNSUPPORTED
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderBackendSemanticService
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderSymbolParser
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderBackendTimeoutException
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.normalizeAcceptedRiderLanguageAlias
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.models.ToolCallResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.AbstractMcpTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.CallElement
@@ -71,13 +73,19 @@ class CallHierarchyTool : AbstractMcpTool() {
         internal fun noCallableMessage(isSymbolMode: Boolean): String =
             if (isSymbolMode) "No method/function found for the specified symbol"
             else "No method/function found at position"
+
+        internal fun riderSymbolValidationMessage(language: String?, symbol: String?): String? {
+            if (language == null || symbol == null) return null
+            return RiderSymbolParser.callHierarchyCallableGuidance(language, symbol)
+        }
     }
 
     override suspend fun doExecute(project: Project, arguments: JsonObject): ToolCallResult {
         val requestedLanguage = optionalStringArg(arguments, ParamNames.LANGUAGE)
+        val normalizedRequestedLanguage = normalizeAcceptedRiderLanguageAlias(requestedLanguage)
         val requestedSymbol = optionalStringArg(arguments, ParamNames.SYMBOL)
         val isRiderSymbolMode = resolveLookupMode(arguments) == LookupModeState.SYMBOL &&
-            requestedLanguage in setOf("C#", "F#") &&
+            normalizedRequestedLanguage in setOf("C#", "F#") &&
             requestedSymbol != null
         val direction = arguments["direction"]?.jsonPrimitive?.content
             ?: return createErrorResult("Missing required parameter: direction")
@@ -100,12 +108,15 @@ class CallHierarchyTool : AbstractMcpTool() {
             ProgressManager.checkCanceled() // Allow cancellation
 
             if (isRiderSymbolMode) {
+                riderSymbolValidationMessage(normalizedRequestedLanguage, requestedSymbol)?.let {
+                    return@suspendingReadAction createErrorResult(it)
+                }
                 val riderHierarchy = RiderBackendSemanticService.getCallHierarchy(
                     project = project,
                     file = optionalStringArg(arguments, ParamNames.FILE),
                     line = optionalIntArg(arguments, ParamNames.LINE),
                     column = optionalIntArg(arguments, ParamNames.COLUMN),
-                    language = requestedLanguage,
+                    language = normalizedRequestedLanguage,
                     symbol = requestedSymbol,
                     direction = direction,
                     depth = depth,

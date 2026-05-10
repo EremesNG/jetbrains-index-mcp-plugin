@@ -117,6 +117,20 @@ class RiderSymbolRoutingUnitTest : TestCase() {
         )
     }
 
+    fun testCallHierarchyNormalizesRiderLanguageAliasesBeforeEarlySymbolRouting() {
+        val source = navigationSource("CallHierarchyTool.kt")
+
+        assertContains(
+            source,
+            "normalizeAcceptedRiderLanguageAlias(requestedLanguage)",
+            "CallHierarchyTool should normalize Rider language aliases before deciding whether C#/F# symbol-mode validation/backend routing applies"
+        )
+        assertFalse(
+            "CallHierarchyTool should not hardcode only canonical Rider language ids for early symbol-mode routing",
+            source.contains("requestedLanguage in setOf(\"C#\", \"F#\")")
+        )
+    }
+
     fun testCallHierarchyDescriptionMakesRiderCallerScopeSemanticsExplicit() {
         val description = CallHierarchyTool().description
 

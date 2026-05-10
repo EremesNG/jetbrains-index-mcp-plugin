@@ -5,6 +5,20 @@ import junit.framework.TestCase
 
 class CallHierarchyToolRiderTimeoutTest : TestCase() {
 
+    fun testRiderSymbolModeValidationRejectsDottedCSharpMemberWithGuidance() {
+        val message = CallHierarchyTool.riderSymbolValidationMessage("C#", "Demo.Service.Run")
+
+        assertNotNull(message)
+        val text = message ?: return
+        assertTrue(text.contains("Demo.Service#Run"))
+        assertTrue(text.contains("#"))
+    }
+
+    fun testRiderSymbolModeValidationAllowsCallableCSharpHashSyntax() {
+        assertNull(CallHierarchyTool.riderSymbolValidationMessage("C#", "Demo.Service#Run"))
+        assertNull(CallHierarchyTool.riderSymbolValidationMessage("C#", "Demo.Service#Run(System.String)"))
+    }
+
     fun testTimeoutMessageIsExplicitAndNotNoMethodFallback() {
         val timeout = RiderBackendTimeoutException(
             callName = "getCallHierarchy",

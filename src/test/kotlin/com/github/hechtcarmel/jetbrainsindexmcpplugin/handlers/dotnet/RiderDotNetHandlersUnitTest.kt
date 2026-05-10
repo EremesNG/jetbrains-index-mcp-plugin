@@ -4,11 +4,19 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.LanguageHandlerRe
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.BuiltInSearchScope
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.DefinitionResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.UsageLocation
+import com.intellij.openapi.editor.Document
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.psi.PsiDocumentManager
+import com.intellij.psi.PsiElement
+import com.intellij.psi.PsiFile
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkObject
+import io.mockk.mockkStatic
 import io.mockk.unmockkObject
+import io.mockk.unmockkStatic
+import io.mockk.verify
 import junit.framework.TestCase
 import java.io.File
 
@@ -129,6 +137,15 @@ class RiderDotNetHandlersUnitTest : TestCase() {
 
         assertNotNull(failure)
         assertTrue(failure is IllegalArgumentException)
+    }
+
+    fun testParserBuildsCallableGuidanceForDottedCSharpMemberSyntax() {
+        val message = RiderSymbolParser.callHierarchyCallableGuidance("C#", "Demo.Service.Run")
+
+        assertNotNull(message)
+        val text = message ?: return
+        assertTrue(text.contains("Demo.Service#Run"))
+        assertTrue(text.contains("call hierarchy"))
     }
 
     fun testRiderRequestLimitsMatchBridgeConstants() {
@@ -865,6 +882,409 @@ class RiderDotNetHandlersUnitTest : TestCase() {
         }
     }
 
+    fun testGetCallHierarchyDepthOneDoesNotRecursivelyExpandChildren() {
+        mockkObject(RdProtocolBridge)
+        try {
+            val project = mockk<Project>()
+            val model = Any()
+
+            every { RdProtocolBridge.getModel(project) } returns model
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestSemanticTarget(
+                    filePath = payload[0] as String?,
+                    line = payload[1] as Int?,
+                    column = payload[2] as Int?,
+                    language = payload[3] as String?,
+                    symbol = payload[4] as String?
+                )
+            }
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdCallHierarchyRequest",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestCallHierarchyRequest(
+                    target = payload[0] as TestSemanticTarget,
+                    direction = payload[1] as String,
+                    depth = payload[2] as Int,
+                    scope = payload[3] as String,
+                    limit = payload[4] as Int
+                )
+            }
+            every {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", any())
+            } answers {
+                RdCallOutcome.Success(callHierarchyResultFor(arg(2) as TestCallHierarchyRequest))
+            }
+
+            val result = RiderBackendSemanticService.getCallHierarchy(
+                project = project,
+                file = null,
+                line = null,
+                column = null,
+                language = "C#",
+                symbol = "Demo.Service#Run()",
+                direction = "callers",
+                depth = 1,
+                scope = BuiltInSearchScope.PROJECT_FILES
+            )
+
+            assertTrue(result.handled)
+            assertNull(result.errorMessage)
+            assertNull(result.message)
+            assertEquals(CALL_HIERARCHY_RESULT_LIMIT, result.value?.calls?.size)
+            assertTrue(result.value?.calls.orEmpty().all { it.children.isNullOrEmpty() })
+            verify(exactly = 1) {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", any())
+            }
+        } finally {
+            unmockkObject(RdProtocolBridge)
+        }
+    }
+
+    fun testGetCallHierarchyDepthTwoExpandsOneAdditionalCallerLevelWithoutGrandchildren() {
+        mockkObject(RdProtocolBridge)
+        try {
+            val project = mockk<Project>()
+            val model = Any()
+
+            every { RdProtocolBridge.getModel(project) } returns model
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestSemanticTarget(
+                    filePath = payload[0] as String?,
+                    line = payload[1] as Int?,
+                    column = payload[2] as Int?,
+                    language = payload[3] as String?,
+                    symbol = payload[4] as String?
+                )
+            }
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdCallHierarchyRequest",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestCallHierarchyRequest(
+                    target = payload[0] as TestSemanticTarget,
+                    direction = payload[1] as String,
+                    depth = payload[2] as Int,
+                    scope = payload[3] as String,
+                    limit = payload[4] as Int
+                )
+            }
+            every {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", any())
+            } answers {
+                RdCallOutcome.Success(callHierarchyResultFor(arg(2) as TestCallHierarchyRequest))
+            }
+
+            val result = RiderBackendSemanticService.getCallHierarchy(
+                project = project,
+                file = null,
+                line = null,
+                column = null,
+                language = "C#",
+                symbol = "Demo.Service#Run()",
+                direction = "callers",
+                depth = 2,
+                scope = BuiltInSearchScope.PROJECT_FILES
+            )
+
+            assertTrue(result.handled)
+            assertNull(result.errorMessage)
+            assertTrue(result.message?.contains("partial", ignoreCase = true) == true)
+            val rootCalls = result.value?.calls.orEmpty()
+            assertEquals(CALL_HIERARCHY_RESULT_LIMIT, rootCalls.size)
+            val expandedRootCalls = rootCalls.take(CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT)
+            assertTrue(expandedRootCalls.all { it.children?.size == CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT })
+            assertTrue(expandedRootCalls.flatMap { it.children.orEmpty() }.all { it.children.isNullOrEmpty() })
+            assertTrue(rootCalls.drop(CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT).all { it.children.isNullOrEmpty() })
+        } finally {
+            unmockkObject(RdProtocolBridge)
+        }
+    }
+
+    fun testPositionModeCallerExpansionDepthTwoDoesNotSilentlyApplySemanticPartialCap() {
+        mockkObject(RdProtocolBridge)
+        mockkStatic(PsiDocumentManager::class)
+        try {
+            val project = mockk<Project>()
+            val model = Any()
+            val handler = RiderCSharpCallHierarchyHandler()
+            val element = mockk<PsiElement>()
+            val psiFile = mockk<PsiFile>()
+            val virtualFile = mockk<VirtualFile>()
+            val document = mockk<Document>()
+            val manager = mockk<PsiDocumentManager>()
+
+            every { element.containingFile } returns psiFile
+            every { element.textOffset } returns 0
+            every { psiFile.virtualFile } returns virtualFile
+            every { virtualFile.path } returns "src/Service.cs"
+            every { PsiDocumentManager.getInstance(project) } returns manager
+            every { manager.getDocument(psiFile) } returns document
+            every { document.getLineNumber(0) } returns 0
+            every { document.getLineStartOffset(0) } returns 0
+
+            every { RdProtocolBridge.getModel(project) } returns model
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestSemanticTarget(
+                    filePath = payload[0] as String?,
+                    line = payload[1] as Int?,
+                    column = payload[2] as Int?,
+                    language = payload[3] as String?,
+                    symbol = payload[4] as String?
+                )
+            }
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdCallHierarchyRequest",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestCallHierarchyRequest(
+                    target = payload[0] as TestSemanticTarget,
+                    direction = payload[1] as String,
+                    depth = payload[2] as Int,
+                    scope = payload[3] as String,
+                    limit = payload[4] as Int
+                )
+            }
+            every {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", any())
+            } answers {
+                RdCallOutcome.Success(callHierarchyResultFor(arg(2) as TestCallHierarchyRequest))
+            }
+
+            val result = handler.getCallHierarchy(
+                element = element,
+                project = project,
+                direction = "callers",
+                depth = 2,
+                scope = BuiltInSearchScope.PROJECT_FILES
+            )
+
+            val rootCalls = result?.calls.orEmpty()
+            assertEquals(CALL_HIERARCHY_RESULT_LIMIT, rootCalls.size)
+            assertTrue(rootCalls.all { it.children?.size == CALL_HIERARCHY_RESULT_LIMIT })
+            assertTrue(rootCalls.flatMap { it.children.orEmpty() }.all { it.children.isNullOrEmpty() })
+            verify(exactly = 1 + CALL_HIERARCHY_RESULT_LIMIT) {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", any())
+            }
+        } finally {
+            unmockkStatic(PsiDocumentManager::class)
+            unmockkObject(RdProtocolBridge)
+        }
+    }
+
+    fun testGetCallHierarchyDoesNotTruncateCalleesExpansionAtPerNodeCallerLimit() {
+        mockkObject(RdProtocolBridge)
+        try {
+            val project = mockk<Project>()
+            val model = Any()
+
+            every { RdProtocolBridge.getModel(project) } returns model
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestSemanticTarget(
+                    filePath = payload[0] as String?,
+                    line = payload[1] as Int?,
+                    column = payload[2] as Int?,
+                    language = payload[3] as String?,
+                    symbol = payload[4] as String?
+                )
+            }
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdCallHierarchyRequest",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestCallHierarchyRequest(
+                    target = payload[0] as TestSemanticTarget,
+                    direction = payload[1] as String,
+                    depth = payload[2] as Int,
+                    scope = payload[3] as String,
+                    limit = payload[4] as Int
+                )
+            }
+            every {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", any())
+            } answers {
+                RdCallOutcome.Success(callHierarchyResultFor(arg(2) as TestCallHierarchyRequest))
+            }
+
+            val result = RiderBackendSemanticService.getCallHierarchy(
+                project = project,
+                file = null,
+                line = null,
+                column = null,
+                language = "C#",
+                symbol = "Demo.Service#Run()",
+                direction = "callees",
+                depth = 2,
+                scope = BuiltInSearchScope.PROJECT_FILES
+            )
+
+            assertTrue(result.handled)
+            assertNull(result.errorMessage)
+            assertNull(result.message)
+            val rootCalls = result.value?.calls.orEmpty()
+            assertEquals(CALL_HIERARCHY_RESULT_LIMIT, rootCalls.size)
+            assertTrue(rootCalls.all { it.children?.size == CALL_HIERARCHY_RESULT_LIMIT })
+            assertTrue(rootCalls.flatMap { it.children.orEmpty() }.all { it.children.isNullOrEmpty() })
+            verify(exactly = 1 + CALL_HIERARCHY_RESULT_LIMIT) {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", any())
+            }
+        } finally {
+            unmockkObject(RdProtocolBridge)
+        }
+    }
+
+    fun testGetCallHierarchyBoundsRecursiveCallerExpansionPerNodeAndAnnotatesPartialResults() {
+        mockkObject(RdProtocolBridge)
+        try {
+            val project = mockk<Project>()
+            val model = Any()
+
+            every { RdProtocolBridge.getModel(project) } returns model
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdSemanticTarget",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestSemanticTarget(
+                    filePath = payload[0] as String?,
+                    line = payload[1] as Int?,
+                    column = payload[2] as Int?,
+                    language = payload[3] as String?,
+                    symbol = payload[4] as String?
+                )
+            }
+            every {
+                RdProtocolBridge.createStruct(
+                    "$MODEL_PKG.RdCallHierarchyRequest",
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } answers {
+                val payload = secondArg<Array<out Any?>>()
+                TestCallHierarchyRequest(
+                    target = payload[0] as TestSemanticTarget,
+                    direction = payload[1] as String,
+                    depth = payload[2] as Int,
+                    scope = payload[3] as String,
+                    limit = payload[4] as Int
+                )
+            }
+            every {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", any())
+            } answers {
+                RdCallOutcome.Success(callHierarchyResultFor(arg(2) as TestCallHierarchyRequest))
+            }
+
+            val result = RiderBackendSemanticService.getCallHierarchy(
+                project = project,
+                file = null,
+                line = null,
+                column = null,
+                language = "C#",
+                symbol = "Demo.Service#Run()",
+                direction = "callers",
+                depth = 3,
+                scope = BuiltInSearchScope.PROJECT_FILES
+            )
+
+            assertTrue(result.handled)
+            assertNull(result.errorMessage)
+            assertTrue(result.message?.contains("partial", ignoreCase = true) == true)
+            verify(exactly = 1 + CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT + (CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT * CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT)) {
+                RdProtocolBridge.invokeCallResult(model, "getCallHierarchy", any())
+            }
+            val rootCalls = result.value?.calls.orEmpty()
+            assertEquals(CALL_HIERARCHY_RESULT_LIMIT, rootCalls.size)
+            assertEquals(CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT, rootCalls.count { !it.children.isNullOrEmpty() })
+            assertTrue(rootCalls.take(CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT).all { it.children?.size == CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT })
+            assertTrue(
+                rootCalls.take(CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT)
+                    .flatMap { it.children.orEmpty() }
+                    .all { it.children.isNullOrEmpty() }
+            )
+            assertTrue(rootCalls.drop(CALL_HIERARCHY_EXPANDED_CHILDREN_PER_NODE_LIMIT).all { it.children.isNullOrEmpty() })
+        } finally {
+            unmockkObject(RdProtocolBridge)
+        }
+    }
+
     fun testSemanticTargetPrefersPositionWhenDualModeInputIsComplete() {
         val projectRoot = createTempDir(prefix = "rider-semantic-target-")
         val sourceFile = File(projectRoot, "src/Service.cs").apply {
@@ -1136,6 +1556,22 @@ class RiderDotNetHandlersUnitTest : TestCase() {
         val calls: List<TestRdSymbol>
     )
 
+    private data class TestSemanticTarget(
+        val filePath: String?,
+        val line: Int?,
+        val column: Int?,
+        val language: String?,
+        val symbol: String?
+    )
+
+    private data class TestCallHierarchyRequest(
+        val target: TestSemanticTarget,
+        val direction: String,
+        val depth: Int,
+        val scope: String,
+        val limit: Int
+    )
+
     private data class TestRdDefinition(
         val filePath: String,
         val line: Int,
@@ -1174,6 +1610,87 @@ class RiderDotNetHandlersUnitTest : TestCase() {
     }
 
     private fun rdProperty(instance: Any, name: String): Any? = RdProtocolBridge.getProperty(instance, name)
+
+    private fun callHierarchyResultFor(request: TestCallHierarchyRequest): TestCallHierarchyResult {
+        val target = request.target
+        return when {
+            target.symbol != null -> TestCallHierarchyResult(
+                root = TestRdSymbol(
+                    name = "Run",
+                    qualifiedName = "Demo.Service.Run",
+                    kind = "METHOD",
+                    filePath = "src/Service.cs",
+                    line = 10,
+                    column = 5,
+                    containerName = "Demo.Service"
+                ),
+                calls = (1..CALL_HIERARCHY_RESULT_LIMIT).map { callerIndex ->
+                    TestRdSymbol(
+                        name = "Caller${callerIndex.toString().padStart(2, '0')}",
+                        qualifiedName = "Demo.Caller${callerIndex.toString().padStart(2, '0')}.Invoke",
+                        kind = "METHOD",
+                        filePath = "src/Caller${callerIndex.toString().padStart(2, '0')}.cs",
+                        line = callerIndex,
+                        column = 1,
+                        containerName = "Demo.Caller${callerIndex.toString().padStart(2, '0')}"
+                    )
+                }
+            )
+
+            target.filePath?.contains("Service") == true -> TestCallHierarchyResult(
+                root = hierarchyNode(target.filePath),
+                calls = (1..CALL_HIERARCHY_RESULT_LIMIT).map { callerIndex ->
+                    TestRdSymbol(
+                        name = "Caller${callerIndex.toString().padStart(2, '0')}",
+                        qualifiedName = "Demo.Caller${callerIndex.toString().padStart(2, '0')}.Invoke",
+                        kind = "METHOD",
+                        filePath = "src/Caller${callerIndex.toString().padStart(2, '0')}.cs",
+                        line = callerIndex,
+                        column = 1,
+                        containerName = "Demo.Caller${callerIndex.toString().padStart(2, '0')}"
+                    )
+                }
+            )
+
+            target.filePath?.contains("Grandchild") == true -> TestCallHierarchyResult(
+                root = hierarchyNode(target.filePath),
+                calls = emptyList()
+            )
+
+            target.filePath?.contains("Caller") == true -> {
+                val prefix = File(target.filePath).nameWithoutExtension
+                TestCallHierarchyResult(
+                    root = hierarchyNode(target.filePath),
+                    calls = (1..CALL_HIERARCHY_RESULT_LIMIT).map { childIndex ->
+                        TestRdSymbol(
+                            name = "$prefix-Grandchild${childIndex.toString().padStart(2, '0')}",
+                            qualifiedName = "Demo.$prefix.Grandchild${childIndex.toString().padStart(2, '0')}",
+                            kind = "METHOD",
+                            filePath = "src/$prefix-Grandchild${childIndex.toString().padStart(2, '0')}.cs",
+                            line = childIndex,
+                            column = 1,
+                            containerName = "Demo.$prefix"
+                        )
+                    }
+                )
+            }
+
+            else -> error("Unexpected hierarchy target: $target")
+        }
+    }
+
+    private fun hierarchyNode(filePath: String): TestRdSymbol {
+        val baseName = File(filePath).nameWithoutExtension
+        return TestRdSymbol(
+            name = baseName,
+            qualifiedName = "Demo.$baseName.Invoke",
+            kind = "METHOD",
+            filePath = filePath,
+            line = 1,
+            column = 1,
+            containerName = "Demo.$baseName"
+        )
+    }
 
     private fun assertHasGetter(instance: Any, getterName: String, message: String) {
         assertTrue(message, instance.javaClass.methods.any { it.name == getterName })
