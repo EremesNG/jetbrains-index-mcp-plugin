@@ -31,13 +31,15 @@ These tools work in every supported JetBrains IDE:
 
 ### Rider C# and F# support
 
-Rider-backed C# requests use the ReSharper backend for supported search and mutation paths, including `ide_find_symbol`, `ide_refactor_rename`, `ide_move_file`, and `ide_refactor_safe_delete`.
+Rider-backed C# requests use the ReSharper backend for supported search and mutation paths, including `ide_find_symbol`, `ide_refactor_rename`, and `ide_move_file`. `ide_refactor_safe_delete` is intentionally excluded from Rider and remains Java/Kotlin-only.
+
+Rider C# refactoring/formatting flows are UI-driven when the backend cannot prove a fully headless path: `ide_refactor_rename` and `ide_move_file` rely on native dialog automation with an active Rider UI, while `ide_optimize_imports` and `ide_reformat_code` run through an editor tab plus IDE actions. These paths fail closed if the required Rider window, dialog, or editor context is unavailable.
 
 Mutation results use the canonical external rename statuses so bounded behavior stays visible: `success`, `no_op`, `needs_active_editor`, `conflict`, `unsupported_context`, and `failed`. Legacy verification terms may still appear in metadata or trace payloads, but not as terminal statuses.
 
 Rider C# rename is bounded, not fully autonomous: it can require an active editor, can stop for conflicts that would otherwise open a dialog, and can fail closed with the canonical external statuses above rather than claiming success.
 
-Rider-backed F# support is currently beta/unstable because Rider exposes fewer language/refactoring guarantees there than it does for C#. Treat F# mutation results as best-effort and expect broader limitation coverage or unsupported-context responses until the Rider language surface matures.
+Rider-backed F# support is currently beta/unstable and not production-ready because Rider exposes fewer language/refactoring guarantees there than it does for C#. Treat F# mutation results as best-effort and expect broader limitation coverage or unsupported-context responses until the Rider language surface matures.
 
 Where Rider/ReSharper cannot prove a relationship semantically, the tool returns the bounded outcome instead of inferring support. This is especially important for ASP.NET convention-routing relationships and other platform-visible-only cases.
 
@@ -59,7 +61,7 @@ Legacy verification terms such as `verification_limited` and `verification_faile
 - Use the repository's deterministic fixture tests as the primary proof path.
 - Keep examples path-agnostic; do not hardcode local checkout paths into usage guidance.
 - Record bounded limitations instead of inflating unsupported Rider behavior into success.
-- Prefer C# for production mutation workflows; treat F# as beta until Rider exposes stronger parity.
+- Prefer C# for production mutation workflows; treat F# as beta and not production-ready until Rider exposes stronger parity.
 
 ### Extended Tools (Language-Aware)
 
@@ -67,11 +69,11 @@ These tools activate based on available language plugins:
 
 | Tool | Description | Languages |
 |------|-------------|-----------|
-| `ide_type_hierarchy` | Get type inheritance hierarchy | Java, Kotlin, Python, JS/TS, Go, PHP, Rust |
-| `ide_call_hierarchy` | Analyze method call relationships | Java, Kotlin, Python, JS/TS, Go, PHP, Rust |
-| `ide_find_implementations` | Find interface implementations | Java, Kotlin, Python, JS/TS, PHP, Rust |
-| `ide_find_super_methods` | Find overridden methods | Java, Kotlin, Python, JS/TS, PHP |
-| `ide_file_structure` | Hierarchical file structure *(disabled by default)* | Java, Kotlin, Python, JS/TS, Markdown |
+| `ide_type_hierarchy` | Get type inheritance hierarchy | Java, Kotlin, Python, JS/TS, Go, PHP, Rust, C#/F# in Rider |
+| `ide_call_hierarchy` | Analyze method call relationships | Java, Kotlin, Python, JS/TS, Go, PHP, Rust, C#/F# in Rider |
+| `ide_find_implementations` | Find interface implementations | Java, Kotlin, Python, JS/TS, PHP, Rust, C#/F# in Rider |
+| `ide_find_super_methods` | Find overridden methods | Java, Kotlin, Python, JS/TS, PHP, C#/F# in Rider |
+| `ide_file_structure` | Hierarchical file structure *(disabled by default)* | Java, Kotlin, Python, JS/TS, Markdown, C#/F# in Rider |
 
 ### Java-Specific Refactoring Tools
 
@@ -1198,6 +1200,8 @@ Move a file to a new directory using the IDE's refactoring engine. Applies langu
 
 Reformat code according to the project's code style settings. Equivalent to the IDE's "Reformat Code" action (<kbd>Ctrl+Alt+L</kbd> / <kbd>Cmd+Opt+L</kbd>).
 
+**Rider note:** Rider-backed .NET formatting uses an editor tab plus IDE action flow, and partial line-range formatting is not supported there.
+
 **Use when:**
 - Applying consistent formatting after code changes
 - Organizing imports
@@ -1465,7 +1469,8 @@ Analyzes method call relationships to find callers or callees.
 
 Finds all concrete implementations of an interface, abstract class, or abstract method.
 
-**Languages:** Java, Kotlin, Python, JS/TS, PHP, Rust (not Go — Go uses implicit interfaces).
+**Languages:** Java, Kotlin, Python, JS/TS, PHP, Rust, Rider-backed C#/F# in Rider (not Go — Go uses implicit interfaces).
+**Rider note:** C# is the production-ready Rider lane; F# is beta/unstable and not recommended for production use.
 
 **Use when:**
 - Locating classes that implement an interface
@@ -1555,7 +1560,8 @@ Finds all concrete implementations of an interface, abstract class, or abstract 
 
 Finds the complete inheritance hierarchy for a method - all parent methods it overrides or implements.
 
-**Languages:** Java, Kotlin, Python, JS/TS, PHP (not Go or Rust — they use composition/traits instead of classical inheritance).
+**Languages:** Java, Kotlin, Python, JS/TS, PHP, Rider-backed C#/F# in Rider (not Go or Rust — they use composition/traits instead of classical inheritance).
+**Rider note:** C# is the production-ready Rider lane; F# is beta/unstable and not recommended for production use.
 
 **Use when:**
 - Finding which interface method an implementation overrides
@@ -1666,7 +1672,8 @@ Finds the complete inheritance hierarchy for a method - all parent methods it ov
 
 Get the hierarchical structure of a source file, similar to the IDE's Structure view (<kbd>Cmd+7</kbd> / <kbd>Alt+7</kbd>).
 
-**Languages:** Java, Kotlin, Python, JavaScript, TypeScript, Markdown.
+**Languages:** Java, Kotlin, Python, JavaScript, TypeScript, Markdown, Rider-backed C#/F# in Rider.
+**Rider note:** C# is the production-ready Rider lane; F# is beta/unstable and not recommended for production use.
 
 **Use when:**
 - Getting an overview of a file's classes, methods, fields, or Markdown heading outline
@@ -1837,7 +1844,7 @@ Safely deletes an element, first checking for usages.
 }
 ```
 
-**Rider C# note:** For Rider-backed C#, `force=false` should return blocking usages when they exist. If the backend cannot prove safe deletion, expect `blocked` or `unsupported` rather than a guessed delete.
+**Availability:** Java/Kotlin only; intentionally not available or exposed in Rider by design.
 
 **Example Response (blocked by usages):**
 
