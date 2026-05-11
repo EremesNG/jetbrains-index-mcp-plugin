@@ -6,6 +6,8 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.BuiltInSearchScop
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.BuiltInSearchScopeResolver
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.CallElementData
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.LanguageHandlerRegistry
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.javascript.isJsTsElementOrFile
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.javascript.resolveJsTsCallHierarchySeed
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.models.ToolCallResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.AbstractMcpTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.CallElement
@@ -89,7 +91,7 @@ class CallHierarchyTool : AbstractMcpTool() {
         return suspendingReadAction {
             ProgressManager.checkCanceled() // Allow cancellation
 
-            val element = resolveElementFromArguments(project, arguments, allowLibraryFilesForPosition = true).getOrElse {
+            val element = resolveCallHierarchySeed(project, arguments).getOrElse {
                 return@suspendingReadAction createErrorResult(it.message ?: ErrorMessages.COULD_NOT_RESOLVE_SYMBOL)
             }
 
@@ -119,6 +121,21 @@ class CallHierarchyTool : AbstractMcpTool() {
                 calls = hierarchyData.calls.map { convertToCallElement(it) }
             ))
         }
+    }
+
+    private fun resolveCallHierarchySeed(project: Project, arguments: JsonObject): Result<com.intellij.psi.PsiElement> {
+        val element = resolveElementFromArguments(project, arguments, allowLibraryFilesForPosition = true).getOrElse {
+            return Result.failure(it)
+        }
+        val explicitLanguage = optionalStringArg(arguments, ParamNames.LANGUAGE)
+        val shouldNormalizeJsTsSeed = explicitLanguage == "JavaScript" ||
+            explicitLanguage == "TypeScript" ||
+            isJsTsElementOrFile(element)
+        if (!shouldNormalizeJsTsSeed) {
+            return Result.success(element)
+        }
+
+        return Result.success(resolveJsTsCallHierarchySeed(element))
     }
 
     /**

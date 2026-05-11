@@ -3,8 +3,15 @@ package com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.javascript
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.util.PluginDetectors
 import com.intellij.psi.PsiNamedElement
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
+import java.nio.file.Files
+import java.nio.file.Path
 
 class JavaScriptSymbolReferenceHandlerTest : BasePlatformTestCase() {
+
+    private companion object {
+        const val FIXTURE_SOURCE_ROOT = "src/test/testData/javascript/webstormIntegration"
+        const val FIXTURE_PROJECT_ROOT = "src/webstormIntegration"
+    }
 
     private val handler = JavaScriptSymbolReferenceHandler()
 
@@ -115,6 +122,109 @@ class JavaScriptSymbolReferenceHandlerTest : BasePlatformTestCase() {
         assertTrue("Should include index candidate", message.contains("src/utils/format/index.ts"))
     }
 
+    fun testResolveOverloadedExportFixtureCoverageHook() {
+        if (!requireJsTsCapability("testResolveOverloadedExportFixtureCoverageHook")) return
+
+        addWebstormIntegrationFixture("overloads/overloaded-export.ts")
+
+        val result = handler.resolveSymbol(project, fixtureSymbol("overloads/overloaded-export.ts", "getProjectId"))
+
+        assertTrue("Overloaded exported functions should resolve through fixture-backed coverage", result.isSuccess)
+        val element = result.getOrThrow()
+        assertNamed(element, "getProjectId")
+        assertContainingFileSuffix(element, "overloads/overloaded-export.ts")
+        assertTrue("Overload resolution should prefer the concrete implementation declaration", element.text.contains("readProjectIdFromConfig"))
+    }
+
+    fun testResolveRealisticMultiNamedIndexBarrelFixtureCoverageHook() {
+        if (!requireJsTsCapability("testResolveRealisticMultiNamedIndexBarrelFixtureCoverageHook")) return
+
+        addWebstormIntegrationFixture("barrels/realistic/config/loader.ts")
+        addWebstormIntegrationFixture("barrels/realistic/config/index.ts")
+
+        val result = handler.resolveSymbol(project, fixtureSymbol("barrels/realistic/config/index.ts", "loadPluginConfig"))
+
+        assertTrue("Realistic multi-named index barrel should resolve successfully", result.isSuccess)
+        assertContainingFileSuffix(result.getOrThrow(), "barrels/realistic/config/loader.ts")
+    }
+
+    fun testResolveNamedBarrelFixtureCoverageHook() {
+        if (!requireJsTsCapability("testResolveNamedBarrelFixtureCoverageHook")) return
+
+        addWebstormIntegrationFixture("barrels/plugin-config.ts")
+        addWebstormIntegrationFixture("barrels/named-barrel.ts")
+
+        val result = handler.resolveSymbol(project, fixtureSymbol("barrels/named-barrel.ts", "loadPluginConfig"))
+
+        assertTrue("Named re-export barrel fixture should be covered explicitly", result.isSuccess)
+        assertNamed(result.getOrThrow(), "loadPluginConfig")
+    }
+
+    fun testResolveExportStarBarrelFixtureCoverageHook() {
+        if (!requireJsTsCapability("testResolveExportStarBarrelFixtureCoverageHook")) return
+
+        addWebstormIntegrationFixture("barrels/plugin-config.ts")
+        addWebstormIntegrationFixture("barrels/export-star-barrel.ts")
+
+        val result = handler.resolveSymbol(project, fixtureSymbol("barrels/export-star-barrel.ts", "loadPluginConfig"))
+
+        assertTrue("Export-star barrel fixture should be covered explicitly", result.isSuccess)
+        assertNamed(result.getOrThrow(), "loadPluginConfig")
+    }
+
+    fun testResolveBarrelFixturesRemainDisambiguatedAcrossSameNamedExports() {
+        if (!requireJsTsCapability("testResolveBarrelFixturesRemainDisambiguatedAcrossSameNamedExports")) return
+
+        addWebstormIntegrationFixture("barrels/plugin-config.ts")
+        addWebstormIntegrationFixture("barrels/named-barrel.ts")
+        addWebstormIntegrationFixture("barrels/unrelated-plugin-config.ts")
+        addWebstormIntegrationFixture("barrels/unrelated-barrel.ts")
+
+        val namedResult = handler.resolveSymbol(project, fixtureSymbol("barrels/named-barrel.ts", "loadPluginConfig"))
+        val unrelatedResult = handler.resolveSymbol(project, fixtureSymbol("barrels/unrelated-barrel.ts", "loadPluginConfig"))
+
+        assertTrue("Named barrel should resolve successfully", namedResult.isSuccess)
+        assertTrue("Unrelated same-named barrel should resolve successfully", unrelatedResult.isSuccess)
+        assertContainingFileSuffix(namedResult.getOrThrow(), "barrels/plugin-config.ts")
+        assertContainingFileSuffix(unrelatedResult.getOrThrow(), "barrels/unrelated-plugin-config.ts")
+    }
+
+    fun testResolveUnsupportedGrammarCoverageHookForFixtureGuidance() {
+        if (!requireJsTsCapability("testResolveUnsupportedGrammarCoverageHookForFixtureGuidance")) return
+
+        val symbol = "$FIXTURE_PROJECT_ROOT/overloads/overloaded-export#getProjectId(string)"
+        val result = handler.resolveSymbol(project, symbol)
+
+        assertTrue("Unsupported fixture grammar should fail deterministically", result.isFailure)
+        val message = result.exceptionOrNull()?.message.orEmpty()
+        assertTrue("Should preserve unsupported_grammar prefix", message.startsWith("unsupported_grammar:"))
+        assertTrue("Coverage hook should keep accepted-form guidance visible", message.contains("modulePath#exportName"))
+    }
+
+    private fun addWebstormIntegrationFixture(relativePath: String) {
+        val sourcePath = Path.of(FIXTURE_SOURCE_ROOT).resolve(relativePath)
+        val targetPath = "$FIXTURE_PROJECT_ROOT/$relativePath"
+        myFixture.addFileToProject(targetPath, Files.readString(sourcePath))
+    }
+
+    private fun fixtureSymbol(relativePath: String, exportName: String): String {
+        return "${fixtureModulePath(relativePath)}#$exportName"
+    }
+
+    private fun fixtureModulePath(relativePath: String): String {
+        return "$FIXTURE_PROJECT_ROOT/${relativePath.removeJsTsExtension()}"
+    }
+
+    private fun String.removeJsTsExtension(): String {
+        return removeSuffix(".d.ts")
+            .removeSuffix(".ts")
+            .removeSuffix(".tsx")
+            .removeSuffix(".js")
+            .removeSuffix(".jsx")
+            .removeSuffix(".mjs")
+            .removeSuffix(".cjs")
+    }
+
     private fun requireJsTsCapability(testName: String): Boolean {
         if (!PluginDetectors.javaScript.isAvailable) {
             System.err.println("$testName: skipped - JavaScript plugin not available")
@@ -131,5 +241,13 @@ class JavaScriptSymbolReferenceHandlerTest : BasePlatformTestCase() {
 
     private fun assertNamed(element: PsiNamedElement, expected: String) {
         assertEquals(expected, element.name)
+    }
+
+    private fun assertContainingFileSuffix(element: PsiNamedElement, expectedSuffix: String) {
+        val filePath = element.containingFile?.virtualFile?.path?.replace('\\', '/')
+        assertTrue(
+            "Expected containing file to end with $expectedSuffix but was $filePath",
+            filePath?.endsWith(expectedSuffix) == true
+        )
     }
 }

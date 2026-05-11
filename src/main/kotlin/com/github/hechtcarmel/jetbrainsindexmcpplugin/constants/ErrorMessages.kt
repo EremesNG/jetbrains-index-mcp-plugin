@@ -40,16 +40,16 @@ object ErrorMessages {
     private const val JS_TS_ACCEPTED_FORMS =
         "modulePath#exportName, modulePath#default, modulePath#ClassName.memberName"
     fun jsTsUnsupportedGrammar(symbol: String) =
-        "unsupported_grammar: Symbol '$symbol' does not match accepted JS/TS symbol forms. Accepted forms: $JS_TS_ACCEPTED_FORMS"
+        "unsupported_grammar: Symbol '$symbol' does not match accepted JS/TS symbol forms. Accepted forms: $JS_TS_ACCEPTED_FORMS. Use file+line+column for local symbols, local import aliases, npm/package symbols, unresolved barrel/re-export chains, or any case where the export cannot be resolved from a module-qualified form."
     fun jsTsNotFound(symbol: String) =
-        "not_found: No declaration found for symbol '$symbol'"
+        "not_found: No declaration found for symbol '$symbol'. If this is a local symbol, alias, npm/package symbol, or unresolved barrel/re-export case, use file+line+column instead."
     fun jsTsAmbiguousMatch(symbol: String, candidates: List<String>) =
-        "ambiguous_match: Multiple declarations match symbol '$symbol'. Candidates: ${candidates.joinToString(", ")}"
+        "ambiguous_match: Multiple declarations match symbol '$symbol'. Candidates: ${candidates.joinToString(", ")}. If you need an exact local target or the export graph is ambiguous, use file+line+column instead."
     fun jsTsUnsupportedLanguageCapability(reason: String? = null) =
         if (reason.isNullOrBlank()) {
-            "unsupported_language_capability: JavaScript/TypeScript symbol resolution is not available in this IDE session"
+            "unsupported_language_capability: JavaScript/TypeScript symbol resolution is not available in this IDE session. Use file+line+column instead."
         } else {
-            "unsupported_language_capability: JavaScript/TypeScript symbol resolution is not available in this IDE session. Reason: $reason"
+            "unsupported_language_capability: JavaScript/TypeScript symbol resolution is not available in this IDE session. Reason: $reason. Use file+line+column instead."
         }
     fun typeNotFound(typeFqn: String, projectName: String) =
         "Type '$typeFqn' not found in project '$projectName'"

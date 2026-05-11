@@ -115,7 +115,7 @@ Some tools support identifying the target element by fully qualified symbol refe
 
 **Supported languages:** Java, JS, and TS. Unsupported languages return an explicit error listing the currently supported symbol-reference languages.
 
-**JS/TS symbol grammar:** Symbols must be module-qualified:
+**JS/TS symbol grammar (v1):** Symbols must be module-qualified:
 - `modulePath#exportName` — named export (e.g., `src/utils#formatDate`)
 - `modulePath#default` — default export (e.g., `src/index#default`)
 - `modulePath#ClassName.memberName` — class member (e.g., `src/models#User.validate`)
@@ -125,7 +125,24 @@ Some tools support identifying the target element by fully qualified symbol refe
 - `not_found` — module path resolved but symbol not found in exports/members
 - `ambiguous_match` — multiple matching exports/members across candidate files
 
-**Note:** Bare global symbol lookup and deep barrel/re-export graph traversal are outside primary v1 behavior. Module-qualified lookup is deterministic and bounded.
+**Fallback TypeScript cases:** Use `file` + `line` + `column` when targeting local non-exported symbols, local import aliases, npm/package symbols, unresolved barrel/re-export chains, or any case that cannot be expressed as a stable module-qualified export.
+
+**Example fallback request:**
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "ide_find_definition",
+    "arguments": {
+      "file": "src/utils/math.ts",
+      "line": 18,
+      "column": 12
+    }
+  }
+}
+```
+
+**Note:** Module-qualified lookup remains v1 grammar and bounded; unsupported cases should fall back to `file` + `line` + `column`.
 
 **Tools that support symbol references:** `ide_find_references`, `ide_find_definition`, `ide_call_hierarchy`, `ide_find_implementations`, `ide_find_super_methods`.
 

@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Changed
+- Improved JS/TS WebStorm integration: `language + symbol` resolution and call-hierarchy seeding now handle overloads more accurately, barrel/re-export caller discovery stays bounded, and TypeScript type aliases map cleanly in `ide_file_structure`.
+
+### Fixed
+- Added regression coverage and guidance for overloads, barrels, aliases, `implements`, and derived `as const`/type-driven cases so the JS/TS navigation behavior stays predictable across supported WebStorm queries.
+
 ## [4.16.3] - 2026-05-06
 ### Fixed
 - **`ide_refactor_rename` no longer fails while committing documents from MCP requests** — Document commits now switch to a write-safe non-modal EDT context instead of using deprecated synchronous transaction submission from the request coroutine's write-unsafe modality. Fixes [#172](https://github.com/hechtcarmel/jetbrains-index-mcp-plugin/issues/172).

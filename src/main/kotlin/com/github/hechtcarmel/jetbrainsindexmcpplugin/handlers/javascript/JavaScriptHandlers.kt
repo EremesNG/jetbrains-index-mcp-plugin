@@ -194,6 +194,368 @@ internal fun deterministicSingleMatchOrFailure(
     }
 }
 
+private sealed interface OverloadedExportResolution {
+    data class PreferImplementation(val implementation: PsiNamedElement) : OverloadedExportResolution
+    data object NoSupportedImplementation : OverloadedExportResolution
+    data object NotOverloadOrAmbiguous : OverloadedExportResolution
+}
+
+private fun selectOverloadedNamedExport(matches: List<PsiNamedElement>): OverloadedExportResolution {
+    if (matches.isEmpty() || matches.any { !isFunctionLike(it) }) {
+        return OverloadedExportResolution.NotOverloadOrAmbiguous
+    }
+
+    val implementations = matches.filter { hasFunctionImplementation(it) }
+    return when (implementations.size) {
+        1 -> OverloadedExportResolution.PreferImplementation(implementations.single())
+        0 -> OverloadedExportResolution.NoSupportedImplementation
+        else -> OverloadedExportResolution.NotOverloadOrAmbiguous
+    }
+}
+
+private fun normalizeOverloadedNamedExportCandidates(
+    symbol: String,
+    candidates: List<Pair<String, PsiNamedElement>>
+): Result<List<Pair<String, PsiNamedElement>>> {
+    if (candidates.isEmpty()) {
+        return Result.success(emptyList())
+    }
+
+    val normalized = mutableListOf<Pair<String, PsiNamedElement>>()
+    candidates
+        .groupBy { it.first }
+        .toSortedMap()
+        .values
+        .forEach { groupedCandidates ->
+            if (groupedCandidates.size == 1) {
+                normalized += groupedCandidates.single()
+                return@forEach
+            }
+
+            when (val overloadSelection = selectOverloadedNamedExport(groupedCandidates.map { it.second })) {
+                is OverloadedExportResolution.PreferImplementation -> {
+                    normalized += groupedCandidates.first().first to overloadSelection.implementation
+                }
+
+                OverloadedExportResolution.NoSupportedImplementation -> Unit
+                OverloadedExportResolution.NotOverloadOrAmbiguous -> {
+                    return Result.failure(
+                        IllegalArgumentException(
+                            ErrorMessages.jsTsAmbiguousMatch(symbol, groupedCandidates.map { it.first })
+                        )
+                    )
+                }
+            }
+        }
+
+    return Result.success(normalized)
+}
+
+internal fun isJsTsElementOrFile(element: PsiElement): Boolean {
+    val elementLanguageId = element.language.id
+    if (elementLanguageId in setOf("JavaScript", "TypeScript", "ECMAScript 6", "JSX Harmony", "TypeScript JSX")) {
+        return true
+    }
+
+    val containingFile = element.containingFile ?: return false
+    val fileLanguageId = containingFile.language.id
+    if (fileLanguageId in setOf("JavaScript", "TypeScript", "ECMAScript 6", "JSX Harmony", "TypeScript JSX")) {
+        return true
+    }
+
+    val extension = containingFile.virtualFile?.extension?.lowercase()
+    return extension in JS_TS_ALLOWED_EXTENSIONS_SET
+}
+
+private fun findSameFileFunctionLikeCandidates(file: PsiFile, name: String): List<PsiNamedElement> {
+    val matches = mutableListOf<PsiNamedElement>()
+    PsiTreeUtil.processElements(file) { candidate ->
+        val named = candidate as? PsiNamedElement
+        if (named != null && named.name == name && isFunctionLike(named)) {
+            matches.add(named)
+        }
+        true
+    }
+    return matches
+}
+
+internal fun resolveJsTsCallHierarchySeed(element: PsiElement): PsiElement {
+    val namedElement = sequence<PsiElement> {
+        var current: PsiElement? = element
+        while (current != null) {
+            yield(current)
+            current = current.parent
+        }
+    }
+        .filterIsInstance<PsiNamedElement>()
+        .firstOrNull(::isFunctionLike)
+        ?: return element
+
+    if (hasFunctionImplementation(namedElement)) {
+        return namedElement
+    }
+
+    val exportName = namedElement.name ?: return namedElement
+    val psiFile = namedElement.containingFile ?: return namedElement
+    val matches = findSameFileFunctionLikeCandidates(psiFile, exportName)
+        .ifEmpty {
+            mutableListOf<PsiNamedElement>().apply {
+                PsiTreeUtil.processElements(psiFile) { candidate ->
+                    val named = candidate as? PsiNamedElement
+                    if (named != null && named.name == exportName && isExportCandidate(named)) {
+                        add(named)
+                    }
+                    true
+                }
+            }
+        }
+
+    return when (val overloadSelection = selectOverloadedNamedExport(matches)) {
+        is OverloadedExportResolution.PreferImplementation -> overloadSelection.implementation
+        OverloadedExportResolution.NoSupportedImplementation,
+        OverloadedExportResolution.NotOverloadOrAmbiguous -> namedElement
+    }
+}
+
+private fun isExportCandidate(named: PsiNamedElement): Boolean {
+    val cls = named.javaClass
+    val className = cls.name
+    if (className.contains("JSImportSpecifier") || className.contains("ES6Export")) return true
+    return callBooleanMethod(named, "isExported") == true || callBooleanMethod(named, "isExport") == true
+}
+
+private fun isFunctionLike(named: PsiNamedElement): Boolean {
+    val className = named.javaClass.name
+    if (className.contains("JSFunction")) return true
+    return callBooleanMethod(named, "isFunction") == true
+}
+
+private fun hasFunctionImplementation(named: PsiNamedElement): Boolean {
+    val source = named.text?.trim().orEmpty()
+    val textHasImplementation = hasImplementationBodyByText(source)
+    if (!textHasImplementation && source.endsWith(";")) {
+        return false
+    }
+
+    for (methodName in listOf(
+        "getBody",
+        "getBlock",
+        "getFunctionBody",
+        "getBodyBlock",
+        "getStatementBlock",
+        "getBlockStatement",
+        "getStatementsBlock"
+    )) {
+        try {
+            val method = named.javaClass.methods.firstOrNull { it.name == methodName && it.parameterCount == 0 } ?: continue
+            if (containsImplementationBody(method.invoke(named))) {
+                return true
+            }
+        } catch (_: Exception) {
+            // Keep probing other body-accessor variants exposed by different JS/TS PSI implementations.
+        }
+    }
+    if (callBooleanMethod(named, "hasBody") == true || callBooleanMethod(named, "hasBlockBody") == true) {
+        return true
+    }
+    return textHasImplementation
+}
+
+private fun containsImplementationBody(value: Any?): Boolean {
+    return when (value) {
+        null -> false
+        is PsiElement -> !value.text.isNullOrBlank()
+        is Array<*> -> value.any(::containsImplementationBody)
+        is Iterable<*> -> value.any(::containsImplementationBody)
+        else -> false
+    }
+}
+
+internal fun hasImplementationBodyByText(text: String?): Boolean {
+    val source = text?.trim().orEmpty()
+    if (source.isBlank()) return false
+    // TypeScript overload signatures can contain top-level braces inside object-literal return types,
+    // e.g. `function f(): { id: string };`. A trailing semicolon marks the declaration as body-less
+    // unless this is an arrow function with an expression or block body.
+    if (source.endsWith(";") && !hasTopLevelArrowImplementationBody(source)) {
+        return false
+    }
+
+    var parenDepth = 0
+    var braceDepth = 0
+    var bracketDepth = 0
+    var inSingleQuote = false
+    var inDoubleQuote = false
+    var inTemplate = false
+    var escaped = false
+
+    for (char in source) {
+        if (escaped) {
+            escaped = false
+            continue
+        }
+
+        when {
+            inSingleQuote -> {
+                when (char) {
+                    '\\' -> escaped = true
+                    '\'' -> inSingleQuote = false
+                }
+                continue
+            }
+
+            inDoubleQuote -> {
+                when (char) {
+                    '\\' -> escaped = true
+                    '"' -> inDoubleQuote = false
+                }
+                continue
+            }
+
+            inTemplate -> {
+                when (char) {
+                    '\\' -> escaped = true
+                    '`' -> inTemplate = false
+                }
+                continue
+            }
+        }
+
+        when (char) {
+            '\'' -> inSingleQuote = true
+            '"' -> inDoubleQuote = true
+            '`' -> inTemplate = true
+            '(' -> parenDepth++
+            ')' -> parenDepth = (parenDepth - 1).coerceAtLeast(0)
+            '[' -> bracketDepth++
+            ']' -> bracketDepth = (bracketDepth - 1).coerceAtLeast(0)
+            '{' -> {
+                if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
+                    return true
+                }
+                braceDepth++
+            }
+
+            '}' -> braceDepth = (braceDepth - 1).coerceAtLeast(0)
+            ';' -> if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) return false
+        }
+    }
+
+    return source.endsWith("}") && !source.endsWith(";")
+}
+
+private fun hasTopLevelArrowImplementationBody(text: String): Boolean {
+    var parenDepth = 0
+    var braceDepth = 0
+    var bracketDepth = 0
+    var inSingleQuote = false
+    var inDoubleQuote = false
+    var inTemplate = false
+    var escaped = false
+
+    var index = 0
+    while (index < text.length) {
+        val char = text[index]
+
+        if (escaped) {
+            escaped = false
+            index++
+            continue
+        }
+
+        when {
+            inSingleQuote -> {
+                when (char) {
+                    '\\' -> escaped = true
+                    '\'' -> inSingleQuote = false
+                }
+                index++
+                continue
+            }
+
+            inDoubleQuote -> {
+                when (char) {
+                    '\\' -> escaped = true
+                    '"' -> inDoubleQuote = false
+                }
+                index++
+                continue
+            }
+
+            inTemplate -> {
+                when (char) {
+                    '\\' -> escaped = true
+                    '`' -> inTemplate = false
+                }
+                index++
+                continue
+            }
+        }
+
+        when (char) {
+            '\'' -> inSingleQuote = true
+            '"' -> inDoubleQuote = true
+            '`' -> inTemplate = true
+            '(' -> parenDepth++
+            ')' -> parenDepth = (parenDepth - 1).coerceAtLeast(0)
+            '[' -> bracketDepth++
+            ']' -> bracketDepth = (bracketDepth - 1).coerceAtLeast(0)
+            '{' -> braceDepth++
+            '}' -> braceDepth = (braceDepth - 1).coerceAtLeast(0)
+            '=' -> {
+                val isTopLevelArrow =
+                    parenDepth == 0 && braceDepth == 0 && bracketDepth == 0 && index + 1 < text.length && text[index + 1] == '>'
+                if (isTopLevelArrow) {
+                    val bodyStart = text.indexOfFirstNonWhitespace(index + 2)
+                    if (bodyStart == -1) return false
+                    return text[bodyStart] != ';'
+                }
+            }
+        }
+
+        index++
+    }
+
+    return false
+}
+
+private fun String.indexOfFirstNonWhitespace(startIndex: Int): Int {
+    var index = startIndex
+    while (index < length) {
+        if (!this[index].isWhitespace()) return index
+        index++
+    }
+    return -1
+}
+
+private fun callBooleanMethod(target: Any, methodName: String): Boolean? {
+    return try {
+        val m = target.javaClass.methods.firstOrNull { it.name == methodName && it.parameterCount == 0 } ?: return null
+        m.invoke(target) as? Boolean
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun isJavaScriptOrTypeScriptTypeAliasClass(type: Class<*>?): Boolean {
+    if (type == null) return false
+    if (type.name.contains("TypeScriptTypeAlias") || type.simpleName.contains("TypeScriptTypeAlias")) {
+        return true
+    }
+    return type.interfaces.any(::isJavaScriptOrTypeScriptTypeAliasClass) || isJavaScriptOrTypeScriptTypeAliasClass(type.superclass)
+}
+
+private fun looksLikeTypeAliasDeclaration(text: String?): Boolean {
+    val source = text?.trimStart().orEmpty()
+    if (source.isBlank()) return false
+    return Regex("^(?:export\\s+)?type\\s+[A-Za-z_$][A-Za-z0-9_$]*\\s*=").containsMatchIn(source)
+}
+
+private fun hasTypeAliasNodeType(element: PsiElement): Boolean {
+    val nodeType = element.node?.elementType?.toString()?.uppercase() ?: return false
+    return nodeType.contains("TYPE_ALIAS")
+}
+
 class JavaScriptSymbolReferenceHandler(
     private val classLookup: (String) -> Class<*>? = { fqcn ->
         try {
@@ -220,13 +582,14 @@ class JavaScriptSymbolReferenceHandler(
         val candidates = mutableListOf<Pair<String, PsiNamedElement>>()
 
         for (moduleCandidate in expandJsTsModuleCandidates(target.modulePath)) {
-            val named = resolveNamedElementFromCandidate(project, psiManager, roots, moduleCandidate, target)
-            if (named != null) {
-                candidates.add(moduleCandidate.relativePath to named)
-            }
+            candidates += resolveNamedElementsFromCandidate(project, psiManager, roots, moduleCandidate, target)
         }
 
-        return deterministicSingleMatchOrFailure(symbol, candidates)
+        val normalizedCandidates = normalizeOverloadedNamedExportCandidates(symbol, candidates).getOrElse {
+            return Result.failure(it)
+        }
+
+        return deterministicSingleMatchOrFailure(symbol, normalizedCandidates)
     }
 
     private fun ensureCapabilityAvailable(): IllegalArgumentException? {
@@ -236,21 +599,22 @@ class JavaScriptSymbolReferenceHandler(
         else IllegalArgumentException(ErrorMessages.jsTsUnsupportedLanguageCapability("JavaScript PSI classes are unavailable"))
     }
 
-    private fun resolveNamedElementFromCandidate(
+    private fun resolveNamedElementsFromCandidate(
         project: Project,
         psiManager: PsiManager,
         roots: List<String>,
         moduleCandidate: JsTsModuleCandidate,
         target: JsTsSymbolTarget
-    ): PsiNamedElement? {
-        val virtualFile = resolveVirtualFile(roots, moduleCandidate.relativePath) ?: return null
-        if (!ProjectUtils.isAccessibleFile(project, virtualFile)) return null
-        val psiFile = psiManager.findFile(virtualFile) ?: return null
-        return when (target) {
-            is JsTsSymbolTarget.NamedExport -> findNamedExport(psiFile, target.exportName)
-            is JsTsSymbolTarget.DefaultExport -> findDefaultExport(psiFile)
-            is JsTsSymbolTarget.ClassMember -> findClassMember(psiFile, target.className, target.memberName)
+    ): List<Pair<String, PsiNamedElement>> {
+        val virtualFile = resolveVirtualFile(roots, moduleCandidate.relativePath) ?: return emptyList()
+        if (!ProjectUtils.isAccessibleFile(project, virtualFile)) return emptyList()
+        val psiFile = psiManager.findFile(virtualFile) ?: return emptyList()
+        val matches = when (target) {
+            is JsTsSymbolTarget.NamedExport -> findNamedExports(psiFile, target.exportName)
+            is JsTsSymbolTarget.DefaultExport -> listOfNotNull(findDefaultExport(psiFile))
+            is JsTsSymbolTarget.ClassMember -> listOfNotNull(findClassMember(psiFile, target.className, target.memberName))
         }
+        return matches.map { buildCandidateKey(moduleCandidate.relativePath, target, it) to it }
     }
 
     private fun resolveVirtualFile(roots: List<String>, relativePath: String): com.intellij.openapi.vfs.VirtualFile? {
@@ -263,7 +627,7 @@ class JavaScriptSymbolReferenceHandler(
         return null
     }
 
-    private fun findNamedExport(file: PsiFile, exportName: String): PsiNamedElement? {
+    private fun findNamedExports(file: PsiFile, exportName: String): List<PsiNamedElement> {
         val matches = mutableListOf<PsiNamedElement>()
         PsiTreeUtil.processElements(file) { element ->
             val named = element as? PsiNamedElement
@@ -272,7 +636,32 @@ class JavaScriptSymbolReferenceHandler(
             }
             true
         }
-        return matches.singleOrNull()
+        if (matches.size <= 1) {
+            return matches
+        }
+
+        // TypeScript overloads produce multiple exported declarations with the same name.
+        // When exactly one declaration has an implementation body, prefer that concrete
+        // declaration instead of surfacing the declaration-only overload signatures.
+        when (val overloadSelection = selectOverloadedNamedExport(matches)) {
+            is OverloadedExportResolution.PreferImplementation -> return listOf(overloadSelection.implementation)
+            OverloadedExportResolution.NoSupportedImplementation -> return emptyList()
+            OverloadedExportResolution.NotOverloadOrAmbiguous -> Unit
+        }
+
+        return matches
+    }
+
+    private fun buildCandidateKey(
+        relativePath: String,
+        target: JsTsSymbolTarget,
+        resolved: PsiNamedElement
+    ): String {
+        return when (target) {
+            is JsTsSymbolTarget.NamedExport -> "$relativePath#${resolved.name ?: target.exportName}"
+            is JsTsSymbolTarget.DefaultExport -> "$relativePath#default"
+            is JsTsSymbolTarget.ClassMember -> "$relativePath#${target.className}.${resolved.name ?: target.memberName}"
+        }
     }
 
     private fun findDefaultExport(file: PsiFile): PsiNamedElement? {
@@ -310,13 +699,6 @@ class JavaScriptSymbolReferenceHandler(
         return memberMatches.singleOrNull()
     }
 
-    private fun isExportCandidate(named: PsiNamedElement): Boolean {
-        val cls = named.javaClass
-        val className = cls.name
-        if (className.contains("JSImportSpecifier") || className.contains("ES6Export")) return true
-        return callBooleanMethod(named, "isExported") == true || callBooleanMethod(named, "isExport") == true
-    }
-
     private fun isDefaultExportCandidate(named: PsiNamedElement): Boolean {
         val className = named.javaClass.name
         if (className.contains("ES6ExportDefaultAssignment") || className.contains("ES6ExportDefaultDeclaration")) {
@@ -339,14 +721,6 @@ class JavaScriptSymbolReferenceHandler(
         return callBooleanMethod(named, "isFunction") == true || callBooleanMethod(named, "isField") == true
     }
 
-    private fun callBooleanMethod(target: Any, methodName: String): Boolean? {
-        return try {
-            val m = target.javaClass.methods.firstOrNull { it.name == methodName && it.parameterCount == 0 } ?: return null
-            m.invoke(target) as? Boolean
-        } catch (_: Exception) {
-            null
-        }
-    }
 }
 
 class TypeScriptSymbolReferenceHandler : SymbolReferenceHandler by JavaScriptSymbolReferenceHandler() {
@@ -514,6 +888,16 @@ abstract class BaseJavaScriptHandler<T> : LanguageHandler<T> {
         } catch (_: Exception) {
             "CLASS"
         }
+    }
+
+    /**
+     * Detects TypeScript `type` aliases, which can surface through the JSClass PSI path.
+     */
+    protected fun isTypeScriptTypeAlias(element: PsiElement): Boolean {
+        if (callBooleanMethod(element, "isTypeAlias") == true) return true
+        if (isJavaScriptOrTypeScriptTypeAliasClass(element.javaClass)) return true
+        if (hasTypeAliasNodeType(element)) return true
+        return looksLikeTypeAliasDeclaration(element.text)
     }
 
     /**
@@ -954,10 +1338,29 @@ class JavaScriptImplementationsHandler : BaseJavaScriptHandler<List<Implementati
  */
 class JavaScriptCallHierarchyHandler : BaseJavaScriptHandler<CallHierarchyData>(), CallHierarchyHandler {
 
+    private enum class CallerReferenceSource {
+        DIRECT,
+        BARREL_TRAVERSAL
+    }
+
+    private data class CollectedCallerReference(
+        val reference: com.intellij.psi.PsiReference,
+        val source: CallerReferenceSource
+    )
+
+    private data class PrioritizedCallerResult(
+        val call: CallElementData,
+        val source: CallerReferenceSource
+    )
+
     companion object {
         private const val MAX_RESULTS_PER_LEVEL = 20
         private const val MAX_STACK_DEPTH = 50
         private const val MAX_SUPER_METHODS = 10
+        // Keep breadth-first traversal bounded, but leave enough headroom for real-world
+        // directory barrels that co-export multiple names before the caller import hop.
+        private const val MAX_BARREL_SYMBOLS_TO_TRAVERSE = 40
+        private const val MAX_BARREL_REFERENCES_TO_COLLECT = 120
     }
 
     override val languageId = "JavaScript"
@@ -975,13 +1378,14 @@ class JavaScriptCallHierarchyHandler : BaseJavaScriptHandler<CallHierarchyData>(
         depth: Int,
         scope: BuiltInSearchScope
     ): CallHierarchyData? {
-        val jsFunction = findContainingJSFunction(element) ?: return null
+        val jsFunction = findContainingJSFunction(resolveJsTsCallHierarchySeed(element)) ?: return null
         LOG.debug("Getting call hierarchy for ${getName(jsFunction)}, direction=$direction, depth=$depth")
         val searchScope = createNavigationSearchScope(project, scope)
 
         val visited = mutableSetOf<String>()
         val calls = if (direction == "callers") {
             findCallersRecursive(project, jsFunction, depth, visited, searchScope = searchScope)
+                .map(PrioritizedCallerResult::call)
         } else {
             findCalleesRecursive(project, jsFunction, depth, visited, searchScope = searchScope)
         }
@@ -1045,7 +1449,7 @@ class JavaScriptCallHierarchyHandler : BaseJavaScriptHandler<CallHierarchyData>(
         visited: MutableSet<String>,
         stackDepth: Int = 0,
         searchScope: GlobalSearchScope
-    ): List<CallElementData> {
+    ): List<PrioritizedCallerResult> {
         if (stackDepth > MAX_STACK_DEPTH || depth <= 0) return emptyList()
 
         val functionKey = getFunctionKey(jsFunction)
@@ -1057,40 +1461,377 @@ class JavaScriptCallHierarchyHandler : BaseJavaScriptHandler<CallHierarchyData>(
             val methodsToSearch = mutableSetOf(jsFunction)
             methodsToSearch.addAll(findAllSuperMethods(project, jsFunction))
 
-            // Use platform ReferencesSearch API with Processor pattern for early termination
-            val allReferences = mutableListOf<com.intellij.psi.PsiReference>()
-
-            for (methodToSearch in methodsToSearch) {
-                if (allReferences.size >= MAX_RESULTS_PER_LEVEL * 2) break
-                ReferencesSearch.search(methodToSearch, searchScope).forEach(Processor { reference ->
-                    allReferences.add(reference)
-                    allReferences.size < MAX_RESULTS_PER_LEVEL * 2
-                })
-            }
+            // Traverse direct references first, then follow named re-exports / export-star
+            // barrels in a bounded breadth-first way. This keeps caller discovery aligned
+            // with reference-search behavior without treating unrelated symbols from the same
+            // barrel as callers.
+            val allReferences = collectCallerReferences(methodsToSearch, searchScope)
 
             LOG.debug("Found ${allReferences.size} references for ${getName(jsFunction)}")
 
-            val results = mutableListOf<CallElementData>()
+            val resultsByKey = LinkedHashMap<String, PrioritizedCallerResult>()
             for (reference in allReferences) {
-                if (results.size >= MAX_RESULTS_PER_LEVEL) break
-                val refElement = reference.element
+                val refElement = reference.reference.element
                 val containingFunction = findContainingCallable(refElement)
                 if (containingFunction != null && containingFunction != jsFunction && !methodsToSearch.contains(containingFunction)) {
                     val children = if (depth > 1) {
                         findCallersRecursive(project, containingFunction, depth - 1, visited, stackDepth + 1, searchScope)
                     } else null
                     if (shouldIncludeNavigationElement(searchScope, containingFunction)) {
-                        results.add(createCallElement(project, containingFunction, children))
+                        putCallerResult(
+                            resultsByKey,
+                            getFunctionKey(containingFunction),
+                            createCallElement(project, containingFunction, children?.map(PrioritizedCallerResult::call)),
+                            reference.source
+                        )
                     } else if (children != null) {
-                        results.addAll(children)
+                        children.forEach { child ->
+                            putCallerResult(resultsByKey, getCallElementKey(child.call), child.call, child.source)
+                        }
                     }
                 }
             }
-            results.distinctBy { it.name + it.file + it.line }.take(MAX_RESULTS_PER_LEVEL)
+
+            buildVisibleCallerResults(resultsByKey)
         } catch (e: Exception) {
             LOG.warn("Error finding callers: ${e.message}")
             emptyList()
         }
+    }
+
+    private fun putCallerResult(
+        resultsByKey: MutableMap<String, PrioritizedCallerResult>,
+        key: String,
+        call: CallElementData,
+        source: CallerReferenceSource
+    ) {
+        val existing = resultsByKey[key]
+        if (existing == null || source == CallerReferenceSource.BARREL_TRAVERSAL && existing.source != CallerReferenceSource.BARREL_TRAVERSAL) {
+            resultsByKey[key] = PrioritizedCallerResult(call, source)
+        }
+    }
+
+    private fun buildVisibleCallerResults(resultsByKey: LinkedHashMap<String, PrioritizedCallerResult>): List<PrioritizedCallerResult> {
+        val prioritized = resultsByKey.values.filter { it.source == CallerReferenceSource.BARREL_TRAVERSAL }
+        if (prioritized.size >= MAX_RESULTS_PER_LEVEL) {
+            return prioritized.take(MAX_RESULTS_PER_LEVEL)
+        }
+
+        val direct = resultsByKey.values.filter { it.source == CallerReferenceSource.DIRECT }
+        return buildList(MAX_RESULTS_PER_LEVEL) {
+            addAll(prioritized)
+            addAll(direct.take(MAX_RESULTS_PER_LEVEL - size))
+        }
+    }
+
+    private fun collectCallerReferences(
+        methodsToSearch: Set<PsiElement>,
+        searchScope: GlobalSearchScope
+    ): List<CollectedCallerReference> {
+        val pendingSymbols = ArrayDeque<PsiNamedElement>()
+        methodsToSearch
+            .asSequence()
+            .filterIsInstance<PsiNamedElement>()
+            .sortedBy { getPsiTraversalKey(it) }
+            .forEach(pendingSymbols::addLast)
+
+        val rootSymbolKeys = pendingSymbols.mapTo(hashSetOf()) { getPsiTraversalKey(it) }
+        val visitedSymbols = linkedSetOf<String>()
+        val queuedSymbols = pendingSymbols.mapTo(linkedSetOf()) { getPsiTraversalKey(it) }
+        val referencesByKey = linkedMapOf<String, CollectedCallerReference>()
+
+        while (
+            pendingSymbols.isNotEmpty() &&
+            visitedSymbols.size < MAX_BARREL_SYMBOLS_TO_TRAVERSE &&
+            referencesByKey.size < MAX_BARREL_REFERENCES_TO_COLLECT
+        ) {
+            val symbol = pendingSymbols.removeFirst()
+            val symbolKey = getPsiTraversalKey(symbol)
+            queuedSymbols.remove(symbolKey)
+            if (!visitedSymbols.add(symbolKey)) continue
+
+            val referenceSource = if (symbolKey in rootSymbolKeys) {
+                CallerReferenceSource.DIRECT
+            } else {
+                CallerReferenceSource.BARREL_TRAVERSAL
+            }
+
+            ReferencesSearch.search(symbol, searchScope).forEach(Processor { reference ->
+                val referenceKey = buildReferenceKey(reference)
+                if (putCollectedReference(referencesByKey, referenceKey, reference, referenceSource)) {
+                    enqueueBarrelTraversalCandidates(
+                        pendingSymbols,
+                        queuedSymbols,
+                        visitedSymbols,
+                        findBarrelTraversalCandidates(reference.element, methodsToSearch, symbol)
+                    )
+                }
+                referencesByKey.size < MAX_BARREL_REFERENCES_TO_COLLECT
+            })
+
+            val containingFile = symbol.containingFile
+            if (containingFile != null && !symbol.name.isNullOrBlank()) {
+                ReferencesSearch.search(containingFile, searchScope).forEach(Processor { reference ->
+                    val referenceKey = buildReferenceKey(reference)
+                    if (putCollectedReference(referencesByKey, referenceKey, reference, referenceSource)) {
+                        enqueueBarrelTraversalCandidates(
+                            pendingSymbols,
+                            queuedSymbols,
+                            visitedSymbols,
+                            findBarrelTraversalCandidates(reference.element, methodsToSearch, symbol)
+                        )
+                    }
+                    referencesByKey.size < MAX_BARREL_REFERENCES_TO_COLLECT
+                })
+            }
+        }
+
+        return referencesByKey.values.toList()
+    }
+
+    private fun putCollectedReference(
+        referencesByKey: MutableMap<String, CollectedCallerReference>,
+        referenceKey: String,
+        reference: com.intellij.psi.PsiReference,
+        source: CallerReferenceSource
+    ): Boolean {
+        val existing = referencesByKey[referenceKey]
+        if (existing == null) {
+            referencesByKey[referenceKey] = CollectedCallerReference(reference, source)
+            return true
+        }
+
+        if (source == CallerReferenceSource.BARREL_TRAVERSAL && existing.source != CallerReferenceSource.BARREL_TRAVERSAL) {
+            referencesByKey[referenceKey] = CollectedCallerReference(reference, source)
+        }
+        return false
+    }
+
+    private fun enqueueBarrelTraversalCandidates(
+        pendingSymbols: ArrayDeque<PsiNamedElement>,
+        queuedSymbols: MutableSet<String>,
+        visitedSymbols: Set<String>,
+        candidates: List<PsiNamedElement>
+    ) {
+        for (candidate in candidates) {
+            val candidateKey = getPsiTraversalKey(candidate)
+            if (
+                candidateKey !in visitedSymbols &&
+                candidateKey !in queuedSymbols &&
+                queuedSymbols.size + visitedSymbols.size < MAX_BARREL_SYMBOLS_TO_TRAVERSE
+            ) {
+                pendingSymbols.addLast(candidate)
+                queuedSymbols.add(candidateKey)
+            }
+        }
+    }
+
+    private fun findBarrelTraversalCandidates(
+        referenceElement: PsiElement,
+        methodsToSearch: Set<PsiElement>,
+        searchedSymbol: PsiNamedElement
+    ): List<PsiNamedElement> {
+        if (findContainingCallable(referenceElement) != null) return emptyList()
+
+        val candidates = linkedMapOf<String, PsiNamedElement>()
+        val targetSymbols = methodsToSearch + searchedSymbol
+        findSemanticImportExportBindings(referenceElement, targetSymbols, searchedSymbol).forEach { bindingCandidate ->
+            candidates[getPsiTraversalKey(bindingCandidate)] = bindingCandidate
+        }
+
+        if (candidates.isEmpty()) {
+            findContextBindingsByName(referenceElement, searchedSymbol.name).forEach { bindingCandidate ->
+                candidates.putIfAbsent(getPsiTraversalKey(bindingCandidate), bindingCandidate)
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            val bindingCandidate = findNearestImportExportBinding(referenceElement, methodsToSearch)
+            if (bindingCandidate != null) {
+                candidates[getPsiTraversalKey(bindingCandidate)] = bindingCandidate
+            }
+        }
+
+        if (isExportStarContext(referenceElement)) {
+            val symbolNames = buildRelatedSymbolNames(searchedSymbol, methodsToSearch)
+            findMatchingExports(referenceElement.containingFile, symbolNames).forEach { exportCandidate ->
+                val exportKey = getPsiTraversalKey(exportCandidate)
+                if (exportKey !in candidates && exportCandidate !in methodsToSearch) {
+                    candidates[exportKey] = exportCandidate
+                }
+            }
+        }
+
+        return candidates.values.toList()
+    }
+
+    private fun findContextBindingsByName(
+        referenceElement: PsiElement,
+        targetName: String?
+    ): List<PsiNamedElement> {
+        val normalizedTargetName = targetName?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val context = findNearestImportExportContext(referenceElement) ?: return emptyList()
+        val candidates = linkedMapOf<String, PsiNamedElement>()
+
+        PsiTreeUtil.processElements(context) { element ->
+            val named = element as? PsiNamedElement ?: return@processElements true
+            if (!looksLikeImportExportBinding(named)) {
+                return@processElements true
+            }
+
+            if (named.name == normalizedTargetName || named.text.orEmpty().contains(normalizedTargetName)) {
+                candidates.putIfAbsent(getPsiTraversalKey(named), named)
+            }
+            candidates.size < MAX_RESULTS_PER_LEVEL
+        }
+
+        return candidates.values.toList()
+    }
+
+    private fun findSemanticImportExportBindings(
+        referenceElement: PsiElement,
+        targetSymbols: Set<PsiElement>,
+        searchedSymbol: PsiNamedElement
+    ): List<PsiNamedElement> {
+        val context = findNearestImportExportContext(referenceElement) ?: return emptyList()
+        val searchedName = searchedSymbol.name ?: return emptyList()
+        val candidates = linkedMapOf<String, PsiNamedElement>()
+
+        PsiTreeUtil.processElements(context) { element ->
+            val named = element as? PsiNamedElement ?: return@processElements true
+            if (named in targetSymbols || named.name.isNullOrBlank() || !looksLikeImportExportBinding(named)) {
+                return@processElements true
+            }
+
+            val candidateName = named.name.orEmpty()
+            val candidateText = named.text.orEmpty()
+            if (candidateName != searchedName && !candidateText.contains(searchedName)) {
+                return@processElements true
+            }
+
+            if (!bindingSemanticallyTargets(named, targetSymbols)) {
+                return@processElements true
+            }
+
+            candidates.putIfAbsent(getPsiTraversalKey(named), named)
+            candidates.size < MAX_RESULTS_PER_LEVEL
+        }
+
+        return candidates.values.toList()
+    }
+
+    private fun findNearestImportExportContext(referenceElement: PsiElement): PsiElement? {
+        var current: PsiElement? = referenceElement
+        while (current != null && current !is PsiFile) {
+            val className = current.javaClass.name
+            val text = current.text.orEmpty()
+            if ((className.contains("Import") || className.contains("Export")) && text.contains("from")) {
+                return current
+            }
+            current = current.parent
+        }
+        return null
+    }
+
+    private fun bindingSemanticallyTargets(candidate: PsiNamedElement, targetSymbols: Set<PsiElement>): Boolean {
+        val targetKeys = targetSymbols.mapTo(hashSetOf()) { getPsiTraversalKey(it) }
+        return candidate.references.any { reference ->
+            val resolved = reference.resolve() ?: return@any false
+            resolved in targetSymbols || getPsiTraversalKey(resolved) in targetKeys
+        }
+    }
+
+    private fun buildRelatedSymbolNames(searchedSymbol: PsiNamedElement, methodsToSearch: Set<PsiElement>): Set<String> {
+        return buildSet {
+            searchedSymbol.name?.takeIf { it.isNotBlank() }?.let(::add)
+            methodsToSearch.asSequence()
+                .filterIsInstance<PsiNamedElement>()
+                .mapNotNull { it.name?.takeIf(String::isNotBlank) }
+                .forEach(::add)
+        }
+    }
+
+    private fun findNearestImportExportBinding(
+        referenceElement: PsiElement,
+        methodsToSearch: Set<PsiElement>
+    ): PsiNamedElement? {
+        var current: PsiElement? = referenceElement
+        while (current != null && current !is PsiFile) {
+            val named = current as? PsiNamedElement
+            if (
+                named != null &&
+                named !in methodsToSearch &&
+                !named.name.isNullOrBlank() &&
+                looksLikeImportExportBinding(named)
+            ) {
+                return named
+            }
+            current = current.parent
+        }
+        return null
+    }
+
+    private fun looksLikeImportExportBinding(named: PsiNamedElement): Boolean {
+        val className = named.javaClass.name
+        if (
+            className.contains("JSImportSpecifier") ||
+            className.contains("JSImportBinding") ||
+            className.contains("ImportedBinding") ||
+            className.contains("ES6ImportSpecifier") ||
+            className.contains("ES6ExportSpecifier") ||
+            className.contains("ExportSpecifier")
+        ) {
+            return true
+        }
+        return callBooleanMethod(named, "isImported") == true ||
+            callBooleanMethod(named, "isExported") == true ||
+            callBooleanMethod(named, "isExport") == true
+    }
+
+    private fun isExportStarContext(referenceElement: PsiElement): Boolean {
+        var current: PsiElement? = referenceElement
+        while (current != null && current !is PsiFile) {
+            val text = current.text ?: ""
+            if (text.contains("export *")) {
+                return true
+            }
+            current = current.parent
+        }
+        return false
+    }
+
+    private fun findMatchingExports(file: PsiFile?, symbolNames: Set<String>): List<PsiNamedElement> {
+        if (file == null || symbolNames.isEmpty()) return emptyList()
+
+        val exports = linkedMapOf<String, PsiNamedElement>()
+        PsiTreeUtil.processElements(file) { element ->
+            val named = element as? PsiNamedElement
+            val exportName = named?.name
+            if (
+                named != null &&
+                !exportName.isNullOrBlank() &&
+                exportName in symbolNames &&
+                isExportCandidate(named)
+            ) {
+                exports.putIfAbsent(getPsiTraversalKey(named), named)
+            }
+            exports.size < MAX_RESULTS_PER_LEVEL
+        }
+        return exports.values.toList()
+    }
+
+    private fun buildReferenceKey(reference: com.intellij.psi.PsiReference): String {
+        val element = reference.element
+        val range = element.textRange
+        val path = element.containingFile?.virtualFile?.path ?: ""
+        return "$path:${range?.startOffset ?: -1}:${range?.endOffset ?: -1}:${element.text}"
+    }
+
+    private fun getPsiTraversalKey(element: PsiElement): String {
+        val path = element.containingFile?.virtualFile?.path ?: ""
+        val range = element.textRange
+        val name = (element as? PsiNamedElement)?.name ?: ""
+        return "$path:${range?.startOffset ?: -1}:${range?.endOffset ?: -1}:${element.javaClass.name}:$name"
     }
 
     /**
@@ -1174,6 +1915,10 @@ class JavaScriptCallHierarchyHandler : BaseJavaScriptHandler<CallHierarchyData>(
         val functionName = getName(jsFunction) ?: ""
         val file = jsFunction.containingFile?.virtualFile?.path ?: ""
         return "$file:$className.$functionName"
+    }
+
+    private fun getCallElementKey(element: CallElementData): String {
+        return "${element.file}:${element.line}:${element.column}:${element.name}"
     }
 
     private fun createCallElement(project: Project, jsFunction: PsiElement, children: List<CallElementData>? = null): CallElementData {
@@ -1502,7 +2247,11 @@ class JavaScriptStructureHandler : BaseJavaScriptHandler<List<StructureNode>>(),
         }
 
         val name = getName(jsClass) ?: "unknown"
-        val kind = if (getClassKind(jsClass) == "INTERFACE") StructureKind.INTERFACE else StructureKind.CLASS
+        val kind = when {
+            isTypeScriptTypeAlias(jsClass) -> StructureKind.TYPE_ALIAS
+            getClassKind(jsClass) == "INTERFACE" -> StructureKind.INTERFACE
+            else -> StructureKind.CLASS
+        }
 
         return StructureNode(
             name = name,

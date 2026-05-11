@@ -8,6 +8,15 @@ import java.lang.reflect.Proxy
 
 class JavaScriptSymbolReferenceHandlerUnitTest : TestCase() {
 
+    private companion object {
+        const val FIXTURE_PROJECT_ROOT = "src/webstormIntegration"
+        const val OVERLOADED_EXPORT_SYMBOL = "$FIXTURE_PROJECT_ROOT/overloads/overloaded-export#getProjectId"
+        const val NAMED_BARREL_SYMBOL = "$FIXTURE_PROJECT_ROOT/barrels/named-barrel#loadPluginConfig"
+        const val EXPORT_STAR_BARREL_SYMBOL = "$FIXTURE_PROJECT_ROOT/barrels/export-star-barrel#loadPluginConfig"
+        const val TYPE_ALIAS_SYMBOL = "$FIXTURE_PROJECT_ROOT/types/type-alias-vs-interface#FileStructureAlias"
+        const val DERIVED_TYPE_SYMBOL = "$FIXTURE_PROJECT_ROOT/derived/const-derived-types#formatThothStatus"
+    }
+
     private fun fakeNamedElement(): PsiNamedElement {
         return Proxy.newProxyInstance(
             PsiNamedElement::class.java.classLoader,
@@ -95,29 +104,82 @@ class JavaScriptSymbolReferenceHandlerUnitTest : TestCase() {
         assertEquals(ErrorMessages.jsTsUnsupportedGrammar(symbol), error)
     }
 
+    fun testParserAcceptsOverloadFixtureSymbol() {
+        val parsed = parseJsTsSymbolTarget(OVERLOADED_EXPORT_SYMBOL).getOrThrow()
+        assertEquals(
+            JsTsSymbolTarget.NamedExport("$FIXTURE_PROJECT_ROOT/overloads/overloaded-export", "getProjectId"),
+            parsed
+        )
+    }
+
+    fun testParserAcceptsNamedBarrelFixtureSymbol() {
+        val parsed = parseJsTsSymbolTarget(NAMED_BARREL_SYMBOL).getOrThrow()
+        assertEquals(
+            JsTsSymbolTarget.NamedExport("$FIXTURE_PROJECT_ROOT/barrels/named-barrel", "loadPluginConfig"),
+            parsed
+        )
+    }
+
+    fun testParserAcceptsExportStarBarrelFixtureSymbol() {
+        val parsed = parseJsTsSymbolTarget(EXPORT_STAR_BARREL_SYMBOL).getOrThrow()
+        assertEquals(
+            JsTsSymbolTarget.NamedExport("$FIXTURE_PROJECT_ROOT/barrels/export-star-barrel", "loadPluginConfig"),
+            parsed
+        )
+    }
+
+    fun testParserAcceptsTypeAliasFixtureSymbol() {
+        val parsed = parseJsTsSymbolTarget(TYPE_ALIAS_SYMBOL).getOrThrow()
+        assertEquals(
+            JsTsSymbolTarget.NamedExport("$FIXTURE_PROJECT_ROOT/types/type-alias-vs-interface", "FileStructureAlias"),
+            parsed
+        )
+    }
+
+    fun testParserAcceptsDerivedTypeFixtureSymbol() {
+        val parsed = parseJsTsSymbolTarget(DERIVED_TYPE_SYMBOL).getOrThrow()
+        assertEquals(
+            JsTsSymbolTarget.NamedExport("$FIXTURE_PROJECT_ROOT/derived/const-derived-types", "formatThothStatus"),
+            parsed
+        )
+    }
+
+    fun testUnsupportedGrammarCoverageHookForOverloadStyleDisambiguation() {
+        val symbol = "$FIXTURE_PROJECT_ROOT/overloads/overloaded-export#getProjectId(string)"
+        val error = parseJsTsSymbolTarget(symbol).exceptionOrNull()?.message
+
+        assertEquals(ErrorMessages.jsTsUnsupportedGrammar(symbol), error)
+        assertTrue(error?.startsWith("unsupported_grammar:") == true)
+        assertTrue(error?.contains("modulePath#exportName") == true)
+        // Coverage hook for Phase 5.1: unsupported overload-disambiguation grammar must keep pointing
+        // callers toward supported forms until file+line+column fallback guidance is tightened.
+    }
+
     fun testDeterministicNotFoundMessage() {
         val symbol = "src/missing#missingExport"
         val error = ErrorMessages.jsTsNotFound(symbol)
-        assertEquals("not_found: No declaration found for symbol '$symbol'", error)
+        assertTrue(error.startsWith("not_found: No declaration found for symbol '$symbol'"))
+        assertTrue(error.contains("use file+line+column instead"))
     }
 
     fun testDeterministicAmbiguousMessage() {
         val symbol = "src/utils#format"
         val candidates = listOf("src/utils.ts#format", "src/utils/index.ts#format")
         val error = ErrorMessages.jsTsAmbiguousMatch(symbol, candidates)
-        assertEquals(
-            "ambiguous_match: Multiple declarations match symbol '$symbol'. Candidates: src/utils.ts#format, src/utils/index.ts#format",
-            error
-        )
+        assertTrue(error.startsWith("ambiguous_match: Multiple declarations match symbol '$symbol'. Candidates: "))
+        assertTrue(error.contains(candidates.joinToString(", ")))
+        assertTrue(error.contains("use file+line+column instead"))
     }
 
     fun testDeterministicUnsupportedCapabilityMessage() {
         val reason = "JavaScript plugin not installed"
         val error = ErrorMessages.jsTsUnsupportedLanguageCapability(reason)
-        assertEquals(
-            "unsupported_language_capability: JavaScript/TypeScript symbol resolution is not available in this IDE session. Reason: $reason",
-            error
+        assertTrue(
+            error.startsWith(
+                "unsupported_language_capability: JavaScript/TypeScript symbol resolution is not available in this IDE session. Reason: $reason"
+            )
         )
+        assertTrue(error.contains("Use file+line+column instead"))
     }
 
     fun testModuleCandidateExpansionWithoutExtensionIsDeterministic() {
@@ -178,5 +240,21 @@ class JavaScriptSymbolReferenceHandlerUnitTest : TestCase() {
             ErrorMessages.jsTsUnsupportedLanguageCapability("JavaScript PSI classes are unavailable"),
             error
         )
+    }
+
+    fun testImplementationBodyHeuristicRejectsObjectLiteralReturnTypeOverloadSignature() {
+        val source = "export function getProjectId(input: string): { id: string };"
+
+        assertFalse(hasImplementationBodyByText(source))
+    }
+
+    fun testImplementationBodyHeuristicAcceptsObjectLiteralReturnTypeImplementation() {
+        val source = """
+            export function getProjectId(input: string): { id: string } {
+              return { id: input };
+            }
+        """.trimIndent()
+
+        assertTrue(hasImplementationBodyByText(source))
     }
 }

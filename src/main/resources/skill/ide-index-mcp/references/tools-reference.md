@@ -25,7 +25,18 @@ Complete parameter reference for all IDE MCP tools. All tools use JSON-RPC via M
 - `not_found` — module path resolved but symbol not found in exports/members
 - `ambiguous_match` — multiple matching exports/members across candidate files
 
-**Note:** Bare global symbol lookup and deep barrel/re-export graph traversal are outside primary v1 behavior. Module-qualified lookup is deterministic and bounded.
+**Fallback TypeScript cases:** Use `file` + `line` + `column` for local non-exported symbols, local import aliases, npm/package symbols, unresolved barrel/re-export chains, or any target that cannot be represented as a stable module-qualified export.
+
+**Example fallback:**
+```json
+{
+  "file": "src/utils/math.ts",
+  "line": 18,
+  "column": 12
+}
+```
+
+**Note:** Module-qualified lookup remains v1 grammar and bounded; unsupported cases should fall back to `file` + `line` + `column`.
 
 ## Response Format
 
