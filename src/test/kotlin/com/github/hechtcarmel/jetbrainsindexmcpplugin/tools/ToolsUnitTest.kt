@@ -470,6 +470,73 @@ class ToolsUnitTest : TestCase() {
         assertEquals(listOf("all", "none", "accessors_and_tests", "ask"), enumValues)
     }
 
+    fun testRenameSymbolToolBypassesDialogSubstitutionForHeadlessJsTsFileRename() {
+        assertTrue(
+            "TypeScript file rename should keep the PsiFile target in headless mode to avoid JS/TS related-symbol dialogs",
+            RenameSymbolTool.shouldBypassDialogSubstitutionForFileRename("TypeScript", "rename_base")
+        )
+        assertTrue(
+            "JavaScript file rename should keep the PsiFile target in headless mode to avoid JS/TS related-symbol dialogs",
+            RenameSymbolTool.shouldBypassDialogSubstitutionForFileRename("JavaScript", "rename_only_current")
+        )
+
+        assertFalse(
+            "Explicit ask mode should preserve IDE dialog behavior",
+            RenameSymbolTool.shouldBypassDialogSubstitutionForFileRename("TypeScript", "ask")
+        )
+        assertFalse(
+            "Non-JS/TS file renames should keep the existing substitution behavior",
+            RenameSymbolTool.shouldBypassDialogSubstitutionForFileRename("JAVA", "rename_base")
+        )
+    }
+
+    fun testRenameSymbolToolRetargetsJsTsModuleSpecifiersAfterFileRename() {
+        val source = """
+            import { leafThing } from './leaf';
+            import './leaf';
+            const lazy = import('./leaf');
+            const cjs = require('./leaf.ts');
+            export { leafThing as exportedLeafThing } from './leaf';
+            const untouched = "from './leaf'";
+            // from './leaf'
+            import { otherThing } from './other';
+        """.trimIndent()
+
+        val updated = RenameSymbolTool.retargetJsTsModuleSpecifiers(
+            source = source,
+            importerDirPath = "C:/repo/src",
+            oldFilePath = "C:/repo/src/leaf.ts",
+            newFilePath = "C:/repo/src/leaf-renamed.ts"
+        )
+
+        assertTrue(updated.contains("from './leaf-renamed'"))
+        assertTrue(updated.contains("import './leaf-renamed'"))
+        assertTrue(updated.contains("import('./leaf-renamed')"))
+        assertTrue(updated.contains("require('./leaf-renamed.ts')"))
+        assertTrue(updated.contains("const untouched = \"from './leaf'\""))
+        assertTrue(updated.contains("// from './leaf'"))
+        assertTrue(updated.contains("from './other'"))
+    }
+
+    fun testRenameSymbolToolBuildsRelativeSpecifiersAcrossDirectories() {
+        assertEquals(
+            "../models/leaf-renamed",
+            RenameSymbolTool.relativeModuleSpecifier(
+                importerDirPath = "C:/repo/src/features",
+                targetFilePath = "C:/repo/src/models/leaf-renamed.ts",
+                includeExtension = false
+            )
+        )
+        assertEquals(
+            "./leaf-renamed.ts",
+            RenameSymbolTool.relativeModuleSpecifier(
+                importerDirPath = "C:/repo/src/models",
+                targetFilePath = "C:/repo/src/models/leaf-renamed.ts",
+                includeExtension = true
+            )
+        )
+    }
+
     fun testSafeDeleteToolSchema() {
         val tool = SafeDeleteTool()
 

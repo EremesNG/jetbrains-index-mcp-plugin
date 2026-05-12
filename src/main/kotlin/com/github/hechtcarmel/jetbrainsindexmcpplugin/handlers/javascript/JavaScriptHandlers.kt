@@ -677,16 +677,13 @@ class JavaScriptSymbolReferenceHandler(
     }
 
     private fun findClassMember(file: PsiFile, className: String, memberName: String): PsiNamedElement? {
-        val classCandidates = mutableListOf<PsiElement>()
-        PsiTreeUtil.processElements(file) { element ->
-            val named = element as? PsiNamedElement
-            if (named != null && named.name == className && isClassLike(named)) {
-                classCandidates.add(named)
-            }
-            true
-        }
+        val classCandidates = findClassCandidates(file, className)
         if (classCandidates.size != 1) return null
         val classElement = classCandidates.single()
+
+        findMethodInClass(classElement, memberName)?.let { method ->
+            return method as? PsiNamedElement
+        }
 
         val memberMatches = mutableListOf<PsiNamedElement>()
         PsiTreeUtil.processElements(classElement) { element ->
@@ -697,6 +694,39 @@ class JavaScriptSymbolReferenceHandler(
             true
         }
         return memberMatches.singleOrNull()
+    }
+
+    private fun findClassCandidates(file: PsiFile, className: String): List<PsiElement> {
+        val candidates = mutableListOf<PsiElement>()
+        val seen = mutableSetOf<PsiElement>()
+        fun addCandidate(candidate: PsiElement) {
+            if (seen.add(candidate)) {
+                candidates.add(candidate)
+            }
+        }
+
+        PsiTreeUtil.processElements(file) { element ->
+            val named = element as? PsiNamedElement
+            if (named != null && named.name == className && isClassLike(named)) {
+                addCandidate(named)
+            } else if (named != null && named.name == className) {
+                val containingClass = findContainingJSClass(named)
+                if (containingClass != null && getName(containingClass) == className) {
+                    addCandidate(containingClass)
+                }
+            }
+            true
+        }
+        if (candidates.isNotEmpty()) return candidates
+
+        PsiTreeUtil.processElements(file) { element ->
+            val named = element as? PsiNamedElement
+            if (named != null && named.name == className && looksLikeClassDeclaration(named)) {
+                addCandidate(named)
+            }
+            true
+        }
+        return candidates
     }
 
     private fun isDefaultExportCandidate(named: PsiNamedElement): Boolean {
@@ -710,7 +740,18 @@ class JavaScriptSymbolReferenceHandler(
     private fun isClassLike(named: PsiNamedElement): Boolean {
         val className = named.javaClass.name
         if (className.contains("JSClass")) return true
+        if (isJSClass(named)) return true
         return callBooleanMethod(named, "isClass") == true
+    }
+
+    private fun looksLikeClassDeclaration(named: PsiNamedElement): Boolean {
+        val source = named.text.trimStart()
+        return source.startsWith("class ") ||
+            source.startsWith("export class ") ||
+            source.startsWith("abstract class ") ||
+            source.startsWith("export abstract class ") ||
+            source.startsWith("interface ") ||
+            source.startsWith("export interface ")
     }
 
     private fun isClassMemberLike(named: PsiNamedElement): Boolean {
