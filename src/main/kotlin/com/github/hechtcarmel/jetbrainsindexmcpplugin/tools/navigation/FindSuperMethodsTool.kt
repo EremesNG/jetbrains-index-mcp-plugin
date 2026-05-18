@@ -4,6 +4,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.constants.ErrorMessages
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.constants.ParamNames
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.constants.ToolNames
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.LanguageHandlerRegistry
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderBackendSemanticService
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.models.ToolCallResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.AbstractMcpTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.MethodInfo
@@ -11,23 +12,30 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.SuperMethodIn
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.SuperMethodsResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.schema.SchemaBuilder
 import com.intellij.openapi.project.Project
+import com.intellij.psi.PsiElement
 import kotlinx.serialization.json.JsonObject
 
 /**
  * Tool for finding super methods across multiple languages.
  *
- * Supports: Java, Kotlin, Python, JavaScript, TypeScript, PHP, Rust
+ * Supports: Java, Kotlin, Python, JavaScript, TypeScript, PHP, C#, F#
  *
  * Delegates to language-specific handlers via [LanguageHandlerRegistry].
  */
 class FindSuperMethodsTool : AbstractMcpTool() {
+
+    companion object {
+        private const val RIDER_SYMBOL_MODE_UNSUPPORTED = "Rider C#/F# symbol-mode super methods require backend-native symbol resolution and are unsupported for symbol requests the backend cannot map to source positions."
+    }
 
     override val name = ToolNames.FIND_SUPER_METHODS
 
     override val description = """
         Find parent methods that a method overrides or implements. Use to navigate up the inheritance chain—from implementation to interface, or from override to original declaration.
 
-        Languages: Java, Kotlin, Python, JavaScript, TypeScript, PHP.
+        Languages: Java, Kotlin, Python, JavaScript, TypeScript, PHP, C#, F#.
+
+        Rider note: C#/F# results use declaration supertypes exposed by Rider's frontend navigation bridge to the ReSharper backend; parent method locations may be unavailable.
 
         NOT supported for Rust: Rust uses trait implementations rather than classical inheritance, so there are no "super methods" in the traditional sense. Use ide_find_definition or ide_type_hierarchy instead.
 
@@ -35,7 +43,7 @@ class FindSuperMethodsTool : AbstractMcpTool() {
 
         Target (mutually exclusive):
         - file + line + column: position-based lookup (position can be anywhere within the method body)
-        - language + symbol: fully qualified symbol reference (currently supported for Java only)
+        - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#)
 
         Example: {"file": "src/UserServiceImpl.java", "line": 25, "column": 10}
         Example: {"language": "Java", "symbol": "com.example.UserServiceImpl#getUser(String)"}
@@ -49,18 +57,28 @@ class FindSuperMethodsTool : AbstractMcpTool() {
         .build()
 
     override suspend fun doExecute(project: Project, arguments: JsonObject): ToolCallResult {
+        val requestedLanguage = optionalStringArg(arguments, ParamNames.LANGUAGE)
+        val requestedSymbol = optionalStringArg(arguments, ParamNames.SYMBOL)
+        val isRiderSymbolMode = resolveLookupMode(arguments) == LookupModeState.SYMBOL &&
+            requestedLanguage in setOf("C#", "F#") &&
+            requestedSymbol != null
         requireSmartMode(project)
 
         return suspendingReadAction {
-            val element = resolveElementFromArguments(project, arguments, allowLibraryFilesForPosition = true).getOrElse {
+            val riderSymbolElement = resolveRiderSymbolModeElement(project, requestedLanguage, requestedSymbol, isRiderSymbolMode)
+            val element = (riderSymbolElement
+                ?: resolveElementFromArguments(project, arguments, allowLibraryFilesForPosition = true)).getOrElse {
                 return@suspendingReadAction createErrorResult(it.message ?: ErrorMessages.COULD_NOT_RESOLVE_SYMBOL)
             }
 
             // Find appropriate handler for this element's language
             val handler = LanguageHandlerRegistry.getSuperMethodsHandler(element)
             if (handler == null) {
+                if (isRiderSymbolMode) {
+                    return@suspendingReadAction createErrorResult(RIDER_SYMBOL_MODE_UNSUPPORTED)
+                }
                 return@suspendingReadAction createErrorResult(
-                    "No super methods handler available for language: ${element.language.id}. " +
+                    "No super methods handler registered for detected PSI language: ${element.language.id}. " +
                     "Supported languages: ${LanguageHandlerRegistry.getSupportedLanguagesForSuperMethods()}"
                 )
             }
@@ -102,5 +120,20 @@ class FindSuperMethodsTool : AbstractMcpTool() {
                 totalCount = superMethodsData.hierarchy.size
             ))
         }
+    }
+
+    private fun resolveRiderSymbolModeElement(
+        project: Project,
+        language: String?,
+        symbol: String?,
+        isRiderSymbolMode: Boolean
+    ): Result<PsiElement>? {
+        if (!isRiderSymbolMode || language == null || symbol == null) return null
+
+        val (file, line, column) = RiderBackendSemanticService.resolveSymbolToPosition(project, language, symbol)
+            ?: return Result.failure(UnsupportedOperationException(RIDER_SYMBOL_MODE_UNSUPPORTED))
+        val element = findNavigablePsiElement(project, file, line, column)
+            ?: return Result.failure(UnsupportedOperationException(RIDER_SYMBOL_MODE_UNSUPPORTED))
+        return Result.success(element)
     }
 }

@@ -5,6 +5,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.constants.ParamNames
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.BuiltInSearchScope
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.BuiltInSearchScopeResolver
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.LanguageHandlerRegistry
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.dotnet.RiderBackendSemanticService
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.PaginationService
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.ProjectResolver
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.models.ToolCallResult
@@ -14,6 +15,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.Implementatio
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.schema.SchemaBuilder
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
+import com.intellij.psi.PsiElement
 import com.intellij.psi.util.PsiModificationTracker
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonElement
@@ -27,7 +29,7 @@ import kotlinx.serialization.json.put
 /**
  * Tool for finding implementations of interfaces, abstract classes, or methods across multiple languages.
  *
- * Supports: Java, Kotlin, Python, JavaScript, TypeScript, PHP, Rust
+ * Supports: Java, Kotlin, Python, JavaScript, TypeScript, PHP, Rust, C#, F#
  *
  * Delegates to language-specific handlers via [LanguageHandlerRegistry].
  */
@@ -36,6 +38,7 @@ class FindImplementationsTool : AbstractMcpTool() {
     companion object {
         private const val DEFAULT_PAGE_SIZE = 100
         private const val MAX_PAGE_SIZE = PaginationService.MAX_PAGE_SIZE
+        private const val RIDER_SYMBOL_MODE_UNSUPPORTED = "Rider C#/F# symbol-mode implementations require backend-native symbol resolution and are unsupported for symbol requests the backend cannot map to source positions."
     }
 
     override val name = "ide_find_implementations"
@@ -43,7 +46,9 @@ class FindImplementationsTool : AbstractMcpTool() {
     override val description = """
         Find all implementations of an interface, abstract class, or abstract method. Use to discover concrete implementations when working with abstractions.
 
-        Languages: Java, Kotlin, Python, JavaScript, TypeScript, PHP, Rust.
+        Languages: Java, Kotlin, Python, JavaScript, TypeScript, PHP, Rust, C#, F#.
+
+        Rider note: C#/F# results use Rider's frontend navigation bridge to the ReSharper backend.
 
         Returns: list of implementing classes/methods with file paths, line/column numbers, and kind (class/method).
 
@@ -51,7 +56,7 @@ class FindImplementationsTool : AbstractMcpTool() {
 
         Target (mutually exclusive):
         - file + line + column: position-based lookup (necessary for fresh search, ignored when cursor is provided)
-        - language + symbol: fully qualified symbol reference (currently supported for Java only; necessary for fresh search, ignored when cursor is provided)
+        - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#; necessary for fresh search, ignored when cursor is provided)
         - cursor: pagination cursor from a previous response
 
         Parameters: scope (optional, default: "project_files"; supported: project_files, project_and_libraries, project_production_files, project_test_files), pageSize (optional, default: 100, max: 500).
@@ -72,6 +77,11 @@ class FindImplementationsTool : AbstractMcpTool() {
 
     override suspend fun doExecute(project: Project, arguments: JsonObject): ToolCallResult {
         val cursor = optionalStringArg(arguments, ParamNames.CURSOR)
+        val requestedLanguage = optionalStringArg(arguments, ParamNames.LANGUAGE)
+        val requestedSymbol = optionalStringArg(arguments, ParamNames.SYMBOL)
+        val isRiderSymbolMode = resolveLookupMode(arguments) == LookupModeState.SYMBOL &&
+            requestedLanguage in setOf("C#", "F#") &&
+            requestedSymbol != null
         if (cursor != null) {
             val pageSize = resolveExplicitPageSize(arguments)
             return buildPaginatedResult<ImplementationLocation, ImplementationResult>(getPageFromCache(cursor, pageSize, project)) { items, page ->
@@ -100,14 +110,19 @@ class FindImplementationsTool : AbstractMcpTool() {
         requireSmartMode(project)
 
         val cursorToken = suspendingReadAction {
-            val element = resolveElementFromArguments(project, arguments, allowLibraryFilesForPosition = true).getOrElse {
+            val riderSymbolElement = resolveRiderSymbolModeElement(project, requestedLanguage, requestedSymbol, isRiderSymbolMode)
+            val element = (riderSymbolElement
+                ?: resolveElementFromArguments(project, arguments, allowLibraryFilesForPosition = true)).getOrElse {
                 return@suspendingReadAction null to createErrorResult(it.message ?: ErrorMessages.COULD_NOT_RESOLVE_SYMBOL)
             }
 
             val handler = LanguageHandlerRegistry.getImplementationsHandler(element)
             if (handler == null) {
+                if (isRiderSymbolMode) {
+                    return@suspendingReadAction null to createErrorResult(RIDER_SYMBOL_MODE_UNSUPPORTED)
+                }
                 return@suspendingReadAction null to createErrorResult(
-                    "No implementations handler available for language: ${element.language.id}. " +
+                    "No implementations handler registered for detected PSI language: ${element.language.id}. " +
                     "Supported languages: ${LanguageHandlerRegistry.getSupportedLanguagesForImplementations()}"
                 )
             }
@@ -167,6 +182,21 @@ class FindImplementationsTool : AbstractMcpTool() {
                 stale = page.stale
             )
         }
+    }
+
+    private fun resolveRiderSymbolModeElement(
+        project: Project,
+        language: String?,
+        symbol: String?,
+        isRiderSymbolMode: Boolean
+    ): Result<PsiElement>? {
+        if (!isRiderSymbolMode || language == null || symbol == null) return null
+
+        val (file, line, column) = RiderBackendSemanticService.resolveSymbolToPosition(project, language, symbol)
+            ?: return Result.failure(UnsupportedOperationException(RIDER_SYMBOL_MODE_UNSUPPORTED))
+        val element = findNavigablePsiElement(project, file, line, column)
+            ?: return Result.failure(UnsupportedOperationException(RIDER_SYMBOL_MODE_UNSUPPORTED))
+        return Result.success(element)
     }
 
 

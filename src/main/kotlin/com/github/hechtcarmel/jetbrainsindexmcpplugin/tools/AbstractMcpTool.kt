@@ -23,6 +23,7 @@ import com.intellij.openapi.application.asContextElement
 import com.intellij.openapi.application.readAction as platformReadAction
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.editor.Document
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
@@ -30,6 +31,7 @@ import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.vfs.LocalFileSystem
 import java.io.File
 import com.intellij.openapi.vfs.VfsUtil
+import com.intellij.openapi.vfs.VfsUtilCore
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiElement
@@ -126,7 +128,7 @@ abstract class AbstractMcpTool : McpTool {
      * - Only check status (e.g., index status)
      * - Don't interact with PSI indices or search APIs
      *
-     * @see ensurePsiUpToDate
+     * @see refreshProjectRootsAndCommit
      * @see McpSettings.syncExternalChanges
      */
     protected open val requiresPsiSync: Boolean = true
@@ -146,18 +148,16 @@ abstract class AbstractMcpTool : McpTool {
     }
 
     /**
-     * Commits all documents in a write-safe context.
+     * Commits all documents in a write-safe EDT command.
      *
-     * [PsiDocumentManager.commitAllDocuments] requires a write-safe EDT context.
-     * MCP HTTP handlers run from coroutine worker threads and may carry a
-     * write-unsafe modality context, so this must not use synchronous transaction
-     * submission inherited from the caller.
+     * MCP tools are typically invoked from background HTTP/coroutine contexts, so
+     * document commits must hop to the EDT before entering a write command. Using the
+     * same EDT/write-command path from both background and already-EDT callers avoids
+     * write-unsafe synchronous transaction waits in Rider.
      */
     protected suspend fun commitDocuments(project: Project) {
-        if (ApplicationManager.getApplication().isDispatchThread) {
-            PsiDocumentManager.getInstance(project).commitAllDocuments()
-        } else {
-            withContext(Dispatchers.EDT + ModalityState.nonModal().asContextElement()) {
+        edtAction {
+            WriteCommandAction.runWriteCommandAction(project) {
                 PsiDocumentManager.getInstance(project).commitAllDocuments()
             }
         }
@@ -174,7 +174,7 @@ abstract class AbstractMcpTool : McpTool {
      *
      * Uses non-blocking coroutine approach to avoid EDT freezes.
      */
-    private suspend fun ensurePsiUpToDate(project: Project) {
+    protected suspend fun refreshProjectRootsAndCommit(project: Project) {
         // 1. Force VFS to see external changes before PSI work proceeds.
         // Refresh all content roots (includes workspace sub-project directories)
         val dirsToRefresh = mutableListOf<VirtualFile>()
@@ -191,8 +191,32 @@ abstract class AbstractMcpTool : McpTool {
             VfsUtil.markDirtyAndRefresh(false, true, true, *dirsToRefresh.toTypedArray())
         }
 
+        // 1b. Reload any cached documents backed by externally changed files.
+        // Commiting alone preserves stale in-memory text; when auto-sync is enabled we must
+        // also pull disk contents into cached documents, while preserving unsaved editor work.
+        reloadCachedDocumentsFromDisk(dirsToRefresh)
+
         // 2. Commit Documents in a write-safe context
         commitDocuments(project)
+    }
+
+    private suspend fun reloadCachedDocumentsFromDisk(roots: List<VirtualFile>) {
+        if (roots.isEmpty()) return
+
+        edtAction {
+            val fileDocumentManager = FileDocumentManager.getInstance()
+            roots.forEach { root ->
+                VfsUtilCore.iterateChildrenRecursively(root, null) { virtualFile ->
+                    if (!virtualFile.isDirectory) {
+                        val cachedDocument = fileDocumentManager.getCachedDocument(virtualFile)
+                        if (cachedDocument != null && !fileDocumentManager.isDocumentUnsaved(cachedDocument)) {
+                            fileDocumentManager.reloadFromDisk(cachedDocument)
+                        }
+                    }
+                    true
+                }
+            }
+        }
     }
 
     /**
@@ -213,7 +237,7 @@ abstract class AbstractMcpTool : McpTool {
     final override suspend fun execute(project: Project, arguments: JsonObject): ToolCallResult {
         val settings = McpSettings.getInstance()
         if (requiresPsiSync && settings.syncExternalChanges) {
-            ensurePsiUpToDate(project)
+            refreshProjectRootsAndCommit(project)
         }
         return doExecute(project, arguments)
     }
@@ -437,8 +461,7 @@ abstract class AbstractMcpTool : McpTool {
     protected enum class LookupModeState {
         MISSING,
         POSITION,
-        SYMBOL,
-        CONFLICT
+        SYMBOL
     }
 
     /**
@@ -452,6 +475,15 @@ abstract class AbstractMcpTool : McpTool {
     }
 
     /**
+     * Returns a normalized optional integer argument.
+     * Missing/null/blank/whitespace-only values are treated as absent (null).
+     */
+    protected fun optionalIntArg(arguments: JsonObject, name: String): Int? {
+        val value = optionalStringArg(arguments, name) ?: return null
+        return value.toIntOrNull()
+    }
+
+    /**
      * Returns a required non-blank string argument.
      * Missing/null/blank values fail with a missing-required-parameter error.
      */
@@ -462,21 +494,28 @@ abstract class AbstractMcpTool : McpTool {
         return Result.success(value)
     }
 
+    protected fun hasCompletePositionTarget(arguments: JsonObject): Boolean =
+        optionalStringArg(arguments, ParamNames.FILE) != null &&
+            optionalIntArg(arguments, ParamNames.LINE) != null &&
+            optionalIntArg(arguments, ParamNames.COLUMN) != null
+
+    protected fun hasCompleteSymbolTarget(arguments: JsonObject): Boolean =
+        optionalStringArg(arguments, ParamNames.LANGUAGE) != null &&
+            optionalStringArg(arguments, ParamNames.SYMBOL) != null
+
     /**
-     * Resolves whether arguments represent position lookup, symbol lookup, conflict, or missing mode.
-     * Blank string fields do not count as present.
+     * Resolves lookup mode using normalized arguments.
+     * Blank string fields and blank numeric strings do not count as present.
+     *
+     * Selection policy:
+     * 1. Prefer complete position targets (`file` + `line` + `column`) because they are more precise.
+     * 2. Otherwise use complete symbol targets (`language` + `symbol`).
+     * 3. Otherwise report missing target information.
      */
     protected fun resolveLookupMode(arguments: JsonObject): LookupModeState {
-        val hasSymbol = optionalStringArg(arguments, ParamNames.LANGUAGE) != null ||
-            optionalStringArg(arguments, ParamNames.SYMBOL) != null
-        val hasPosition = optionalStringArg(arguments, ParamNames.FILE) != null ||
-            arguments[ParamNames.LINE]?.jsonPrimitive?.int != null ||
-            arguments[ParamNames.COLUMN]?.jsonPrimitive?.int != null
-
         return when {
-            hasSymbol && hasPosition -> LookupModeState.CONFLICT
-            hasSymbol -> LookupModeState.SYMBOL
-            hasPosition -> LookupModeState.POSITION
+            hasCompletePositionTarget(arguments) -> LookupModeState.POSITION
+            hasCompleteSymbolTarget(arguments) -> LookupModeState.SYMBOL
             else -> LookupModeState.MISSING
         }
     }
@@ -507,8 +546,7 @@ abstract class AbstractMcpTool : McpTool {
 
     /**
      * Resolves a PSI element from arguments using either `language`+`symbol` or `file`+`line`+`column`.
-     *
-     * These two parameter groups are mutually exclusive.
+     * Complete position targets take precedence over complete symbol targets.
      *
      * The symbol path always returns a [com.intellij.psi.PsiNamedElement] (the declaration);
      * the position path returns a leaf token that callers must resolve further.
@@ -526,12 +564,10 @@ abstract class AbstractMcpTool : McpTool {
         val language = optionalStringArg(arguments, ParamNames.LANGUAGE)
         val symbol = optionalStringArg(arguments, ParamNames.SYMBOL)
         val file = optionalStringArg(arguments, ParamNames.FILE)
-        val line = arguments[ParamNames.LINE]?.jsonPrimitive?.int
-        val column = arguments[ParamNames.COLUMN]?.jsonPrimitive?.int
+        val line = optionalIntArg(arguments, ParamNames.LINE)
+        val column = optionalIntArg(arguments, ParamNames.COLUMN)
 
         return when (resolveLookupMode(arguments)) {
-            LookupModeState.CONFLICT -> ErrorMessages.SYMBOL_AND_POSITION_EXCLUSIVE.toArgumentFailure()
-
             LookupModeState.SYMBOL -> {
                 if (language == null) return ErrorMessages.missingParamForSymbol(ParamNames.LANGUAGE).toArgumentFailure()
                 if (symbol == null) return ErrorMessages.missingParamForSymbol(ParamNames.SYMBOL).toArgumentFailure()
@@ -671,8 +707,8 @@ abstract class AbstractMcpTool : McpTool {
         maxPageSize: Int = PaginationService.MAX_PAGE_SIZE,
         vararg aliases: String
     ): Int {
-        val raw = arguments["pageSize"]?.jsonPrimitive?.int
-            ?: aliases.firstNotNullOfOrNull { arguments[it]?.jsonPrimitive?.int }
+        val raw = optionalIntArg(arguments, "pageSize")
+            ?: aliases.firstNotNullOfOrNull { optionalIntArg(arguments, it) }
             ?: defaultPageSize
         return raw.coerceIn(1, maxPageSize)
     }
@@ -686,8 +722,8 @@ abstract class AbstractMcpTool : McpTool {
         maxPageSize: Int = PaginationService.MAX_PAGE_SIZE,
         vararg aliases: String
     ): Int? {
-        val raw = arguments["pageSize"]?.jsonPrimitive?.int
-            ?: aliases.firstNotNullOfOrNull { arguments[it]?.jsonPrimitive?.int }
+        val raw = optionalIntArg(arguments, "pageSize")
+            ?: aliases.firstNotNullOfOrNull { optionalIntArg(arguments, it) }
             ?: return null
         return raw.coerceIn(1, maxPageSize)
     }
