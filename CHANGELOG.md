@@ -84,6 +84,10 @@
 ### Added
 - Added Rider C# and F# language handlers for hierarchy, implementation, call hierarchy, super-method, and file-structure tools using Rider's frontend navigation bridge to the ReSharper backend.
 
+## [4.16.3] - 2026-05-06
+### Fixed
+- **`ide_refactor_rename` no longer fails while committing documents from MCP requests** — Document commits now switch to a write-safe non-modal EDT context instead of using deprecated synchronous transaction submission from the request coroutine's write-unsafe modality. Fixes [#172](https://github.com/hechtcarmel/jetbrains-index-mcp-plugin/issues/172).
+
 ## [4.16.2] - 2026-05-03
 ### Fixed
 - **Blank pagination cursors now start fresh searches** — Search/navigation tools now treat missing, null, blank, and whitespace-only `cursor` values as absent, so clients that send `"cursor": ""` no longer get invalid-cursor errors.
