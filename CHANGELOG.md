@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+## [4.17.3] - 2026-05-21
+### Fixed
+- Fixed `ide_move_file` PHP namespace inference for monorepos where `composer.json` is nested below the opened project root. The PHP semantic move now discovers the nearest ancestor Composer PSR-4 mapping and resolves it relative to that Composer file, so moves under nested source roots can update namespaces correctly. Fixes [#185](https://github.com/hechtcarmel/jetbrains-index-mcp-plugin/issues/185).
+
 ## [4.17.2] - 2026-05-18
 ### Fixed
 - De-duplicated PHP interface and trait names in `ide_file_structure` class signatures.
