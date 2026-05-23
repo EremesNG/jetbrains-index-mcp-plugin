@@ -3,6 +3,10 @@
 # IDE Index MCP Server Changelog
 
 ## [Unreleased]
+### Added
+- **PHP symbol reference handler** — PHP now supports `language`+`symbol` parameter mode for `ide_find_references`, `ide_find_definition`, `ide_call_hierarchy`, `ide_find_implementations`, and `ide_find_super_methods`. Accepts symbol formats with PHP namespaces (e.g., `\\App\\Service\\UserService`, `\\App\\Service\\UserService::find()`, `\\App\\Service\\UserService::$property`). Fixes [#179](https://github.com/hechtcarmel/jetbrains-index-mcp-plugin/issues/179).
+- **PHP symbol reference member lookup** — Inherited and case-insensitive PHP methods resolve through PhpStorm's `findMethodByName(CharSequence)` API, field/constant lookup uses the matching `findFieldByName(CharSequence, boolean)` signature, and plain `Class::name` symbols do not fall back to properties without the documented `$property` syntax.
+- **PHP enum case resolution** — `EnumType::CASE` now resolves to enum case PSI elements via PhpStorm's `getEnumCases()` API. Enum case lookup runs before class constant lookup so `::CASE` correctly targets enum cases on enum types. `::CASE()` still resolves as a method call.
 
 ## [4.17.3] - 2026-05-21
 ### Fixed

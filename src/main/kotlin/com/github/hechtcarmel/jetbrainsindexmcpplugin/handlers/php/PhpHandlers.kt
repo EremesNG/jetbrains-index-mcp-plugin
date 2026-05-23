@@ -1,5 +1,7 @@
 package com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.php
 
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.constants.ErrorMessages
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.constants.toArgumentFailure
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.*
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.StructureKind
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.StructureNode
@@ -11,6 +13,7 @@ import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiElement
+import com.intellij.psi.PsiNamedElement
 import com.intellij.psi.PsiFile
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.search.searches.ReferencesSearch
@@ -66,6 +69,7 @@ object PhpHandlers {
             registry.registerCallHierarchyHandler(PhpCallHierarchyHandler())
             registry.registerSuperMethodsHandler(PhpSuperMethodsHandler())
             registry.registerStructureHandler(PhpStructureHandler())
+            registry.registerSymbolReferenceHandler(PhpSymbolReferenceHandler())
 
             LOG.info("Registered PHP handlers")
         } catch (e: ClassNotFoundException) {
@@ -255,6 +259,17 @@ abstract class BasePhpHandler<T> : LanguageHandler<T> {
     }
 
     /**
+     * Checks if a PhpClass element is an enum using reflection.
+     */
+    protected fun isEnum(phpClass: PsiElement): Boolean {
+        return try {
+            phpClass.javaClass.getMethod("isEnum").invoke(phpClass) as? Boolean ?: false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
      * Finds containing PhpClass using reflection.
      */
     protected fun findContainingPhpClass(element: PsiElement): PsiElement? {
@@ -425,23 +440,282 @@ abstract class BasePhpHandler<T> : LanguageHandler<T> {
         }
     }
 
+    protected data class DeclaredPhpMethod(
+        val method: PsiElement,
+        val declaringClass: PsiElement
+    )
+
     /**
      * Finds a method by name in a PhpClass using reflection.
-     * Uses `findMethodByName()` API, falling back to searching `getOwnMethods()`.
+     * Uses PhpStorm's `findMethodByName(CharSequence)` API so inherited methods
+     * and PHP's case-insensitive method names are handled by the PHP plugin.
+     *
+     * This is appropriate for direct symbol resolution (`Child::inheritedMethod()`),
+     * but implementation/super-method traversal should use declared-only helpers.
      */
     protected fun findMethodInClass(phpClass: PsiElement, methodName: String): PsiElement? {
-        return try {
-            val findMethodByNameMethod = phpClass.javaClass.getMethod("findMethodByName", String::class.java)
-            findMethodByNameMethod.invoke(phpClass, methodName) as? PsiElement
-        } catch (e: Exception) {
-            // Fallback to getOwnMethods and search manually
-            try {
-                val getMethodsMethod = phpClass.javaClass.getMethod("getOwnMethods")
-                val methods = getMethodsMethod.invoke(phpClass) as? Array<*> ?: return null
-                methods.filterIsInstance<PsiElement>().find { getName(it) == methodName }
-            } catch (e2: Exception) {
+        return findMethodByName(phpClass, methodName)
+            ?: findMethodInClassCollections(phpClass, methodName, includeInherited = true)
+    }
+
+    /**
+     * Finds a method declared directly on the given PhpClass/interface.
+     * Does not use PhpClass.findMethodByName() and does not inspect getMethods(),
+     * because both can return inherited methods.
+     */
+    protected fun findOwnMethodInClass(phpClass: PsiElement, methodName: String): PsiElement? {
+        return findMethodInClassCollections(phpClass, methodName, includeInherited = false)
+    }
+
+    /**
+     * Finds the nearest ancestor class that actually declares the requested method.
+     */
+    protected fun findOwnMethodInClassHierarchy(
+        phpClass: PsiElement,
+        methodName: String
+    ): DeclaredPhpMethod? {
+        val visited = mutableSetOf<String>()
+        var currentClass: PsiElement? = phpClass
+
+        while (currentClass != null) {
+            val classKey = getFQN(currentClass) ?: getName(currentClass) ?: currentClass.textOffset.toString()
+            if (!visited.add(classKey)) return null
+
+            val ownMethod = findOwnMethodInClass(currentClass, methodName)
+            if (ownMethod != null) {
+                return DeclaredPhpMethod(ownMethod, currentClass)
+            }
+
+            currentClass = getSuperClass(currentClass)
+        }
+
+        return null
+    }
+
+    /**
+     * Finds the nearest interface in an extends chain that actually declares the method.
+     */
+    protected fun findOwnMethodInInterfaceHierarchy(
+        iface: PsiElement,
+        methodName: String,
+        visited: MutableSet<String> = mutableSetOf()
+    ): DeclaredPhpMethod? {
+        val ifaceKey = getFQN(iface) ?: getName(iface) ?: iface.textOffset.toString()
+        if (!visited.add(ifaceKey)) return null
+
+        val ownMethod = findOwnMethodInClass(iface, methodName)
+        if (ownMethod != null) {
+            return DeclaredPhpMethod(ownMethod, iface)
+        }
+
+        return getImplementedInterfaces(iface)
+            ?.filterIsInstance<PsiElement>()
+            ?.firstNotNullOfOrNull { parentInterface ->
+                findOwnMethodInInterfaceHierarchy(parentInterface, methodName, visited)
+            }
+    }
+
+    private fun findMethodByName(phpClass: PsiElement, methodName: String): PsiElement? {
+        val parameterTypes = listOf(CharSequence::class.java, String::class.java)
+
+        for (parameterType in parameterTypes) {
+            val method = try {
+                val findMethodByNameMethod = phpClass.javaClass.getMethod("findMethodByName", parameterType)
+                findMethodByNameMethod.invoke(phpClass, methodName) as? PsiElement
+            } catch (_: NoSuchMethodException) {
+                null
+            } catch (e: Exception) {
+                LOG.debug("Error resolving PHP method $methodName using findMethodByName: ${e.message}")
                 null
             }
+
+            if (method != null) {
+                return method
+            }
+        }
+
+        return null
+    }
+
+    private fun findMethodInClassCollections(
+        phpClass: PsiElement,
+        methodName: String,
+        includeInherited: Boolean
+    ): PsiElement? {
+        val collectionMethodNames = if (includeInherited) {
+            listOf("getOwnMethods", "getMethods")
+        } else {
+            listOf("getOwnMethods")
+        }
+
+        for (collectionMethodName in collectionMethodNames) {
+            val method = try {
+                val getMethodsMethod = phpClass.javaClass.getMethod(collectionMethodName)
+                toPsiElements(getMethodsMethod.invoke(phpClass)).find {
+                    getName(it)?.equals(methodName, ignoreCase = true) == true
+                }
+            } catch (_: NoSuchMethodException) {
+                null
+            } catch (e: Exception) {
+                LOG.debug("Error resolving PHP method $methodName using $collectionMethodName: ${e.message}")
+                null
+            }
+
+            if (method != null) {
+                return method
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Finds a PHP class, interface, or trait by its fully qualified name using PhpIndex.
+     */
+    protected fun getClassByFQN(project: Project, fqn: String): PsiElement? {
+        val phpIndex = getPhpIndex(project) ?: return null
+        val lookupMethods = listOf(
+            "getClassesByFQN",
+            "getInterfacesByFQN",
+            "getTraitsByFQN"
+        )
+
+        for (methodName in lookupMethods) {
+            val element = try {
+                val method = phpIndex.javaClass.getMethod(methodName, String::class.java)
+                toPsiElements(method.invoke(phpIndex, fqn)).firstOrNull()
+            } catch (e: NoSuchMethodException) {
+                LOG.debug("PhpIndex.$methodName(String) is not available")
+                null
+            } catch (e: Exception) {
+                LOG.debug("Error resolving PHP type by FQN $fqn using $methodName: ${e.message}")
+                null
+            }
+
+            if (element != null) {
+                return element
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Finds a non-constant field/property by name in a PhpClass using reflection.
+     */
+    protected fun findFieldInClass(phpClass: PsiElement, fieldName: String): PsiElement? {
+        return findFieldByName(phpClass, fieldName, findConstant = false)
+            ?: findFieldInClassCollections(phpClass, fieldName, expectedConstant = false)
+    }
+
+    /**
+     * Finds a class constant by name in a PhpClass using reflection.
+     */
+    protected fun findConstantInClass(phpClass: PsiElement, constantName: String): PsiElement? {
+        return findFieldByName(phpClass, constantName, findConstant = true)
+            ?: findFieldInClassCollections(phpClass, constantName, expectedConstant = true)
+    }
+
+    /**
+     * Finds an enum case by name in a PhpClass enum using reflection.
+     * Uses PhpStorm's `getEnumCases()` API to retrieve enum cases.
+     */
+    protected fun findEnumCaseInClass(phpClass: PsiElement, caseName: String): PsiElement? {
+        val collectionMethodNames = listOf("getEnumCases")
+
+        for (methodName in collectionMethodNames) {
+            val result = try {
+                val method = phpClass.javaClass.getMethod(methodName)
+                toPsiElements(method.invoke(phpClass)).firstOrNull {
+                    getName(it) == caseName
+                }
+            } catch (_: NoSuchMethodException) {
+                null
+            } catch (e: Exception) {
+                LOG.debug("Error resolving PHP enum case $caseName using $methodName: ${e.message}")
+                null
+            }
+
+            if (result != null) {
+                return result
+            }
+        }
+
+        return null
+    }
+
+    private fun findFieldByName(
+        phpClass: PsiElement,
+        fieldName: String,
+        findConstant: Boolean
+    ): PsiElement? {
+        val booleanPrimitiveType = Boolean::class.javaPrimitiveType ?: Boolean::class.javaObjectType
+        val signatureCandidates = listOf(
+            arrayOf(CharSequence::class.java, booleanPrimitiveType),
+            arrayOf(CharSequence::class.java, Boolean::class.javaObjectType),
+            arrayOf<Class<*>>(String::class.java, booleanPrimitiveType),
+            arrayOf<Class<*>>(String::class.java, Boolean::class.javaObjectType)
+        )
+
+        for (signature in signatureCandidates) {
+            val field = try {
+                val method = phpClass.javaClass.getMethod("findFieldByName", *signature)
+                method.invoke(phpClass, fieldName, findConstant) as? PsiElement
+            } catch (_: NoSuchMethodException) {
+                null
+            } catch (e: Exception) {
+                LOG.debug("Error resolving PHP field $fieldName using findFieldByName: ${e.message}")
+                null
+            }
+
+            if (field != null && isField(field) && isConstantField(field) == findConstant) {
+                return field
+            }
+        }
+
+        return null
+    }
+
+    private fun findFieldInClassCollections(
+        phpClass: PsiElement,
+        fieldName: String,
+        expectedConstant: Boolean
+    ): PsiElement? {
+        for (methodName in listOf("getOwnFields", "getFields")) {
+            val field = try {
+                val method = phpClass.javaClass.getMethod(methodName)
+                toPsiElements(method.invoke(phpClass)).find {
+                    isField(it) && getName(it) == fieldName && isConstantField(it) == expectedConstant
+                }
+            } catch (_: NoSuchMethodException) {
+                null
+            } catch (e: Exception) {
+                LOG.debug("Error resolving PHP field $fieldName using $methodName: ${e.message}")
+                null
+            }
+
+            if (field != null) {
+                return field
+            }
+        }
+
+        return null
+    }
+
+    private fun isConstantField(field: PsiElement): Boolean {
+        return try {
+            val method = field.javaClass.getMethod("isConstant")
+            method.invoke(field) as? Boolean ?: false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun toPsiElements(value: Any?): Sequence<PsiElement> {
+        return when (value) {
+            is Array<*> -> value.asSequence().filterIsInstance<PsiElement>()
+            is Iterable<*> -> value.asSequence().filterIsInstance<PsiElement>()
+            else -> emptySequence()
         }
     }
 }
@@ -1133,8 +1407,9 @@ class PhpImplementationsHandler : BasePhpHandler<List<ImplementationData>>(), Im
                 .filter { shouldIncludeNavigationElement(searchScope, it) }
                 .take(100)
                 .forEach { subclass ->
-                // Find method with same name in this subclass
-                val overridingMethod = findMethodInClass(subclass, methodName)
+                // Find only methods declared directly in this subclass. Inherited methods
+                // are not implementations/overrides of the queried method.
+                val overridingMethod = findOwnMethodInClass(subclass, methodName)
                 if (overridingMethod != null) {
                     val file = overridingMethod.containingFile?.virtualFile
                     if (file != null) {
@@ -1264,31 +1539,35 @@ class PhpCallHierarchyHandler : BasePhpHandler<CallHierarchyData>(), CallHierarc
         val containingClass = getContainingClass(method) ?: return
         val methodName = getName(method) ?: return
 
-        // Check superclass
+        // Check superclass. Search the class chain for the nearest class that
+        // actually declares the method instead of collecting an inherited PSI
+        // element under an intermediate class key.
         val superClass = getSuperClass(containingClass)
         if (superClass != null) {
-            val superClassName = getFQN(superClass) ?: getName(superClass)
-            val key = "$superClassName::$methodName"
-            if (key !in visited) {
-                visited.add(key)
-                val superMethod = findMethodInClass(superClass, methodName)
-                if (superMethod != null) {
-                    result.add(superMethod)
-                    findSuperMethodsRecursive(project, superMethod, result, visited)
+            val declaredSuperMethod = findOwnMethodInClassHierarchy(superClass, methodName)
+            if (declaredSuperMethod != null) {
+                val declaringClassName = getFQN(declaredSuperMethod.declaringClass)
+                    ?: getName(declaredSuperMethod.declaringClass)
+                val key = "$declaringClassName::$methodName"
+                if (key !in visited) {
+                    visited.add(key)
+                    result.add(declaredSuperMethod.method)
+                    findSuperMethodsRecursive(project, declaredSuperMethod.method, result, visited)
                 }
             }
         }
 
-        // Check interfaces
+        // Check interfaces. Use the declaring interface as the visited key.
         val interfaces = getImplementedInterfaces(containingClass)
         interfaces?.filterIsInstance<PsiElement>()?.forEach { iface ->
-            val ifaceName = getFQN(iface) ?: getName(iface)
-            val key = "$ifaceName::$methodName"
-            if (key !in visited) {
-                visited.add(key)
-                val ifaceMethod = findMethodInClass(iface, methodName)
-                if (ifaceMethod != null) {
-                    result.add(ifaceMethod)
+            val declaredIfaceMethod = findOwnMethodInInterfaceHierarchy(iface, methodName)
+            if (declaredIfaceMethod != null) {
+                val ifaceName = getFQN(declaredIfaceMethod.declaringClass)
+                    ?: getName(declaredIfaceMethod.declaringClass)
+                val key = "$ifaceName::$methodName"
+                if (key !in visited) {
+                    visited.add(key)
+                    result.add(declaredIfaceMethod.method)
                 }
             }
         }
@@ -1518,27 +1797,30 @@ class PhpSuperMethodsHandler : BasePhpHandler<SuperMethodsData>(), SuperMethodsH
             val containingClass = getContainingClass(method) ?: return emptyList()
             val methodName = getName(method) ?: return emptyList()
 
-            // Check superclass
+            // Check superclass. Skip intermediate classes that only inherit the method,
+            // and report the actual class that declares the super method.
             val superClass = getSuperClass(containingClass)
             if (superClass != null) {
-                val superClassName = getFQN(superClass) ?: getName(superClass)
-                val key = "$superClassName::$methodName"
-                if (key !in visited) {
-                    visited.add(key)
+                val declaredSuperMethod = findOwnMethodInClassHierarchy(superClass, methodName)
+                if (declaredSuperMethod != null) {
+                    val superMethod = declaredSuperMethod.method
+                    val declaringClass = declaredSuperMethod.declaringClass
+                    val declaringClassName = getFQN(declaringClass) ?: getName(declaringClass)
+                    val key = "$declaringClassName::$methodName"
+                    if (key !in visited) {
+                        visited.add(key)
 
-                    val superMethod = findMethodInClass(superClass, methodName)
-                    if (superMethod != null) {
                         val file = superMethod.containingFile?.virtualFile
 
                         hierarchy.add(SuperMethodData(
                             name = methodName,
                             signature = buildMethodSignature(superMethod),
-                            containingClass = superClassName ?: "unknown",
-                            containingClassKind = determineClassKind(superClass),
+                            containingClass = declaringClassName ?: "unknown",
+                            containingClassKind = determineClassKind(declaringClass),
                             file = file?.let { getRelativePath(project, it) },
                             line = getLineNumber(project, superMethod),
                             column = getColumnNumber(project, superMethod),
-                            isInterface = isInterface(superClass),
+                            isInterface = isInterface(declaringClass),
                             depth = depth,
                             language = "PHP"
                         ))
@@ -1548,16 +1830,19 @@ class PhpSuperMethodsHandler : BasePhpHandler<SuperMethodsData>(), SuperMethodsH
                 }
             }
 
-            // Check interfaces
+            // Check interfaces. As with classes, report the interface that actually
+            // declares the method, not an intermediate interface that only inherits it.
             val interfaces = getImplementedInterfaces(containingClass)
             interfaces?.filterIsInstance<PsiElement>()?.forEach { iface ->
-                val ifaceName = getFQN(iface) ?: getName(iface)
-                val key = "$ifaceName::$methodName"
-                if (key !in visited) {
-                    visited.add(key)
+                val declaredIfaceMethod = findOwnMethodInInterfaceHierarchy(iface, methodName)
+                if (declaredIfaceMethod != null) {
+                    val ifaceMethod = declaredIfaceMethod.method
+                    val declaringInterface = declaredIfaceMethod.declaringClass
+                    val ifaceName = getFQN(declaringInterface) ?: getName(declaringInterface)
+                    val key = "$ifaceName::$methodName"
+                    if (key !in visited) {
+                        visited.add(key)
 
-                    val ifaceMethod = findMethodInClass(iface, methodName)
-                    if (ifaceMethod != null) {
                         val file = ifaceMethod.containingFile?.virtualFile
 
                         hierarchy.add(SuperMethodData(
@@ -1616,6 +1901,162 @@ class PhpSuperMethodsHandler : BasePhpHandler<SuperMethodsData>(), SuperMethodsH
             "$methodName($params)"
         } catch (e: Exception) {
             getName(method) ?: "unknown"
+        }
+    }
+}
+
+/**
+ * PHP implementation of [SymbolReferenceHandler].
+ *
+ * Resolves PHP symbol reference strings (e.g., `\\App\\Service\\UserService::find()`) to PSI elements.
+ *
+ * Supported symbol formats:
+ * - `\\App\\Service\\UserService` - Class/interface/trait by fully qualified name
+ * - `App\\Service\\UserService` - Same, without leading backslash (auto-normalized)
+ * - `\\App\\Service\\UserService::find` - Method by name
+ * - `\\App\\Service\\UserService::find()` - Method with parameters (ignored; PHP has no overloading by type)
+ * - `\\App\\Service\\UserService::\$name` - Field/property
+ * - `\\App\\Service\\UserService::ROLE_ADMIN` - Class constant
+ * - `\\App\\Service\\StatusEnum::ACTIVE` - Enum case
+ */
+class PhpSymbolReferenceHandler : BasePhpHandler<PsiNamedElement>(), SymbolReferenceHandler {
+
+    companion object {
+        // A valid PHP identifier (simplified: covers the vast majority of code)
+        private const val IDENTIFIER = """[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*"""
+
+        // A PHP namespace segment (same as identifier)
+        private const val NAMESPACE_SEGMENT = IDENTIFIER
+
+        // Fully qualified name with optional leading backslash and backslash-separated segments
+        // In the triple-quoted string, \\ = regex \\ (matches one literal \\)
+        private const val FQN = """\\?(?:$NAMESPACE_SEGMENT\\)*$NAMESPACE_SEGMENT"""
+
+        // Property prefixed with $, regex: \$ matches literal $
+        private const val PROPERTY = "\\$" + IDENTIFIER
+
+        // Method call with optional parameters, e.g. methodName(...)
+        private const val METHOD_CALL = """$IDENTIFIER\([^)]*\)"""
+
+        // Member: method call, property, or plain identifier (constant/method name)
+        private const val MEMBER = """(?:$METHOD_CALL|$PROPERTY|$IDENTIFIER)"""
+
+        // Full pattern: FQN with optional ::member
+        internal val PHP_SYMBOL_PATTERN = """^$FQN(::$MEMBER)?$""".toRegex()
+
+        private val SYMBOL_EXAMPLES = listOf(
+            "'\\App\\Service\\UserService'",
+            "'\\App\\Service\\UserService::find'",
+            "'\\App\\Service\\UserService::find()'",
+            "'\\App\\Service\\UserService::\$property'",
+            "'\\App\\Service\\UserService::ROLE_ADMIN'",
+            "'\\App\\Service\\StatusEnum::ACTIVE'"
+        )
+    }
+
+    override val languageId = "PHP"
+    override val languageName = "PHP"
+
+    override fun canHandle(element: PsiElement): Boolean =
+        isAvailable() && isPhpLanguage(element)
+
+    override fun isAvailable(): Boolean =
+        PluginDetectors.php.isAvailable && phpClassClass != null && phpNamedElementClass != null
+
+    override fun resolveSymbol(project: Project, symbol: String): Result<PsiNamedElement> {
+        val trimmed = symbol.trim()
+
+        if (!PHP_SYMBOL_PATTERN.matches(trimmed)) {
+            return ErrorMessages.invalidSymbolFormat(trimmed, SYMBOL_EXAMPLES).toArgumentFailure()
+        }
+
+        val fullyQualifiedName: String
+        val memberPart: String?
+
+        val memberSeparatorIndex = trimmed.indexOf("::")
+        if (memberSeparatorIndex >= 0) {
+            fullyQualifiedName = trimmed.substring(0, memberSeparatorIndex)
+            memberPart = trimmed.substring(memberSeparatorIndex + 2)
+        } else {
+            fullyQualifiedName = trimmed
+            memberPart = null
+        }
+
+        // Normalize to leading backslash (PhpIndex resolves both forms but leading \ is canonical)
+        val classFqn = if (fullyQualifiedName.startsWith("\\")) fullyQualifiedName else "\\$fullyQualifiedName"
+
+        val phpClass = getClassByFQN(project, classFqn)
+            ?: return ErrorMessages.typeNotFound(classFqn, project.name).toArgumentFailure()
+
+        if (memberPart == null) {
+            return phpClass.toPsiNamedElementResult()
+        }
+
+        return resolvePhpMember(phpClass, classFqn, memberPart)
+    }
+
+    private fun resolvePhpMember(
+        phpClass: PsiElement,
+        classFqn: String,
+        memberPart: String
+    ): Result<PsiNamedElement> {
+        // Strip parameter parentheses for method lookup (PHP has no overloading by type)
+        val hasParens = memberPart.endsWith(")") && memberPart.contains("(")
+        val memberName = if (hasParens) {
+            memberPart.substring(0, memberPart.indexOf('('))
+        } else {
+            memberPart
+        }
+
+        val isProperty = memberName.startsWith("$")
+
+        if (isProperty) {
+            // Field/property: strip the leading $ for the getName comparison
+            val fieldName = memberName.substring(1)
+            val field = findFieldInClass(phpClass, fieldName)
+                ?: return ErrorMessages.memberNotFoundInType(memberPart, classFqn).toArgumentFailure()
+            return field.toPsiNamedElementResult()
+        }
+
+        if (hasParens) {
+            // Explicit method call syntax with (): look up method by name (ignore params)
+            val method = findMethodInClass(phpClass, memberName)
+                ?: return ErrorMessages.memberNotFoundInType(memberPart, classFqn).toArgumentFailure()
+            return method.toPsiNamedElementResult()
+        }
+
+        // No parentheses and no $ prefix: could be an enum case, constant, or method.
+        // Properties require the documented `$property` syntax so a plain name
+        // does not silently navigate to a same-named property.
+
+        // Try enum case first (only if the type is an enum)
+        if (isEnum(phpClass)) {
+            val enumCase = findEnumCaseInClass(phpClass, memberName)
+            if (enumCase != null) {
+                return enumCase.toPsiNamedElementResult()
+            }
+        }
+
+        // Try constant
+        val constant = findConstantInClass(phpClass, memberName)
+        if (constant != null) {
+            return constant.toPsiNamedElementResult()
+        }
+
+        // Try method
+        val method = findMethodInClass(phpClass, memberName)
+        if (method != null) {
+            return method.toPsiNamedElementResult()
+        }
+
+        return ErrorMessages.memberNotFoundInType(memberPart, classFqn).toArgumentFailure()
+    }
+
+    private fun PsiElement.toPsiNamedElementResult(): Result<PsiNamedElement> {
+        return if (this is PsiNamedElement) {
+            Result.success(this)
+        } else {
+            ErrorMessages.SYMBOL_NOT_RESOLVED.toArgumentFailure()
         }
     }
 }
