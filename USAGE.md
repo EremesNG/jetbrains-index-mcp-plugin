@@ -109,11 +109,40 @@ Some tools support identifying the target element by fully qualified symbol refe
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `language` | string | Language of the symbol (e.g., `"Java"`). Required when using `symbol`. Unsupported languages are rejected at runtime; use `file` + `line` + `column` for languages without symbol-reference support. |
-| `symbol` | string | Fully qualified symbol reference. Format: `com.example.ClassName`, `com.example.ClassName#memberName`. |
+| `symbol` | string | Fully qualified symbol reference. **Java format:** `com.example.ClassName`, `com.example.ClassName#memberName`. **JS/TS format:** `modulePath#exportName`, `modulePath#default`, or `modulePath#ClassName.memberName`. |
 
 **Important:** The two parameter groups are **mutually exclusive** — provide either `file` + `line` + `column` OR `language` + `symbol`, not both.
 
-**Supported languages:** Java only today. Unsupported languages return an explicit error listing the currently supported symbol-reference languages.
+**Supported languages:** Java, JS, and TS. Unsupported languages return an explicit error listing the currently supported symbol-reference languages.
+
+**JS/TS symbol grammar (v1):** Symbols must be module-qualified:
+- `modulePath#exportName` — named export (e.g., `src/utils#formatDate`)
+- `modulePath#default` — default export (e.g., `src/index#default`)
+- `modulePath#ClassName.memberName` — class member (e.g., `src/models#User.validate`)
+
+**Deterministic outcomes for JS/TS symbol resolution:**
+- `unsupported_grammar` — symbol does not match accepted forms
+- `not_found` — module path resolved but symbol not found in exports/members
+- `ambiguous_match` — multiple matching exports/members across candidate files
+
+**Fallback TypeScript cases:** Use `file` + `line` + `column` when targeting local non-exported symbols, local import aliases, npm/package symbols, unresolved barrel/re-export chains, or any case that cannot be expressed as a stable module-qualified export.
+
+**Example fallback request:**
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "ide_find_definition",
+    "arguments": {
+      "file": "src/utils/math.ts",
+      "line": 18,
+      "column": 12
+    }
+  }
+}
+```
+
+**Note:** Module-qualified lookup remains v1 grammar and bounded; unsupported cases should fall back to `file` + `line` + `column`.
 
 **Tools that support symbol references:** `ide_find_references`, `ide_find_definition`, `ide_call_hierarchy`, `ide_find_implementations`, `ide_find_super_methods`.
 
@@ -954,9 +983,9 @@ For Markdown heading outlines, use `ide_file_structure`.
 
 > **Note**: All refactoring tools modify source files. Changes can be undone with Ctrl/Cmd+Z.
 
-### ide_refactor_rename (Universal - All Languages)
+### ide_refactor_rename
 
-Renames a symbol and updates all references across the project. This tool uses IntelliJ's `RenameProcessor` which is language-agnostic and works across **all languages** supported by your IDE.
+Renames a symbol or file and updates all references across the project. This tool uses IntelliJ's `RenameProcessor` which is language-agnostic and works across **all languages** supported by your IDE.
 
 **Supported Languages:** Java, Kotlin, Python, JavaScript, TypeScript, Go, PHP, Rust, Ruby, and any language with IntelliJ plugin support.
 
@@ -964,6 +993,7 @@ Renames a symbol and updates all references across the project. This tool uses I
 - Language-specific name validation (identifier rules, keyword detection)
 - **Fully headless/autonomous operation** (no popups or dialogs)
 - **Automatic related element renaming** - getters/setters, overriding methods, test classes are renamed automatically
+- Explicit `targetType` mode selection (`symbol` or `file`)
 - Conflict detection before rename execution (returns error instead of showing dialog)
 - Single atomic operation - all renames (primary + related) can be undone with one Ctrl/Cmd+Z
 
@@ -977,8 +1007,9 @@ Renames a symbol and updates all references across the project. This tool uses I
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file` | string | Yes | Path to the file containing the symbol |
-| `line` | integer | Yes | 1-based line number |
-| `column` | integer | Yes | 1-based column number |
+| `targetType` | string | No | `symbol` (requires 1-based `line` + `column`) or `file` (renames the file itself; placeholder coordinates are ignored) |
+| `line` | integer | No | 1-based line number for symbol rename |
+| `column` | integer | No | 1-based column number for symbol rename |
 | `newName` | string | Yes | The new name for the symbol |
 | `overrideStrategy` | string | No | How to handle overriding methods: `"rename_base"` (default), `"rename_only_current"`, or `"ask"` |
 | `relatedRenamingStrategy` | string | No | How to handle automatic renaming of related symbols: `"all"` (default), `"none"`, `"accessors_and_tests"`, or `"ask"` |
