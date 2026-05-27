@@ -74,14 +74,15 @@ class MoveFileToolBehaviorTest : BasePlatformTestCase() {
 
     fun testMoveFileToolFailsClosedWhenDestinationCannotBeCreated() = runBlocking {
         writeProjectFile("src/Example.cs", "namespace Demo; public sealed class Example {}")
+        writeProjectFile("blocked.txt", "blocked")
 
         val result = MoveFileTool().execute(project, buildJsonObject {
             put("file", "src/Example.cs")
-            put("destination", "bad<dest")
+            put("destination", "blocked.txt/child")
         })
 
         assertTrue("Invalid destination should fail closed", result.isError)
-        assertTrue(textResult(result).contains("Invalid destination 'bad<dest'"))
+        assertTrue(textResult(result).contains("Invalid destination 'blocked.txt/child'"))
     }
 
     fun testMoveFileToolReportsPhpSemanticBackendWhenSelected() = runBlocking {
