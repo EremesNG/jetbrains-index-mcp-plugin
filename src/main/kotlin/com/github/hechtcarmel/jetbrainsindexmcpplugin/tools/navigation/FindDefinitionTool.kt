@@ -35,9 +35,9 @@ class FindDefinitionTool : AbstractMcpTool() {
 
         Returns: file path, line/column of definition, code preview, and symbol name.
 
-        Target (mutually exclusive):
-        - file + line + column: position-based lookup
-        - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#)
+        Target selection:
+        - Complete file + positive line + positive column: position-based lookup, preferred when present because it is more precise
+        - Complete language + symbol: fully qualified symbol reference used when no complete position target is present (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#). Blank strings and non-positive line/column values count as absent.
 
         Example: {"file": "src/Main.java", "line": 15, "column": 10}
         Example: {"language": "Java", "symbol": "com.example.MyClass#processData(String)"}
@@ -67,8 +67,8 @@ class FindDefinitionTool : AbstractMcpTool() {
         val riderDefinition = RiderBackendSemanticService.findDefinition(
             project = project,
             file = optionalStringArg(arguments, ParamNames.FILE),
-            line = optionalIntArg(arguments, ParamNames.LINE),
-            column = optionalIntArg(arguments, ParamNames.COLUMN),
+            line = optionalPositionIntArg(arguments, ParamNames.LINE),
+            column = optionalPositionIntArg(arguments, ParamNames.COLUMN),
             language = normalizedRequestedLanguage,
             symbol = optionalStringArg(arguments, ParamNames.SYMBOL),
             fullElementPreview = fullElementPreview,

@@ -55,9 +55,9 @@ class FindImplementationsTool : AbstractMcpTool() {
 
         Supports pagination: first call returns results + nextCursor. Pass cursor to get the next page.
 
-        Target (mutually exclusive):
-        - file + line + column: position-based lookup (necessary for fresh search, ignored when cursor is provided)
-        - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#; necessary for fresh search, ignored when cursor is provided)
+        Target selection:
+        - Complete file + positive line + positive column: position-based lookup, preferred when present because it is more precise (necessary for fresh search, ignored when cursor is provided)
+        - Complete language + symbol: fully qualified symbol reference used when no complete position target is present (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#; necessary for fresh search, ignored when cursor is provided). Blank strings and non-positive line/column values count as absent.
         - cursor: pagination cursor from a previous response
 
         Parameters: scope (optional, default: "project_files"; supported: project_files, project_and_libraries, project_production_files, project_test_files), pageSize (optional, default: 100, max: 500).

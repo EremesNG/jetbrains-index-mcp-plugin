@@ -26,8 +26,8 @@ class RiderSymbolRoutingUnitTest : TestCase() {
         )
         assertContains(
             source,
-            "line = optionalIntArg(arguments, ParamNames.LINE)",
-            "FindDefinitionTool should normalize blank numeric position arguments before calling the Rider backend-native definition path"
+            "line = optionalPositionIntArg(arguments, ParamNames.LINE)",
+            "FindDefinitionTool should normalize blank and non-positive numeric position arguments before calling the Rider backend-native definition path"
         )
         assertFalse(
             "FindDefinitionTool should not reserve Rider backend definition lookup for position-mode only; that silently falls back for Rider C#/F# symbol-mode",
@@ -56,8 +56,8 @@ class RiderSymbolRoutingUnitTest : TestCase() {
         )
         assertContains(
             source,
-            "line = optionalIntArg(arguments, ParamNames.LINE)",
-            "FindUsagesTool should normalize blank numeric position arguments before calling the Rider backend-native references path"
+            "line = optionalPositionIntArg(arguments, ParamNames.LINE)",
+            "FindUsagesTool should normalize blank and non-positive numeric position arguments before calling the Rider backend-native references path"
         )
         assertFalse(
             "FindUsagesTool should not reserve Rider backend reference lookup for position-mode only; that silently falls back for Rider C#/F# symbol-mode",

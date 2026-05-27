@@ -168,6 +168,20 @@ class AbstractMcpToolArgumentNormalizationUnitTest : TestCase() {
         assertEquals("SYMBOL", lookupMode)
     }
 
+    fun testNonPositivePositionDefaultsDoNotOverrideCompleteSymbol() {
+        val arguments = buildJsonObject {
+            put("file", JsonPrimitive("src/Main.kt"))
+            put("line", JsonPrimitive(0))
+            put("column", JsonPrimitive(0))
+            put("language", JsonPrimitive("C#"))
+            put("symbol", JsonPrimitive("Namespace.Type#Method"))
+        }
+
+        val lookupMode = tool.lookupModeForTest(arguments)
+
+        assertEquals("SYMBOL", lookupMode)
+    }
+
     fun testIncompletePositionDoesNotOverrideCompleteSymbol() {
         val arguments = buildJsonObject {
             put("file", JsonPrimitive("src/Main.kt"))

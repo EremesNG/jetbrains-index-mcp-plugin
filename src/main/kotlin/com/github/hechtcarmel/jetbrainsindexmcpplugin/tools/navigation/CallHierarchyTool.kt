@@ -43,9 +43,9 @@ class CallHierarchyTool : AbstractMcpTool() {
 
         Returns: recursive tree with method signatures, file locations (line/column), and nested call relationships.
 
-        Target (mutually exclusive):
-        - file + line + column: position-based lookup
-        - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#)
+        Target selection:
+        - Complete file + positive line + positive column: position-based lookup, preferred when present because it is more precise
+        - Complete language + symbol: fully qualified symbol reference used when no complete position target is present (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#). Blank strings and non-positive line/column values count as absent.
 
         Parameters: direction (required): "callers" or "callees". depth (optional, default: 3, max: 5). scope (optional, default: "project_files"; supported: project_files, project_and_libraries, project_production_files, project_test_files).
 
@@ -114,8 +114,8 @@ class CallHierarchyTool : AbstractMcpTool() {
                 val riderHierarchy = RiderBackendSemanticService.getCallHierarchy(
                     project = project,
                     file = optionalStringArg(arguments, ParamNames.FILE),
-                    line = optionalIntArg(arguments, ParamNames.LINE),
-                    column = optionalIntArg(arguments, ParamNames.COLUMN),
+                    line = optionalPositionIntArg(arguments, ParamNames.LINE),
+                    column = optionalPositionIntArg(arguments, ParamNames.COLUMN),
                     language = normalizedRequestedLanguage,
                     symbol = requestedSymbol,
                     direction = direction,

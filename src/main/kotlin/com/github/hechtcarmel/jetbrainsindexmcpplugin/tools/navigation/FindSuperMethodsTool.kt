@@ -42,9 +42,9 @@ class FindSuperMethodsTool : AbstractMcpTool() {
 
         Returns: full hierarchy chain from immediate parent (depth=1) to root, with file locations (line/column) and containing class info.
 
-        Target (mutually exclusive):
-        - file + line + column: position-based lookup (position can be anywhere within the method body)
-        - language + symbol: fully qualified symbol reference (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#)
+        Target selection:
+        - Complete file + positive line + positive column: position-based lookup, preferred when present because it is more precise (position can be anywhere within the method body)
+        - Complete language + symbol: fully qualified symbol reference used when no complete position target is present (supported when the requested language has a SymbolReferenceHandler, including Rider C#/F#). Blank strings and non-positive line/column values count as absent.
 
         Example: {"file": "src/UserServiceImpl.java", "line": 25, "column": 10}
         Example: {"language": "Java", "symbol": "com.example.UserServiceImpl#getUser(String)"}

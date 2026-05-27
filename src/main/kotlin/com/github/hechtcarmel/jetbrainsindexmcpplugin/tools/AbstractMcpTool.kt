@@ -484,6 +484,14 @@ abstract class AbstractMcpTool : McpTool {
     }
 
     /**
+     * Returns a normalized optional position integer.
+     * Missing/null/blank/whitespace-only/non-positive values are treated as absent (null).
+     */
+    protected fun optionalPositionIntArg(arguments: JsonObject, name: String): Int? {
+        return optionalIntArg(arguments, name)?.takeIf { it > 0 }
+    }
+
+    /**
      * Returns a required non-blank string argument.
      * Missing/null/blank values fail with a missing-required-parameter error.
      */
@@ -496,8 +504,8 @@ abstract class AbstractMcpTool : McpTool {
 
     protected fun hasCompletePositionTarget(arguments: JsonObject): Boolean =
         optionalStringArg(arguments, ParamNames.FILE) != null &&
-            optionalIntArg(arguments, ParamNames.LINE) != null &&
-            optionalIntArg(arguments, ParamNames.COLUMN) != null
+            optionalPositionIntArg(arguments, ParamNames.LINE) != null &&
+            optionalPositionIntArg(arguments, ParamNames.COLUMN) != null
 
     protected fun hasCompleteSymbolTarget(arguments: JsonObject): Boolean =
         optionalStringArg(arguments, ParamNames.LANGUAGE) != null &&
@@ -564,8 +572,8 @@ abstract class AbstractMcpTool : McpTool {
         val language = optionalStringArg(arguments, ParamNames.LANGUAGE)
         val symbol = optionalStringArg(arguments, ParamNames.SYMBOL)
         val file = optionalStringArg(arguments, ParamNames.FILE)
-        val line = optionalIntArg(arguments, ParamNames.LINE)
-        val column = optionalIntArg(arguments, ParamNames.COLUMN)
+        val line = optionalPositionIntArg(arguments, ParamNames.LINE)
+        val column = optionalPositionIntArg(arguments, ParamNames.COLUMN)
 
         return when (resolveLookupMode(arguments)) {
             LookupModeState.SYMBOL -> {
