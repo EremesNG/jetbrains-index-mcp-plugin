@@ -221,7 +221,8 @@ class RenameSymbolTool : AbstractMcpTool() {
         val elementPointer: SmartPsiElementPointer<PsiElement>,
         val rangeInElement: TextRange,
         val importerFilePointer: SmartPsiElementPointer<PsiFile>?,
-        val importerTextBeforeRename: String?
+        val importerTextBeforeRename: String?,
+        val referenceElementTextBeforeRename: String?
     )
 
     private data class RenameExecutionResult(
@@ -595,9 +596,7 @@ class RenameSymbolTool : AbstractMcpTool() {
                 retargetJsTsFileRenameReferencesAfterRename(
                     project,
                     jsTsFileRetargeting,
-                    renamedFile,
-                    retargetWarnings,
-                    unretargetedImporters
+                    renamedFile
                 )
                 finalizeJsTsFileRenameRetargeting(
                     project, jsTsFileRetargeting, renamedFile, affectedFiles,
@@ -716,7 +715,8 @@ class RenameSymbolTool : AbstractMcpTool() {
                         },
                         importerTextBeforeRename = importerFile?.let { file ->
                             PsiDocumentManager.getInstance(file.project).getDocument(file)?.text ?: file.text
-                        }
+                        },
+                        referenceElementTextBeforeRename = referenceElement.text
                     )
                 )
                 true
@@ -764,50 +764,36 @@ class RenameSymbolTool : AbstractMcpTool() {
     private fun retargetJsTsFileRenameReferencesAfterRename(
         project: Project,
         retargeting: JsTsFileRenameRetargeting,
-        renamedFile: PsiFile,
-        warnings: MutableList<String>,
-        unretargetedImporters: MutableList<String>
+        renamedFile: PsiFile
     ) {
         for (referencePointer in retargeting.references) {
             val referenceElement = referencePointer.elementPointer.element
+            if (isJsTsReferenceAlreadyRetargeted(referencePointer, referenceElement, renamedFile)) {
+                continue
+            }
+
             if (referenceElement == null) {
-                val importerPath = resolveImporterPath(project, referencePointer, null)
-                val warningMsg = "Semantic JS/TS file rename could not retarget importer after rename" +
-                    importerPath?.let { " for '$it'" }.orEmpty() +
-                    ": collected reference element is no longer available"
-                warnings += warningMsg
-                if (importerPath != null) {
-                    unretargetedImporters += importerPath
-                }
                 continue
             }
 
             val reference = findCollectedReference(referenceElement, referencePointer)
             if (reference == null) {
-                val importerPath = resolveImporterPath(project, referencePointer, referenceElement)
-                val warningMsg = "Semantic JS/TS file rename could not retarget importer after rename" +
-                    importerPath?.let { " '$it'" }.orEmpty() +
-                    ": collected reference could not be found at stored range ${referencePointer.rangeInElement}"
-                warnings += warningMsg
-                if (importerPath != null) {
-                    unretargetedImporters += importerPath
-                }
                 continue
             }
 
             try {
                 bindJsTsFileRenameReferenceToFile(reference, renamedFile)
             } catch (e: Exception) {
+                if (isJsTsReferenceAlreadyRetargeted(referencePointer, referenceElement, renamedFile)) {
+                    continue
+                }
+
                 val importerPath = resolveImporterPath(project, referencePointer, referenceElement)
                 val reason = e.message ?: e.javaClass.simpleName
                 val warningMsg = "Semantic JS/TS file rename failed after rename" +
                     importerPath?.let { " for '$it'" }.orEmpty() +
                     ": $reason"
                 LOG.debug(warningMsg)
-                warnings += warningMsg
-                if (importerPath != null) {
-                    unretargetedImporters += importerPath
-                }
             }
         }
         PsiDocumentManager.getInstance(project).commitAllDocuments()
@@ -826,6 +812,33 @@ class RenameSymbolTool : AbstractMcpTool() {
         reference.bindToElement(renamedFile)
     }
 
+    private fun isJsTsReferenceAlreadyRetargeted(
+        referencePointer: JsTsFileRenameReference,
+        referenceElement: PsiElement?,
+        renamedFile: PsiFile
+    ): Boolean {
+        if (referenceElement == null) {
+            return false
+        }
+
+        val currentReference = findCollectedReference(referenceElement, referencePointer)
+        if (currentReference != null) {
+            return referenceResolvesToFile(currentReference, renamedFile)
+        }
+
+        return referencePointer.referenceElementTextBeforeRename != null &&
+            referenceElement.text != referencePointer.referenceElementTextBeforeRename &&
+            referenceElement.references.any { referenceResolvesToFile(it, renamedFile) }
+    }
+
+    private fun referenceResolvesToFile(reference: PsiReference, file: PsiFile): Boolean {
+        return runCatching {
+            val fileReference = FileReference.findFileReference(reference)
+            val currentReference = fileReference?.getFileReferenceSet()?.getLastReference() ?: reference
+            currentReference.resolve()?.isEquivalentTo(file) == true
+        }.getOrDefault(false)
+    }
+
     private fun finalizeJsTsFileRenameRetargeting(
         project: Project,
         retargeting: JsTsFileRenameRetargeting,
@@ -836,6 +849,17 @@ class RenameSymbolTool : AbstractMcpTool() {
     ) {
         for (referencePointer in retargeting.references) {
             val referenceElement = referencePointer.elementPointer.element
+            markJsTsRetargetingImporterAffectedIfChanged(
+                project,
+                referencePointer,
+                referenceElement,
+                referencePointer.importerTextBeforeRename,
+                affectedFiles
+            )
+            if (isJsTsReferenceAlreadyRetargeted(referencePointer, referenceElement, renamedFile)) {
+                continue
+            }
+
             if (referenceElement == null) {
                 val importerPath = resolveImporterPath(project, referencePointer, null)
                 val warningMsg = "Semantic JS/TS file rename could not verify importer retargeting" +
@@ -845,17 +869,6 @@ class RenameSymbolTool : AbstractMcpTool() {
                 if (importerPath != null) {
                     unretargetedImporters += importerPath
                 }
-                continue
-            }
-
-            val importerChanged = markJsTsRetargetingImporterAffectedIfChanged(
-                project,
-                referencePointer,
-                referenceElement,
-                referencePointer.importerTextBeforeRename,
-                affectedFiles
-            )
-            if (importerChanged && referenceElement.references.any { it.resolve()?.isEquivalentTo(renamedFile) == true }) {
                 continue
             }
 
@@ -892,7 +905,7 @@ class RenameSymbolTool : AbstractMcpTool() {
     private fun markJsTsRetargetingImporterAffectedIfChanged(
         project: Project,
         referencePointer: JsTsFileRenameReference,
-        referenceElement: PsiElement,
+        referenceElement: PsiElement?,
         importerTextBefore: String?,
         affectedFiles: MutableSet<String>
     ): Boolean {
@@ -901,7 +914,7 @@ class RenameSymbolTool : AbstractMcpTool() {
             return false
         }
 
-        val importerFile = referencePointer.importerFilePointer?.element ?: referenceElement.containingFile
+        val importerFile = referencePointer.importerFilePointer?.element ?: referenceElement?.containingFile
         importerFile?.virtualFile?.let {
             affectedFiles.add(getRelativePath(project, it))
             return true

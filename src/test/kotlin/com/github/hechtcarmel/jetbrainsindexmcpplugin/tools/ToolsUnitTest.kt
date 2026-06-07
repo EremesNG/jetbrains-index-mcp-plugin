@@ -634,7 +634,37 @@ class ToolsUnitTest : TestCase() {
         )
         assertTrue(
             "Already-updated references may only be skipped after explicit renamed-file resolution verification",
-            finalizeBody.contains("isEquivalentTo(renamedFile)")
+            finalizeBody.contains("isJsTsReferenceAlreadyRetargeted")
+        )
+        assertTrue(
+            "Current importer-state verification must resolve references to the renamed file",
+            source.contains("currentReference.resolve()?.isEquivalentTo(file) == true")
+        )
+        assertTrue(
+            "JS/TS file rename verification must be reference-scoped, not importer-file scoped",
+            source.contains("referenceElementTextBeforeRename")
+        )
+    }
+
+    fun testRenameSymbolToolChecksCurrentJsTsImporterStateBeforeStoredRangeFailure() {
+        val sourcePath = Path.of(
+            System.getProperty("user.dir"),
+            "src/main/kotlin/com/github/hechtcarmel/jetbrainsindexmcpplugin/tools/refactoring/RenameSymbolTool.kt"
+        )
+        val source = Files.readString(sourcePath)
+        val retargetBody = source.substringAfter("private fun retargetJsTsFileRenameReferencesAfterRename(")
+            .substringBefore("private fun bindJsTsFileRenameReferenceToFile(")
+
+        val currentStateCheckIndex = retargetBody.indexOf("isJsTsReferenceAlreadyRetargeted")
+        val staleRangeWarningIndex = retargetBody.indexOf("collected reference could not be found at stored range")
+
+        assertTrue(
+            "JS/TS file rename retargeting must verify the current importer state before trusting a stale stored range",
+            currentStateCheckIndex >= 0
+        )
+        assertTrue(
+            "Already-retargeted importers must be accepted before reporting a stored-range lookup failure",
+            staleRangeWarningIndex == -1 || currentStateCheckIndex < staleRangeWarningIndex
         )
     }
 

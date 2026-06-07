@@ -142,6 +142,58 @@ class RenameSymbolToolBehaviorTest : BasePlatformTestCase() {
         IndexingTestUtil.waitUntilIndexesAreReady(project)
     }
 
+    fun testJsTsFileRenameDoesNotReportFalseUnretargetedImportersWhenPlatformUpdatesImporters() = runBlocking {
+        if (!requireJsTsToolRoutingCapability("testJsTsFileRenameDoesNotReportFalseUnretargetedImportersWhenPlatformUpdatesImporters")) {
+            return@runBlocking
+        }
+
+        writeProjectFile(
+            "src/frontend/src/__mcp_pr175_fixture__/config.ts",
+            "export const loadConfig = () => ({});\n"
+        )
+        writeProjectFile(
+            "src/frontend/src/__mcp_pr175_fixture__/importOnly.ts",
+            """
+            import { loadConfig } from "./config";
+
+            export const importedName = loadConfig;
+            """.trimIndent()
+        )
+        writeProjectFile(
+            "src/frontend/src/__mcp_pr175_fixture__/index.ts",
+            """
+            export { loadConfig } from "./config";
+            export * from "./config";
+            """.trimIndent()
+        )
+
+        val result = RenameSymbolTool().execute(project, buildJsonObject {
+            put("file", "src/frontend/src/__mcp_pr175_fixture__/config.ts")
+            put("targetType", "file")
+            put("newName", "configRenamed.ts")
+        })
+
+        assertFalse("JS/TS file rename should succeed", result.isError)
+        val payload = json.decodeFromString<RefactoringResult>((result.content.single() as ContentBlock.Text).text)
+
+        val basePath = requireNotNull(project.basePath)
+        val importOnlyText = Files.readString(
+            Path.of(basePath, "src/frontend/src/__mcp_pr175_fixture__/importOnly.ts")
+        )
+        val indexText = Files.readString(
+            Path.of(basePath, "src/frontend/src/__mcp_pr175_fixture__/index.ts")
+        )
+
+        assertTrue(importOnlyText.contains("\"./configRenamed\""))
+        assertTrue(indexText.contains("\"./configRenamed\""))
+        assertFalse(importOnlyText.contains("\"./config\""))
+        assertFalse(indexText.contains("\"./config\""))
+        assertNull(payload.warnings)
+        assertNull(payload.unretargetedImporters)
+        assertFalse(payload.message.contains("could not be auto-retargeted"))
+        IndexingTestUtil.waitUntilIndexesAreReady(project)
+    }
+
     fun testExplicitFileRenameIgnoresMalformedCoordinatesDuringFullToolExecution() = runBlocking {
         writeProjectFile(
             "docs/readme.txt",
