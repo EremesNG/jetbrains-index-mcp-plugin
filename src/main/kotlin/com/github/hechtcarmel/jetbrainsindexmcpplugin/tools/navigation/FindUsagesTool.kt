@@ -78,6 +78,7 @@ class FindUsagesTool : AbstractMcpTool() {
         .lineAndColumn(required = false)
         .languageAndSymbol(required = false)
         .scopeProperty("Search scope. Default: project_files.")
+        .booleanProperty(ParamNames.INCLUDE_GENERATED, "Include references in generated sources (KSP/Dagger/annotation-processor output, e.g. build/generated DI factories). Default: true — keeps valid runtime references (Dagger, MapStruct, gRPC, serializers). Set false to drop generated output when it dominates the result set.")
         .intProperty("maxResults", "Maximum results per page (deprecated, use pageSize). Default: $DEFAULT_MAX_RESULTS, max: $MAX_PAGE_SIZE.")
         .stringProperty("cursor", "Pagination cursor from a previous response. When provided, returns the next page of results. Search parameters are ignored; project_path and pageSize may still be provided.")
         .intProperty("pageSize", "Results per page. Default: $DEFAULT_MAX_RESULTS, max: $MAX_PAGE_SIZE.")
@@ -104,6 +105,10 @@ class FindUsagesTool : AbstractMcpTool() {
 
         val pageSize = resolvePageSize(arguments, DEFAULT_MAX_RESULTS, aliases = arrayOf("maxResults"))
         val collectLimit = maxOf(PaginationService.DEFAULT_OVERCOLLECT, pageSize)
+        // Generated DI factories / *_MembersInjector classes are included by default so valid
+        // runtime references (Dagger, MapStruct, gRPC, serializers) are not missed. Callers can
+        // pass includeGenerated=false to drop generated output when it dominates results.
+        val excludeGenerated = resolveExcludeGenerated(arguments, default = true)
         val rawScope = rawScopeValue(arguments[ParamNames.SCOPE])
         val scope = try {
             BuiltInSearchScopeResolver.parse(arguments, BuiltInSearchScope.PROJECT_FILES)
@@ -128,7 +133,7 @@ class FindUsagesTool : AbstractMcpTool() {
             val usages = ConcurrentLinkedQueue<UsageLocation>()
             val totalFound = AtomicInteger(0)
             val totalCountLimit = collectLimit * 10
-            val searchScope = BuiltInSearchScopeResolver.resolveGlobalScope(project, scope)
+            val searchScope = BuiltInSearchScopeResolver.resolveGlobalScope(project, scope, excludeGenerated)
 
             try {
                 ReferencesSearch.search(targetElement, searchScope).forEach(Processor { reference ->
@@ -184,7 +189,7 @@ class FindUsagesTool : AbstractMcpTool() {
                 suspendingReadAction {
                     val el = smartPointer.element
                         ?: throw IllegalStateException("Target element no longer valid")
-                    extendFindUsages(project, el, seenKeys, limit, scope)
+                    extendFindUsages(project, el, seenKeys, limit, scope, excludeGenerated)
                 }
             }
 
@@ -237,11 +242,12 @@ class FindUsagesTool : AbstractMcpTool() {
         targetElement: PsiElement,
         seenKeys: Set<String>,
         limit: Int,
-        scope: BuiltInSearchScope
+        scope: BuiltInSearchScope,
+        excludeGenerated: Boolean
     ): List<PaginationService.SerializedResult> {
         val newResults = ConcurrentLinkedQueue<PaginationService.SerializedResult>()
         val count = AtomicInteger(0)
-        val searchScope = BuiltInSearchScopeResolver.resolveGlobalScope(project, scope)
+        val searchScope = BuiltInSearchScopeResolver.resolveGlobalScope(project, scope, excludeGenerated)
 
         try {
             ReferencesSearch.search(targetElement, searchScope).forEach(Processor { reference ->
