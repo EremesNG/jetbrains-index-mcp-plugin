@@ -10,6 +10,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.PaginationService
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.ProjectResolver
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.models.ContentBlock
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.models.ToolCallResult
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.lifecycle.ProjectModeService
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.settings.McpSettings
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.util.ClassResolver
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.util.ProjectUtils
@@ -45,6 +46,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -132,6 +134,25 @@ abstract class AbstractMcpTool : McpTool {
     protected open val requiresPsiSync: Boolean = true
 
     /**
+     * Whether this tool participates in lifecycle management (auto-enroll, auto-wake).
+     *
+     * Tools that explicitly manage lifecycle state (e.g., [ReleaseProjectTool]) should
+     * return false so they observe the project's actual managed state rather than
+     * triggering enrollment as a side effect of being called.
+     */
+    protected open val participatesInLifecycle: Boolean = true
+
+    /**
+     * Human-readable list of languages that currently support language+symbol lookup.
+     */
+    protected fun supportedSymbolReferenceLanguagesDescription(): String {
+        return LanguageHandlerRegistry.getSupportedLanguageNamesForSymbolReference()
+            .takeIf { it.isNotEmpty() }
+            ?.joinToString(", ")
+            ?: "none"
+    }
+
+    /**
      * Executes an action on the EDT, reusing the current thread if already on EDT.
      *
      * This avoids deadlocks when called from `runBlocking` on EDT in tests
@@ -211,11 +232,30 @@ abstract class AbstractMcpTool : McpTool {
      * @return A [ToolCallResult] containing the operation result or error
      */
     final override suspend fun execute(project: Project, arguments: JsonObject): ToolCallResult {
+        val modeService = ProjectModeService.getInstance()
+        if (participatesInLifecycle && McpSettings.getInstance().lifecycleEnabled) {
+            if (!modeService.isManaged(project)) {
+                modeService.enroll(project)
+            } else {
+                modeService.wakeForMcp(project)
+            }
+        }
+
         val settings = McpSettings.getInstance()
         if (requiresPsiSync && settings.syncExternalChanges) {
             ensurePsiUpToDate(project)
         }
-        return doExecute(project, arguments)
+        return try {
+            doExecute(project, arguments)
+        } catch (e: com.intellij.openapi.project.IndexNotReadyException) {
+            // The IDE entered dumb mode (reindexing) during this call. This can happen
+            // when a project has just woken from dormant or a background process triggered
+            // reindexing. The caller should check ide_index_status and retry.
+            createErrorResult(
+                "IDE index is not ready — indexing is in progress. " +
+                "Call ide_index_status to check when it completes, then retry."
+            )
+        }
     }
 
     /**
@@ -489,6 +529,21 @@ abstract class AbstractMcpTool : McpTool {
             hasPosition -> LookupModeState.POSITION
             else -> LookupModeState.MISSING
         }
+    }
+
+    /**
+     * Resolves whether generated sources (KSP/Dagger/annotation-processor output) should be
+     * excluded from the search scope, derived from the optional `includeGenerated` argument.
+     *
+     * Each tool passes its own [default] for `includeGenerated` so behavior is per-tool:
+     * reference and hierarchy tools include generated sources by default, while name and
+     * implementation searches exclude them by default.
+     *
+     * @return true when generated sources should be excluded from the resolved scope.
+     */
+    protected fun resolveExcludeGenerated(arguments: JsonObject, default: Boolean): Boolean {
+        val includeGenerated = arguments[ParamNames.INCLUDE_GENERATED]?.jsonPrimitive?.booleanOrNull ?: default
+        return !includeGenerated
     }
 
     /**

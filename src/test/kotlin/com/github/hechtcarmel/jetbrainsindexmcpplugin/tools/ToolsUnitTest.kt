@@ -149,6 +149,7 @@ class ToolsUnitTest : TestCase() {
         assertNotNull("Should have language property", properties?.get(ParamNames.LANGUAGE))
         assertNotNull("Should have symbol property", properties?.get(ParamNames.SYMBOL))
         assertHasScopeAndNoLegacyFilters(properties)
+        assertNotNull("Should have includeGenerated property", properties?.get(ParamNames.INCLUDE_GENERATED))
         assertNotNull("Should have cursor property", properties?.get("cursor"))
         assertNotNull("Should have pageSize property", properties?.get("pageSize"))
 
@@ -196,6 +197,7 @@ class ToolsUnitTest : TestCase() {
         assertNotNull("Should have column property", properties?.get(ParamNames.COLUMN))
         assertNotNull("Should have className property", properties?.get(ParamNames.CLASS_NAME))
         assertHasScopeAndNoLegacyFilters(properties)
+        assertNotNull("Should have includeGenerated property", properties?.get(ParamNames.INCLUDE_GENERATED))
     }
 
     fun testCallHierarchyToolSchema() {
@@ -214,6 +216,7 @@ class ToolsUnitTest : TestCase() {
         assertNotNull("Should have language property", properties?.get(ParamNames.LANGUAGE))
         assertNotNull("Should have symbol property", properties?.get(ParamNames.SYMBOL))
         assertHasScopeAndNoLegacyFilters(properties)
+        assertNotNull("Should have includeGenerated property", properties?.get(ParamNames.INCLUDE_GENERATED))
     }
 
     fun testFindImplementationsToolSchema() {
@@ -234,6 +237,7 @@ class ToolsUnitTest : TestCase() {
         assertNotNull("Should have language property", properties?.get(ParamNames.LANGUAGE))
         assertNotNull("Should have symbol property", properties?.get(ParamNames.SYMBOL))
         assertHasScopeAndNoLegacyFilters(properties)
+        assertNotNull("Should have includeGenerated property", properties?.get(ParamNames.INCLUDE_GENERATED))
         assertNotNull("Should have cursor property", properties?.get("cursor"))
         assertNotNull("Should have pageSize property", properties?.get("pageSize"))
 
@@ -247,6 +251,7 @@ class ToolsUnitTest : TestCase() {
 
         assertNotNull("Should have query property", properties?.get(ParamNames.QUERY))
         assertHasScopeAndNoLegacyFilters(properties)
+        assertNotNull("Should have includeGenerated property", properties?.get(ParamNames.INCLUDE_GENERATED))
     }
 
     fun testFindFileToolSchemaUsesScope() {
@@ -255,6 +260,7 @@ class ToolsUnitTest : TestCase() {
 
         assertNotNull("Should have query property", properties?.get(ParamNames.QUERY))
         assertHasScopeAndNoLegacyFilters(properties)
+        assertNotNull("Should have includeGenerated property", properties?.get(ParamNames.INCLUDE_GENERATED))
     }
 
     fun testFindSymbolToolSchemaUsesScope() {
@@ -263,6 +269,7 @@ class ToolsUnitTest : TestCase() {
 
         assertNotNull("Should have query property", properties?.get(ParamNames.QUERY))
         assertHasScopeAndNoLegacyFilters(properties)
+        assertNotNull("Should have includeGenerated property", properties?.get(ParamNames.INCLUDE_GENERATED))
     }
 
     fun testGetDiagnosticsToolSchema() {
@@ -932,8 +939,10 @@ class ToolsUnitTest : TestCase() {
 
         assertNotNull("Should have project_path property", properties?.get(ParamNames.PROJECT_PATH))
         assertNotNull("Should have query property", properties?.get(ParamNames.QUERY))
+        assertNotNull("Should have regex property", properties?.get(ParamNames.REGEX))
         assertNotNull("Should have context property", properties?.get(ParamNames.CONTEXT))
         assertNotNull("Should have caseSensitive property", properties?.get(ParamNames.CASE_SENSITIVE))
+        assertNotNull("Should have filePattern property", properties?.get(ParamNames.FILE_PATTERN))
         assertNotNull("Should have limit property", properties?.get(ParamNames.LIMIT))
         assertNotNull("Should have cursor property", properties?.get("cursor"))
         assertNotNull("Should have pageSize property", properties?.get("pageSize"))

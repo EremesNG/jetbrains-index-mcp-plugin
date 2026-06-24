@@ -4,19 +4,119 @@
 
 ## [Unreleased]
 
-### Changed
-- Improved JS/TS WebStorm integration: `language + symbol` resolution and call-hierarchy seeding now handle overloads more accurately, barrel/re-export caller discovery stays bounded, and TypeScript type aliases map cleanly in `ide_file_structure`.
-- JS/TS symbol/navigation internals now detect type aliases, classes/interfaces, import/export `from` clauses, and `export *` re-exports via IntelliJ PSI (class/elementType + reflection) instead of source-text/regex heuristics, fixing false positives (e.g. `export *` matched inside comments/strings or anywhere in a file).
+## [4.23.2] - 2026-06-14
+### Fixed
+- Build failures that only report compiler output now return diagnostics instead of an empty error list when possible.
+- Plugin install/update now requires an IDE restart and verifier-only headless runs no longer start the MCP server.
+
+## [4.23.0] - 2026-06-13
+### Added — Project lifecycle management
+
+Automatic sleep/wake management for IntelliJ projects used as MCP servers. When multiple
+projects are open simultaneously, idle ones consume memory unnecessarily and leave editors
+open for no reason. Lifecycle management addresses this with a four-state machine driven
+by window focus and MCP activity.
+
+**States:** `active` (full IDE, Power Save off) → `background` (Power Save on, MCP
+functional) → `dormant` (editors closed, PSI caches freed, index retained) → `closed`
+(project fully closed). Projects enroll automatically on first MCP use and auto-reopen
+transparently when an MCP tool targets a closed project — callers see normal results
+after a short indexing delay, with no changes required in existing tools.
+
+- **`ide_set_project_mode`** — explicitly set a managed project's lifecycle mode (`active`, `background`, `dormant`, `closed`).
+- **`ide_get_project_modes`** — list all MCP-managed projects and their current modes, including those we closed.
+- **`ide_project_status`** — combined snapshot: every open project and every managed project in one table, with open/managed/mode per row.
+- **`ide_release_project`** — unenroll a project, restoring full IDE behaviour and disabling Power Save Mode. Accepts an optional `path` argument to release a closed managed project without needing it to be open.
+- **`ide_set_all_project_modes`** — set all managed projects to the same mode at once (active, background, or dormant).
+- **`ide_enroll_all_projects`** — enroll every currently open project in lifecycle management at once; already-managed projects are skipped.
+- **`ide_release_all_projects`** — release every managed project (including closed ones) from lifecycle management at once.
+- **`ide_set_lifecycle_log_file`** — enable or disable writing lifecycle events to the persistent log file on disk (`mcp-lifecycle.log`, written alongside `idea.log`). The in-memory ring buffer is always active regardless. *(disabled by default)*
+- **Lifecycle settings** — configurable timing thresholds (focus→background, background→dormant, dormant→closed) and a master enable/disable toggle in Settings → Index MCP Server.
+- **Interactive project list in Settings** — the lifecycle settings panel now shows all known projects (open and closed managed) with a checkbox per project (checked = enrolled), an X button to release individual projects, and "Enroll All Open" / "Release All" buttons. Changes take effect immediately without clicking Apply.
+- **"MCP: Open Project" action** — searchable popup (Cmd+Shift+A) listing managed projects by state; selecting one opens or wakes it.
+- **"MCP: Show Project States" action** — opens the lifecycle settings panel from the keyboard.
+
+**Enrollment on semantic use, not on open/close** — `ide_open_project` and `ide_close_project` are infrastructure tools and do not trigger lifecycle enrollment. Enrollment happens on the first real semantic tool call (find references, diagnostics, refactoring, etc.) after a project is open.
+
+**MCP availability guarantee** — the lifecycle manager never closes the last open managed project. When only one managed project remains open and its close timer fires, it is kept in `dormant` state instead.
+
+See `docs/lifecycle-management.md` for design rationale, API notes, and threading details.
+
+### Added — Lifecycle event log
+
+- **`ide_lifecycle_log`** — query recent lifecycle events from an in-memory ring buffer. Records every state transition, project open/close, focus change, timer firing, and MCP-triggered wake for all IntelliJ projects (not just managed ones). Each event includes a `trigger` field that identifies the cause: `timer:focus`, `timer:inactivity`, `timer:close`, `focus_gained`, `focus_lost`, `mcp_call`, `auto_open`, or `user`. Parameters: `limit` (default 50), `project` (path substring filter). Response includes `log_file` — the path to a persistent log file. No restart required.
+- **Event log buffer size** — configurable in Settings → Index MCP Server → Lifecycle (default 500, range 100–10,000).
+
+See `docs/lifecycle-log.md` for design rationale and the trigger taxonomy.
 
 ### Fixed
-- `ide_refactor_rename` now completes JS/TS file renames with partial success when import retargeting encounters per-importer `bindToElement` failures; the result includes `warnings` and `unretargetedImporters` fields describing which importers could not be auto-retargeted.
-- Symbol resolution no longer returns false `ambiguous_match` errors when both `foo.ts` and `foo/index.ts` export the same name; direct-file precedence now mirrors Node.js module resolution so `foo.ts` is preferred over `foo/index.ts`.
-- `export default class ClassName {}` forms are now correctly resolved as default exports in JavaScript/TypeScript symbol lookups (`modulePath#default`).
-- `ide_refactor_rename` now accepts an explicit `targetType` mode so file-renaming clients can send placeholder `line: 0, column: 0` without tripping symbol-position validation, while symbol mode still rejects invalid 1-based coordinates.
-- `ide_refactor_rename` no longer opens the JS/TS related-symbol confirmation dialog during headless WebStorm file renames; JavaScript and TypeScript file renames now keep the file as the rename target unless `overrideStrategy="ask"` is explicitly requested.
-- `ide_refactor_rename` now keeps JS/TS imports in sync during headless file renames by letting the platform's semantic file/move hooks retarget module specifiers; the old manual rewrite post-pass stays removed.
-- `ide_type_hierarchy` now resolves JavaScript and TypeScript `className` lookups through WebStorm symbol search when JVM-style class lookup is not applicable.
-- Added regression coverage and guidance for overloads, barrels, aliases, `implements`, and derived `as const`/type-driven cases so the JS/TS navigation behavior stays predictable across supported WebStorm queries.
+- `IndexNotReadyException` from `ide_diagnostics` and other tools now logged at DEBUG instead of ERROR when the IDE index is not ready.
+- Rethrow `ProcessCanceledException` instead of logging as ERROR when a project is disposed mid-call.
+- MCP server watchdog restarts the server if it stops unexpectedly between tool calls.
+- Detect compiled elements before rename to avoid assertion crash in `ide_refactor_rename`.
+
+## [4.22.0] - 2026-06-12
+### Added
+All three tools are **disabled by default** and must be enabled in Settings → Tools → Index MCP Server before use.
+
+- **`ide_set_power_save_mode`** — enable or disable IDE Power Save Mode (IDE-wide). Suspends background inspections and on-the-fly code analysis to cut CPU/memory usage while the index and all code intelligence operations (find usages, refactoring, navigation) remain fully functional.
+- **`ide_close_project`** — close an open project window and free its memory. Non-blocking; the project can be reopened via Recent Projects or `ide_open_project`. Refuses to close the last open project so the MCP server always keeps a JSON-RPC context project.
+- **`ide_open_project`** — open a project by absolute filesystem path and wait until indexing completes (`timeoutSeconds`, default 600), so follow-up tool calls succeed immediately. Idempotent for already-open projects; reports partial success if the project opens but indexing exceeds the timeout.
+
+## [4.21.1] - 2026-06-11
+### Fixed
+- Fixed JetBrains Marketplace compatibility issue (internal IntelliJ API usage in `ide_restart`).
+
+## [4.21.0] - 2026-06-10
+### Added
+Both tools are **disabled by default** and must be enabled in Settings → Tools → Index MCP Server before use.
+
+- **`ide_install_plugin`** — install a plugin zip into the IDE, replacing any existing version. Auto-detects the output of `./gradlew buildPlugin` (`build/distributions/*.zip`) when no path is supplied; accepts an explicit path for any plugin zip. A restart is required to load the updated plugin.
+- **`ide_restart`** — restart the IDE. Terminates the MCP connection immediately; no further tool calls should be made after invoking this. Typical use: `ide_install_plugin` followed by `ide_restart`.
+
+## [4.20.0] - 2026-06-07
+### Added
+- Added `includeGenerated` controls so generated code can be included when it matters and filtered when it adds noise.
+
+## [4.19.3] - 2026-06-05
+### Fixed
+- Replaced internal IntelliJ `PluginManager.findEnabledPlugin` usage with public plugin-state checks for Marketplace approval.
+- Fixed `ide_file_structure` for Lombok/augmented Java classes by skipping generated PSI members without real source offsets. Fixes [#201](https://github.com/hechtcarmel/jetbrains-index-mcp-plugin/issues/201).
+
+## [4.19.1] - 2026-05-26
+### Fixed
+- Fixed `ide_search_text` regex search and `filePattern` filtering for [#190](https://github.com/hechtcarmel/jetbrains-index-mcp-plugin/issues/190).
+
+## [4.19.0] - 2026-05-26
+### Added
+- Added `regex` support to `ide_search_text` through IntelliJ's Find in Files path, including existing `context` filtering and pagination.
+
+### Fixed
+- Wired `ide_search_text`'s documented `filePattern` filter into the schema and search execution path using IntelliJ file mask semantics. Fixes [#190](https://github.com/hechtcarmel/jetbrains-index-mcp-plugin/issues/190).
+
+## [4.18.0] - 2026-05-24
+### Added
+- **PHP symbol reference handler** — PHP now supports `language`+`symbol` parameter mode for `ide_find_references`, `ide_find_definition`, `ide_call_hierarchy`, `ide_find_implementations`, and `ide_find_super_methods`. Accepts symbol formats with PHP namespaces (e.g., `\\App\\Service\\UserService`, `\\App\\Service\\UserService::find()`, `\\App\\Service\\UserService::$property`). Fixes [#179](https://github.com/hechtcarmel/jetbrains-index-mcp-plugin/issues/179).
+- **PHP symbol reference member lookup** — Inherited and case-insensitive PHP methods resolve through PhpStorm's `findMethodByName(CharSequence)` API, field/constant lookup uses the matching `findFieldByName(CharSequence, boolean)` signature, and plain `Class::name` symbols do not fall back to properties without the documented `$property` syntax.
+- **PHP enum case resolution** — `EnumType::CASE` now resolves to enum case PSI elements via PhpStorm's `getEnumCases()` API. Enum case lookup runs before class constant lookup so `::CASE` correctly targets enum cases on enum types. `::CASE()` still resolves as a method call.
+
+## [4.17.3] - 2026-05-21
+### Fixed
+- Fixed `ide_move_file` PHP namespace inference for monorepos where `composer.json` is nested below the opened project root. The PHP semantic move now discovers the nearest ancestor Composer PSR-4 mapping and resolves it relative to that Composer file, so moves under nested source roots can update namespaces correctly. Fixes [#185](https://github.com/hechtcarmel/jetbrains-index-mcp-plugin/issues/185).
+
+## [4.17.2] - 2026-05-18
+### Fixed
+- De-duplicated PHP interface and trait names in `ide_file_structure` class signatures.
+
+## [4.17.1] - 2026-05-17
+### Fixed
+- minor issues with - PHP support to `ide_file_structure`
+
+## [4.17.0] - 2026-05-17
+### Added
+- Added PHP support to `ide_file_structure` using the IDE Structure View API. Works in PhpStorm and IntelliJ IDEA Ultimate with the PHP plugin enabled.
+- PHP structure output includes namespace containers, constructor-promoted property modifiers, enum cases, constants, and includes while filtering implicit PHP runtime details from enums.
+- PHP structure output renders interface inheritance as `extends`, labels global namespace blocks, and filters synthetic `final` modifiers from properties/constants in final classes.
 
 ## [4.16.3] - 2026-05-06
 ### Fixed

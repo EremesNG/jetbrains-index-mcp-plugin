@@ -22,8 +22,8 @@ class PluginDetector(
     private fun checkAvailable(): Boolean {
         for (pluginId in pluginIds) {
             try {
-                val plugin = PluginManagerCore.getPlugin(PluginId.getId(pluginId))
-                if (plugin != null && plugin.isEnabled) {
+                val id = PluginId.getId(pluginId)
+                if (PluginManagerCore.isLoaded(id) && !PluginManagerCore.isDisabled(id)) {
                     log.info("$name plugin detected via plugin ID ($pluginId)")
                     return true
                 }

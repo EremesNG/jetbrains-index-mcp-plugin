@@ -10,6 +10,8 @@ import java.nio.file.Files
 import java.nio.file.Path
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import org.jetbrains.jps.model.java.JavaSourceRootType
+import org.jetbrains.jps.model.java.JpsJavaExtensionService
 
 class BuiltInSearchScopeResolverUnitTest : BasePlatformTestCase() {
 
@@ -80,12 +82,48 @@ class BuiltInSearchScopeResolverUnitTest : BasePlatformTestCase() {
         assertTrue((scope as GlobalSearchScope).contains(prodFile.virtualFile))
     }
 
+    fun testResolveGlobalScopeIncludesGeneratedSourcesByDefault() {
+        val prod = createSourceRoot("gen-prod", isTestSource = false)
+        val genRoot = createGeneratedSourceRoot("gen-build/generated")
+
+        val handWritten = createProjectFile(prod, "sample/HandWritten.kt", "class HandWritten")
+        val generated = createProjectFile(genRoot, "sample/Generated_Factory.kt", "class Generated_Factory")
+
+        // Default (excludeGenerated = false): the shared resolver never silently drops generated
+        // sources. Each tool decides its own default and opts in via excludeGenerated when needed.
+        val defaultScope = BuiltInSearchScopeResolver.resolveGlobalScope(project, BuiltInSearchScope.PROJECT_FILES)
+        assertTrue("Hand-written source must remain in default scope", defaultScope.contains(handWritten.virtualFile))
+        assertTrue("Generated source must be visible by default", defaultScope.contains(generated.virtualFile))
+
+        // Opt-in (excludeGenerated = true): generated is filtered out, hand-written stays.
+        val exclusiveScope = BuiltInSearchScopeResolver.resolveGlobalScope(
+            project,
+            BuiltInSearchScope.PROJECT_FILES,
+            excludeGenerated = true
+        )
+        assertTrue("Hand-written source must remain when generated are excluded", exclusiveScope.contains(handWritten.virtualFile))
+        assertFalse("Generated source must be excluded when excludeGenerated=true", exclusiveScope.contains(generated.virtualFile))
+    }
+
     private fun createSourceRoot(name: String, isTestSource: Boolean): Path {
         val path = Path.of(project.basePath ?: error("Project base path is required")).resolve(name)
         Files.createDirectories(path)
         val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(path)
             ?: error("Failed to refresh $name source root")
         PsiTestUtil.addSourceRoot(module, virtualFile, isTestSource)
+        return path
+    }
+
+    private fun createGeneratedSourceRoot(name: String): Path {
+        val path = Path.of(project.basePath ?: error("Project base path is required")).resolve(name)
+        Files.createDirectories(path)
+        val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(path)
+            ?: error("Failed to refresh $name generated source root")
+        // Register as a generated source root so ProjectFileIndex.isInGeneratedSources() reports true,
+        // mirroring how Gradle import marks build/generated/ksp output.
+        val properties = JpsJavaExtensionService.getInstance()
+            .createSourceRootProperties("", true /* forGeneratedSources */)
+        PsiTestUtil.addSourceRoot(module, virtualFile, JavaSourceRootType.SOURCE, properties)
         return path
     }
 

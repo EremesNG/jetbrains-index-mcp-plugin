@@ -35,12 +35,13 @@ class FindSuperMethodsTool : AbstractMcpTool() {
 
         Target (mutually exclusive):
         - file + line + column: position-based lookup (position can be anywhere within the method body)
-        - language + symbol: fully qualified symbol reference (currently supported for Java + JS/TS)
+        - language + symbol: fully qualified symbol reference (supported languages: ${supportedSymbolReferenceLanguagesDescription()})
 
         Example: {"file": "src/UserServiceImpl.java", "line": 25, "column": 10}
         Example: {"language": "Java", "symbol": "com.example.UserServiceImpl#getUser(String)"}
         Example: {"language": "TypeScript", "symbol": "src/service#UserService.getUser"}
-    """.trimIndent()
+        Example: {"language": "PHP", "symbol": "\\App\\Service\\UserService::find()"}
+        """.trimIndent()
 
     override val inputSchema: JsonObject = SchemaBuilder.tool()
         .projectPath()

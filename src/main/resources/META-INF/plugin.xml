@@ -1,5 +1,5 @@
 <!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
-<idea-plugin>
+<idea-plugin require-restart="true">
     <id>com.github.hechtcarmel.jetbrainsindexmcpplugin</id>
     <name>IDE Index MCP Server</name>
     <vendor email="hechtcarmel@gmail.com" url="https://github.com/hechtcarmel">hechtcarmel</vendor>
@@ -46,7 +46,7 @@
     <li><b>Call Hierarchy</b> - Trace method/function call relationships (Java, Kotlin, Python, JS/TS, Go, PHP, Rust)</li>
     <li><b>Find Implementations</b> - Discover all implementations of interfaces and abstract methods (Java, Kotlin, Python, JS/TS, PHP, Rust)</li>
     <li><b>Find Super Methods</b> - Navigate through method override hierarchies (Java, Kotlin, Python, JS/TS, PHP)</li>
-    <li><b>File Structure</b> - View hierarchical file structure like IDE's Structure view (Java, Kotlin, Python, JS/TS, Markdown) (disabled by default)</li>
+    <li><b>File Structure</b> - View hierarchical file structure like IDE's Structure view (Java, Kotlin, Python, JS/TS, PHP, Markdown) (disabled by default)</li>
 </ul>
 
 <h3>Refactoring Tools</h3>
@@ -55,6 +55,19 @@
     <li><b>Reformat Code</b> - Reformat using project code style with import optimization (disabled by default)</li>
     <li><b>Optimize Imports</b> - Remove unused imports and organize remaining imports without reformatting (disabled by default)</li>
     <li><b>Safe Delete</b> - Remove code safely with usage checking (Java/Kotlin only)</li>
+</ul>
+
+<h3>Project Lifecycle Management</h3>
+<p>When working across many projects simultaneously, idle ones consume unnecessary memory and
+leave editors open for no reason. Lifecycle management automatically sleeps and wakes projects
+based on window focus and MCP activity:</p>
+<ul>
+    <li><b>Automatic sleep/wake</b> - Projects transition from active → background → dormant → closed as they sit idle, and reopen transparently on the next MCP call</li>
+    <li><b>Four modes</b> - Active (full IDE), Background (Power Save on, MCP functional), Dormant (editors closed, PSI cache freed), Closed (fully unloaded, auto-reopens in ~10s)</li>
+    <li><b>Zero-config enrollment</b> - Projects join lifecycle management automatically on their first MCP tool call</li>
+    <li><b>Explicit controls</b> - <code>ide_set_project_mode</code>, <code>ide_get_project_modes</code>, <code>ide_project_status</code>, <code>ide_release_project</code></li>
+    <li><b>Lifecycle event log</b> - <code>ide_lifecycle_log</code> shows a timestamped history of every state transition with trigger reasons, for diagnosing unexpected behaviour</li>
+    <li><b>Configurable thresholds</b> - Timing for each transition is set in Settings → Index MCP Server</li>
 </ul>
 
 <h3>Why This Plugin?</h3>
@@ -149,9 +162,20 @@ for detailed documentation and examples.</p>
         <!-- Startup Activity -->
         <postStartupActivity implementation="com.github.hechtcarmel.jetbrainsindexmcpplugin.startup.McpServerStartupActivity"/>
 
+        <!-- Lifecycle: per-project focus listener registration -->
+        <postStartupActivity implementation="com.github.hechtcarmel.jetbrainsindexmcpplugin.lifecycle.ProjectFocusActivity"/>
+
+        <!-- Lifecycle services are registered via @Service annotation; no XML entry needed -->
+
         <!-- Notification Group -->
         <notificationGroup id="Index MCP Server" displayType="BALLOON"/>
     </extensions>
+
+    <!-- Lifecycle: listener for non-managed project open/close events -->
+    <applicationListeners>
+        <listener class="com.github.hechtcarmel.jetbrainsindexmcpplugin.lifecycle.ProjectLifecycleListener"
+                  topic="com.intellij.openapi.project.ProjectManagerListener"/>
+    </applicationListeners>
 
     <!-- Extension Point for Custom Tools -->
     <extensionPoints>
@@ -167,5 +191,15 @@ for detailed documentation and examples.</p>
             <action id="McpServer.InstallSkill" class="com.github.hechtcarmel.jetbrainsindexmcpplugin.actions.InstallSkillAction" text="Get Companion Skill" description="Install or export the companion skill for AI coding agents"/>
             <action id="McpServer.OpenSettings" class="com.github.hechtcarmel.jetbrainsindexmcpplugin.actions.OpenSettingsAction" text="Settings" description="Open MCP Server settings"/>
         </group>
+
+        <!-- Lifecycle actions — appear in Cmd+Shift+A (Find Action) -->
+        <action id="McpServer.OpenManagedProject"
+                class="com.github.hechtcarmel.jetbrainsindexmcpplugin.actions.OpenManagedProjectAction"
+                text="MCP: Open Project"
+                description="Open or wake an MCP-managed project"/>
+        <action id="McpServer.ShowProjectStates"
+                class="com.github.hechtcarmel.jetbrainsindexmcpplugin.actions.ShowProjectStatesAction"
+                text="MCP: Show Project States"
+                description="Open MCP settings to view managed project states"/>
     </actions>
 </idea-plugin>

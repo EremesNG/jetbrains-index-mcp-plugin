@@ -31,10 +31,10 @@ enum class StructureKind {
     CLASS, INTERFACE, ENUM, ANNOTATION, RECORD, OBJECT, TRAIT,
 
     // Members
-    METHOD, FIELD, PROPERTY, CONSTRUCTOR,
+    METHOD, FIELD, PROPERTY, CONSTRUCTOR, CONSTANT, ENUM_CASE,
 
-    // Language-specific (e.g. TypeScript type aliases, Markdown headings)
-    FUNCTION, VARIABLE, TYPE_ALIAS, HEADING,
+    // Language-specific (e.g. TypeScript type aliases, PHP includes, Markdown headings)
+    FUNCTION, VARIABLE, TYPE_ALIAS, HEADING, INCLUDE,
 
     // Containers
     NAMESPACE, PACKAGE, MODULE,

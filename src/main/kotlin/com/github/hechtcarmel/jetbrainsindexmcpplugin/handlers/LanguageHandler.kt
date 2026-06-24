@@ -78,7 +78,8 @@ interface TypeHierarchyHandler : LanguageHandler<TypeHierarchyData> {
     fun getTypeHierarchy(
         element: PsiElement,
         project: Project,
-        scope: BuiltInSearchScope = BuiltInSearchScope.PROJECT_FILES
+        scope: BuiltInSearchScope = BuiltInSearchScope.PROJECT_FILES,
+        excludeGenerated: Boolean = false
     ): TypeHierarchyData?
 }
 
@@ -98,7 +99,8 @@ interface ImplementationsHandler : LanguageHandler<List<ImplementationData>> {
     fun findImplementations(
         element: PsiElement,
         project: Project,
-        scope: BuiltInSearchScope = BuiltInSearchScope.PROJECT_FILES
+        scope: BuiltInSearchScope = BuiltInSearchScope.PROJECT_FILES,
+        excludeGenerated: Boolean = false
     ): List<ImplementationData>?
 }
 
@@ -122,7 +124,8 @@ interface CallHierarchyHandler : LanguageHandler<CallHierarchyData> {
         project: Project,
         direction: String,
         depth: Int,
-        scope: BuiltInSearchScope = BuiltInSearchScope.PROJECT_FILES
+        scope: BuiltInSearchScope = BuiltInSearchScope.PROJECT_FILES,
+        excludeGenerated: Boolean = false
     ): CallHierarchyData?
 }
 
@@ -259,7 +262,7 @@ interface SymbolReferenceHandler : LanguageHandler<PsiNamedElement> {
     /**
      * The language name this handler supports.
      *
-     * Currently implemented for "Java". Future handlers may use "Kotlin", "Python", "JavaScript", etc.
+     * Currently implemented for languages such as "Java" and "PHP". Future handlers may use "Kotlin", "Python", "JavaScript", etc.
      *
      * This is the user-facing language name used in the `language` tool parameter.
      * Should match the [com.intellij.lang.Language.displayName] (case-insensitive matching is used).
@@ -270,7 +273,7 @@ interface SymbolReferenceHandler : LanguageHandler<PsiNamedElement> {
      * Resolves a symbol reference string to a PSI element.
      *
      * @param project The project context
-     * @param symbol The symbol reference string (e.g., `com.example.MyClass#method(String)`)
+     * @param symbol The symbol reference string (e.g., `com.example.MyClass#method(String)` or `\\App\\Service\\UserService::find()`)
      * @return A [Result] containing the resolved element or a failure
      */
     fun resolveSymbol(project: Project, symbol: String): Result<PsiNamedElement>

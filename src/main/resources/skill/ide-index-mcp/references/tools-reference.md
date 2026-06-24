@@ -10,10 +10,10 @@ Complete parameter reference for all IDE MCP tools. All tools use JSON-RPC via M
 | `file` | string | For project files, path relative to project root (e.g., `src/main/App.java`). `ide_read_file` and some read-only position-based navigation tools also accept dependency/library paths returned by the plugin as absolute paths or `jar://` URLs; check each tool section because support is tool-specific. |
 | `line` | integer | **1-based** line number |
 | `column` | integer | **1-based** column number. Place on the symbol name, not whitespace. For dotted expressions like `json.dumps()` or `os.path.join()`, point to the member token (`dumps`, `join`) when targeting the member definition. |
-| `language` | string | Language of the symbol (e.g., `"Java"`). Required when using `symbol`. |
-| `symbol` | string | Fully qualified symbol reference. Format: `com.example.ClassName`, `com.example.ClassName#memberName`. |
+| `language` | string | Language of the symbol (e.g., `"Java"`, `"PHP"`). Required when using `symbol`. |
+| `symbol` | string | Fully qualified symbol reference. Java format: `com.example.ClassName`, `com.example.ClassName#memberName`. PHP format: `\\App\\Service\\UserService`, `\\App\\Service\\UserService::method()`, `\\App\\Service\\UserService::CONSTANT`, `\\App\\Service\\UserService::$property`, `\\App\\Service\\StatusEnum::ACTIVE`. PHP properties require the `$property` form; plain `::name` resolves enum cases (on enum types), constants, or methods. |
 
-**Symbol reference:** Some tools accept `language` + `symbol` as an alternative to `file` + `line` + `column`. The two groups are **mutually exclusive**. Currently supported for Java + JS/TS. Unsupported languages are rejected explicitly; use `file` + `line` + `column` for other languages.
+**Symbol reference:** Some tools accept `language` + `symbol` as an alternative to `file` + `line` + `column`. The two groups are **mutually exclusive**. Supported languages: Java, PHP, JavaScript, TypeScript. Unsupported languages are rejected explicitly; use `file` + `line` + `column` for other languages.
 
 **JavaScript/TypeScript symbol grammar (v1):** Symbols must be module-qualified in one of these forms:
 - `modulePath#exportName` — named export (e.g., `src/utils#formatDate`)
@@ -61,6 +61,7 @@ Find all usages of a symbol (semantic, not text search).
 | `language` | string | conditional | Symbol language (e.g., `"Java"`). Required for symbol-based lookup. |
 | `symbol` | string | conditional | Fully qualified symbol reference. Required for symbol-based lookup. |
 | `scope` | enum | no | One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | no | Include references in generated sources (KSP/Dagger/annotation-processor output). **Default true** — keeps valid runtime references (Dagger/MapStruct/gRPC/serializers). Set false to drop generated call sites when they dominate results on injected symbols. |
 | `maxResults` | integer | no | Deprecated alias for `pageSize`. Default 100, max 500 |
 | `cursor` | string | no | Pagination cursor from a previous response. When provided, search parameters are ignored; `project_path` and `pageSize` may still be provided. |
 | `pageSize` | integer | no | Results per page. Default 100, max 500 |
@@ -97,6 +98,7 @@ Search for classes/interfaces by name using IDE's class index. Equivalent to Ctr
 | `query` | string | yes | Class name pattern |
 | `scope` | enum | no | One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
 | `language` | string | no | Filter: "Java", "Kotlin", "Python", etc. |
+| `includeGenerated` | boolean | no | Include classes from generated sources (KSP/Dagger/annotation-processor output). Default false |
 | `matchMode` | enum | no | `substring` (default), `prefix`, `exact` |
 | `limit` | integer | no | Deprecated alias for `pageSize`. Default 25, max 500 |
 | `cursor` | string | no | Pagination cursor from a previous response. When provided, search parameters are ignored; `project_path` and `pageSize` may still be provided. |
@@ -114,6 +116,7 @@ Search for files by name using IDE's file index. Equivalent to Ctrl+Shift+N / Cm
 |-----------|------|----------|-------------|
 | `query` | string | yes | File name pattern |
 | `scope` | enum | no | One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | no | Include files under generated sources (KSP/Dagger/annotation-processor output). Default false |
 | `limit` | integer | no | Deprecated alias for `pageSize`. Default 25, max 500 |
 | `cursor` | string | no | Pagination cursor from a previous response. When provided, search parameters are ignored; `project_path` and `pageSize` may still be provided. |
 | `pageSize` | integer | no | Results per page. Default 25, max 500 |
@@ -123,13 +126,15 @@ Search for files by name using IDE's file index. Equivalent to Ctrl+Shift+N / Cm
 **Path note**: Project results use relative paths. Dependency/library results may use absolute paths or `jar://` URLs.
 
 ### ide_search_text
-Search for exact words using IDE's pre-built word index. O(1) lookups, not file scanning.
+Search for text using IDE's pre-built word index for exact searches or IntelliJ Find in Files for regex searches.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `query` | string | yes | Exact word (NOT regex/pattern) |
+| `query` | string | yes | Text to search for; exact word unless `regex` is true |
+| `regex` | boolean | no | Treat `query` as a regular expression. Default false |
 | `context` | enum | no | `all` (default), `code`, `comments`, `strings` |
 | `caseSensitive` | boolean | no | Default true |
+| `filePattern` | string | no | IntelliJ file mask, e.g. `*.kt`, `*.java,!*Test.java` |
 | `limit` | integer | no | Default 100, max 500 |
 | `project_path` | string | no | Project root path |
 
@@ -148,6 +153,7 @@ Find implementations of interfaces, abstract classes, or abstract methods.
 | `language` | string | conditional | Symbol language (e.g., `"Java"`). Required for symbol-based lookup. |
 | `symbol` | string | conditional | Fully qualified symbol reference. For JS/TS, use module-qualified forms: `modulePath#exportName`, `modulePath#default`, or `modulePath#ClassName.memberName`. Required for symbol-based lookup. |
 | `scope` | enum | no | One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | no | Include implementations in generated sources (KSP/Dagger/annotation-processor output). Default false |
 | `cursor` | string | no | Pagination cursor from a previous response. When provided, search parameters are ignored; `project_path` and `pageSize` may still be provided. |
 | `pageSize` | integer | no | Results per page. Default 100, max 500 |
 | `project_path` | string | no | Project root path |
@@ -163,6 +169,7 @@ Search for any code symbol (classes, methods, fields, functions) by name.
 | `query` | string | yes | Symbol name pattern. Matching follows IntelliJ's Go to Symbol popup, including qualified queries like `BasicSolver.run`. |
 | `scope` | enum | no | One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
 | `language` | string | no | Filter by language |
+| `includeGenerated` | boolean | no | Include symbols from generated sources (KSP/Dagger/annotation-processor output). Default false |
 | `limit` | integer | no | Deprecated alias for `pageSize`. Default 25, max 500 |
 | `cursor` | string | no | Pagination cursor from a previous response. When provided, search parameters are ignored; `project_path` and `pageSize` may still be provided. |
 | `pageSize` | integer | no | Results per page. Default 25, max 500 |
@@ -199,6 +206,7 @@ Get complete type inheritance hierarchy (supertypes and subtypes).
 | `line` | integer | no | Required with file |
 | `column` | integer | no | Required with file |
 | `scope` | enum | no | One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | no | Include supertypes/subtypes in generated sources (KSP/Dagger/annotation-processor output). Default true — keeps generated types in the hierarchy |
 | `project_path` | string | no | Project root path |
 
 **Provide either** `className` **or** `file`+`line`+`column`.
@@ -220,6 +228,7 @@ Build call tree showing who calls a method or what a method calls.
 | `direction` | enum | yes | `callers` or `callees` |
 | `depth` | integer | no | Recursion depth (default 3, max 5) |
 | `scope` | enum | no | One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | no | Include callers/callees in generated sources (KSP/Dagger/annotation-processor output). Default true |
 | `project_path` | string | no | Project root path |
 
 **Returns**: `{ element: {name, file, line, column, language}, calls: [{name, file, line, column, language, children: [...]}] }`
@@ -233,7 +242,9 @@ Get hierarchical file structure like IDE's Structure panel.
 | `project_path` | string | no | Project root path |
 
 **Returns**: `{ file, language, structure }` (formatted tree with types, modifiers, signatures, line numbers)
-**Languages**: Java, Kotlin, Python, JS/TS, Markdown.
+**Languages**: Java, Kotlin, Python, JS/TS, PHP, Markdown.
+
+PHP support requires the PHP plugin and is available in PhpStorm or IntelliJ IDEA Ultimate with the PHP plugin enabled.
 
 ### ide_read_file (disabled by default)
 Read file content by path or qualified name, including library/jar sources.
@@ -372,6 +383,36 @@ Build project using IDE's build system (JPS, Gradle, Maven).
 **Returns**: `{ success, aborted, errors?, warnings?, buildMessages: [{message, file, line, column, severity}], truncated, rawOutput?, durationMs }`
 Note: `errors`/`warnings` are `null` when no messages were captured (not 0).
 
+### ide_set_power_save_mode (disabled by default)
+Enable or disable IDE Power Save Mode (IDE-wide). Suspends background inspections and code analysis; the index and code intelligence tools stay functional.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `enabled` | boolean | yes | `true` to enable, `false` to disable |
+| `project_path` | string | no | Project root path |
+
+**Returns**: text confirmation, e.g. `Power Save Mode enabled (IDE-wide).`
+
+### ide_close_project (disabled by default)
+Close an open project window and free its memory. Non-blocking; returns once the close is scheduled. Refuses to close the last open project.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_path` | string | no | Project root path (required when multiple projects are open) |
+
+**Returns**: text confirmation, e.g. `Project 'name' is closing.`
+
+### ide_open_project (disabled by default)
+Open a project by absolute path and wait until indexing completes. Idempotent: returns immediately if the project is already open. May require a human to answer the IDE's "Trust project?" dialog for first-time projects.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Absolute path of the project directory |
+| `timeoutSeconds` | integer | no | Max seconds to wait for open + indexing (default 600) |
+| `project_path` | string | no | JSON-RPC context project when multiple are open |
+
+**Returns**: text confirmation; on indexing timeout returns success with a note to check `ide_index_status`.
+
 ---
 
 ## Editor Tools
@@ -396,3 +437,26 @@ Open a file in the editor with optional navigation.
 | `project_path` | string | no | Project root path |
 
 **Returns**: `{ file, opened, message }`
+
+---
+
+## Plugin Development Tools
+
+### ide_install_plugin (disabled by default)
+Install a plugin zip into the IDE, replacing any existing version. Auto-detects the newest `build/distributions/*.zip` of the active project when `path` is omitted. Requires `ide_restart` to load the new version.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | no | Absolute path to the plugin zip (default: auto-detect) |
+| `project_path` | string | no | Project root path when `path` is omitted |
+
+**Returns**: text confirmation with the installed plugin id and zip name.
+
+### ide_restart (disabled by default)
+Restart the IDE. Terminates the MCP connection immediately — reconnect after the IDE comes back up.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_path` | string | no | Project root path |
+
+**Returns**: text confirmation; the connection drops right after.

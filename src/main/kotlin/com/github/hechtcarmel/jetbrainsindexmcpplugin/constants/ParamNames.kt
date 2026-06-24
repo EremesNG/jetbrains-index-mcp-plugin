@@ -49,7 +49,10 @@ object ParamNames {
     const val LIMIT = "limit"
     const val CONTEXT = "context"
     const val CASE_SENSITIVE = "caseSensitive"
+    const val FILE_PATTERN = "filePattern"
+    const val REGEX = "regex"
     const val CURSOR = "cursor"
+    const val INCLUDE_GENERATED = "includeGenerated"
 
     // Preview parameters
     const val FULL_ELEMENT_PREVIEW = "fullElementPreview"

@@ -4,6 +4,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.server.models.ContentBlock
 import com.intellij.testFramework.IndexingTestUtil
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.psi.PsiDirectory
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
 import com.intellij.psi.SmartPointerManager
@@ -37,6 +38,46 @@ class MoveFileToolBehaviorTest : BasePlatformTestCase() {
         }
         IndexingTestUtil.waitUntilIndexesAreReady(project)
         return path
+    }
+
+    private fun createProjectDirectory(relativePath: String): PsiDirectory {
+        val projectBasePath = requireNotNull(project.basePath)
+        val path = Path.of(projectBasePath, relativePath)
+        Files.createDirectories(path)
+        val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(path)
+        assertNotNull("Directory should resolve in VFS: $relativePath", virtualFile)
+        return com.intellij.psi.PsiManager.getInstance(project).findDirectory(virtualFile!!)
+            ?: error("Directory should resolve as PSI: $relativePath")
+    }
+
+    private fun determineComposerNamespace(tool: MoveFileTool, targetDirectory: PsiDirectory): String? {
+        val method = MoveFileTool::class.java.getDeclaredMethod(
+            "determinePhpNamespaceFromComposer",
+            com.intellij.openapi.project.Project::class.java,
+            PsiDirectory::class.java
+        )
+        method.isAccessible = true
+        return method.invoke(tool, project, targetDirectory) as? String
+    }
+
+    fun testComposerNamespaceInferenceUsesNestedComposerJson() {
+        writeProjectFile(
+            "platform/composer.json",
+            """
+                {
+                  "autoload": {
+                    "psr-4": {
+                      "App\\": "src/"
+                    }
+                  }
+                }
+            """.trimIndent()
+        )
+        val targetDirectory = createProjectDirectory("platform/src/History/Revision/Domain")
+
+        val namespace = determineComposerNamespace(MoveFileTool(), targetDirectory)
+
+        assertEquals("App\\History\\Revision\\Domain", namespace)
     }
 
     fun testMoveFileToolFailsFastWhenPhpSemanticMoveIsUnsupported() = runBlocking {

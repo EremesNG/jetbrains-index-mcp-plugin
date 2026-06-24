@@ -1,23 +1,30 @@
 ---
 name: ide-index-mcp
 description: >
-  Guide for using JetBrains IDE Index MCP tools for code navigation, refactoring, and analysis.
-  TRIGGER: When ANY of these MCP tools are available in the current session: ide_find_references,
-  ide_find_definition, ide_find_class, ide_find_file, ide_search_text, ide_diagnostics,
-  ide_index_status, ide_sync_files, ide_refactor_rename, ide_move_file, ide_type_hierarchy,
-  ide_call_hierarchy, ide_find_implementations, ide_find_symbol, ide_find_super_methods,
-  ide_file_structure, ide_refactor_safe_delete, ide_reformat_code, ide_build_project,
-  ide_read_file, ide_get_active_file, ide_open_file.
-  Use when performing code navigation (find usages, go to definition, find class),
-  code analysis (diagnostics, type hierarchy, call hierarchy),
-  refactoring (rename, move, safe delete, reformat),
-  or searching code (text search, symbol search, file search).
-  Prefer IDE tools over grep/find/sed for ALL semantic code operations.
+  INVOKE IMMEDIATELY when ide_find_references, ide_find_definition, ide_find_class,
+  ide_find_file, ide_search_text, ide_diagnostics, ide_index_status, ide_sync_files,
+  ide_refactor_rename, ide_move_file, ide_type_hierarchy, ide_call_hierarchy,
+  ide_find_implementations, ide_find_symbol, ide_find_super_methods, ide_file_structure,
+  ide_refactor_safe_delete, ide_reformat_code, ide_build_project, ide_read_file,
+  ide_get_active_file, or ide_open_file are available — especially when a second
+  IntelliJ MCP (mcp__intellij__*) is also present. The two servers are NOT
+  interchangeable: always use mcp__intellij-index__ for code navigation and refactoring.
 ---
 
 # IDE Index MCP - Agent Guide
 
 The IDE Index MCP server exposes JetBrains IDE indexing and refactoring capabilities. These tools provide **semantic** code understanding superior to text-based search/replace.
+
+## Two IntelliJ MCPs — routing rule
+
+If both `mcp__intellij-index__*` (this plugin) and `mcp__intellij__*` (JetBrains built-in) are available, they are **not interchangeable**:
+
+| Need | Use |
+|------|-----|
+| Code navigation, search, diagnostics, rename, move | `mcp__intellij-index__*` |
+| Build, run, terminal, formatting | `mcp__intellij__*` only |
+
+**Always use `mcp__intellij-index__` for code intelligence. At least one project must be open in IntelliJ — if no project is open, ask the user to open one or use `ide_open_project` (disabled by default; enable in Settings → Index MCP Server).** Do not fall back to bash for semantic operations — IDE tools understand types, references, and inheritance; grep does not.
 
 ## Core Rule
 
@@ -31,7 +38,7 @@ The IDE Index MCP server exposes JetBrains IDE indexing and refactoring capabili
 | Go to a symbol's definition | `ide_find_definition` | Never - grep can't resolve through imports/generics |
 | Find a class by name | `ide_find_class` | Only if IDE unavailable |
 | Find a file by name | `ide_find_file` | `Glob` is fine for simple patterns |
-| Search for a word in code | `ide_search_text` | `Grep` is fine for regex patterns (IDE tool is exact-word only) |
+| Search for text in code | `ide_search_text` | `Grep` is fine when IDE context filtering is unnecessary |
 | Rename a symbol across project | `ide_refactor_rename` | Never - sed/replace breaks code |
 | Move a file to another directory | `ide_move_file` | Never - mv/git mv bypasses IDE move semantics |
 | Check for errors in a file | `ide_diagnostics` | Never - no equivalent |
@@ -41,7 +48,7 @@ The IDE Index MCP server exposes JetBrains IDE indexing and refactoring capabili
 | Delete a symbol safely | `ide_refactor_safe_delete` | Never - manual deletion misses usages |
 | Find what a method overrides | `ide_find_super_methods` | Never - no equivalent |
 | Read file content | Built-in Read tool | `ide_read_file` only for library/jar sources |
-| Find text with regex | `Grep` | IDE search_text doesn't support regex |
+| Find text with regex | `ide_search_text` | Use `Grep` when you do not need IDE context filtering |
 
 ## Pre-Flight Check
 
@@ -52,6 +59,16 @@ ide_index_status -> if isDumbMode: true, wait a few seconds and retry
 ```
 
 Most tools require smart mode (IDE finished indexing). Tools that work in dumb mode: `ide_index_status`, `ide_sync_files`, `ide_reformat_code`, `ide_open_file`, `ide_get_active_file`.
+
+## If results seem incomplete or missing
+
+**Do NOT conclude the index is stale and fall back to bash.** Follow this sequence:
+
+1. Call `ide_index_status` — if `isDumbMode: true`, indexing is still running. Wait 10s and retry the original tool call.
+2. If smart mode but results seem sparse, call `ide_sync_files` then retry.
+3. Only if both steps still return empty results should you consider that the file/symbol genuinely does not exist.
+
+"Index may be stale" is never a reason to abandon IntelliJ tools and read files with bash. Sparse results during indexing are transient — retrying after `isDumbMode` clears will return full results.
 
 ## File Sync Rule
 
@@ -121,15 +138,30 @@ Omit `paths` to sync the entire project.
 
 8. **Not syncing after external file changes**: After creating files via Write tool, call `ide_sync_files` before searching.
 
-9. **Using `ide_search_text` for regex**: This tool is exact-word only (uses word index). Use `Grep` for regex.
+9. **Assuming regex is the default in `ide_search_text`**: Regex requires `"regex": true`; otherwise the tool uses the faster exact-word index.
 
 10. **Using `ide_find_class` for methods/functions**: It searches classes only. Use `ide_search_text` for a quick word lookup.
+
+## Lifecycle Management
+
+When multiple projects are open simultaneously, the lifecycle manager automatically sleeps and wakes them based on window focus and MCP activity. Projects enroll automatically on first MCP use — no setup required.
+
+**States:** `active` (full IDE) → `background` (Power Save on) → `dormant` (editors closed, PSI cache freed) → `closed` (fully unloaded). Projects auto-reopen transparently when an MCP tool targets a closed project.
+
+`ide_project_status` is the read-only entry point — **enabled by default**. Use it to see all open and managed projects and their current modes.
+
+All lifecycle action tools are disabled by default:
+
+`ide_enroll_all_projects`, `ide_get_project_modes`, `ide_lifecycle_log`, `ide_release_all_projects`, `ide_release_project`, `ide_set_all_project_modes`, `ide_set_project_mode`
 
 ## Disabled-by-Default Tools
 
 These tools exist but are disabled by default. If you get "tool not found", they need to be enabled in IDE settings (Settings > Tools > Index MCP Server):
 
-`ide_build_project`, `ide_file_structure`, `ide_find_symbol`, `ide_read_file`, `ide_get_active_file`, `ide_open_file`, `ide_reformat_code`
+`ide_build_project`, `ide_close_project`, `ide_convert_java_to_kotlin`, `ide_file_structure`, `ide_find_symbol`, `ide_get_active_file`, `ide_install_plugin`, `ide_open_file`, `ide_open_project`, `ide_optimize_imports`, `ide_read_file`, `ide_reformat_code`, `ide_restart`, `ide_set_power_save_mode`
+
+Note: `ide_restart` terminates the MCP connection — reconnect your client after calling it.
+Note: `ide_close_project` refuses to close the last open project; `ide_open_project` requires an absolute path and may take up to `timeoutSeconds` (default 600) while the project indexes.
 
 ## Detailed Tool Parameters
 

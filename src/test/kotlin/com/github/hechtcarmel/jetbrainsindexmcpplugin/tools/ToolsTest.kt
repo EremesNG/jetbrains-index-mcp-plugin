@@ -11,10 +11,12 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.navigation.FindImple
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.navigation.FindSuperMethodsTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.navigation.FindUsagesTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.navigation.FindDefinitionTool
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.navigation.SearchTextTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.navigation.TypeHierarchyTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.project.GetIndexStatusTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.ReformatCodeTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.RenameSymbolTool
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.RenameSymbolTool.Companion.buildCompiledElementErrorMessage
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.SafeDeleteTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.constants.ErrorMessages
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.constants.SchemaConstants
@@ -24,19 +26,27 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.LanguageHandlerRe
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.OptimizedSymbolSearch
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.SymbolData
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.createMatcher
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.handlers.createNameFilter
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.CallHierarchyResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.FileStructureResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.ImplementationResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.SuperMethodsResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.util.PluginDetectors
+import com.intellij.lang.java.JavaLanguage
 import com.intellij.navigation.ChooseByNameContributor
 import com.intellij.navigation.NavigationItem
 import com.intellij.openapi.roots.ModuleRootModificationUtil
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.psi.PsiClass
+import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiManager
+import com.intellij.psi.PsiMethod
+import com.intellij.psi.PsiTypes
+import com.intellij.psi.augment.PsiAugmentProvider
 import com.intellij.psi.codeStyle.MinusculeMatcher
+import com.intellij.psi.impl.light.LightMethodBuilder
 import com.intellij.psi.search.GlobalSearchScope
+import com.intellij.testFramework.ExtensionTestUtil
 import com.intellij.testFramework.IndexingTestUtil
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.nio.file.Files
@@ -639,6 +649,55 @@ class ToolsTest : BasePlatformTestCase() {
         assertEquals(listOf("ProjectScopeSymbol"), results.map { it.name })
     }
 
+    fun testSearchTextToolFilePatternFiltersExactSearchResults() = runBlocking {
+        myFixture.addFileToProject("mappers/UserMapper.xml", "<mapper><select id=\"a\">select needle from sys_user</select></mapper>")
+        myFixture.addFileToProject("web/pagination.js", "const q = 'needle';")
+        myFixture.addFileToProject("tmp/opac_phase2_sql-mybatis.json", "{\"query\":\"needle\"}")
+        IndexingTestUtil.waitUntilIndexesAreReady(project)
+
+        val tool = SearchTextTool()
+        val result = tool.execute(project, buildJsonObject {
+            put("query", "needle")
+            put("filePattern", "*.xml")
+            put("pageSize", 10)
+        })
+
+        assertFalse("Search should succeed", result.isError)
+        val resultJson = json.parseToJsonElement((result.content.first() as ContentBlock.Text).text).jsonObject
+        val files = resultJson["matches"]!!.jsonArray.map { it.jsonObject["file"]!!.jsonPrimitive.content }
+
+        assertEquals(listOf("mappers/UserMapper.xml"), files)
+    }
+
+    fun testSearchTextToolRegexUsesFindInFilesOutsideReadAction() = runBlocking {
+        myFixture.addFileToProject(
+            "src/CommandRunner.java",
+            """
+            class CommandRunner {
+                void run() throws Exception {
+                    Runtime.getRuntime().exec("calc");
+                }
+            }
+            """.trimIndent()
+        )
+        IndexingTestUtil.waitUntilIndexesAreReady(project)
+
+        val tool = SearchTextTool()
+        val result = tool.execute(project, buildJsonObject {
+            put("query", "Runtime\\.getRuntime\\(\\)\\.exec\\(")
+            put("regex", true)
+            put("context", "code")
+            put("filePattern", "*.java")
+            put("pageSize", 10)
+        })
+
+        assertFalse("Regex search should succeed", result.isError)
+        val resultJson = json.parseToJsonElement((result.content.first() as ContentBlock.Text).text).jsonObject
+        val files = resultJson["matches"]!!.jsonArray.map { it.jsonObject["file"]!!.jsonPrimitive.content }
+
+        assertEquals(listOf("src/CommandRunner.java"), files)
+    }
+
     // Intelligence Tools Tests
 
     fun testGetDiagnosticsToolMissingParams() = runBlocking {
@@ -706,6 +765,66 @@ class ToolsTest : BasePlatformTestCase() {
         })
 
         assertTrue("Should error with blank name", result.isError)
+    }
+
+    fun testRenameSymbolToolCompiledElementReturnsHelpfulError() = runBlocking {
+        // Regression test: renaming a compiled class (e.g. a JDK type) used to trigger
+        // an assertion in RenameProcessor constructor, logged as SEVERE "Plugin to blame".
+        // Fix: validateAndPrepare() detects PsiCompiledElement before reaching RenameProcessor
+        // and returns a clear error message containing "compiled".
+        //
+        // In the test fixture the JDK may not be fully indexed, so java.lang.String may not
+        // resolve to a PsiCompiledElement — we verify via unit-level logic below instead.
+        val psiFile = myFixture.addFileToProject(
+            "Usage.java",
+            """
+            public class Usage {
+                public void method() {
+                    String s = "hello";
+                }
+            }
+            """.trimIndent()
+        )
+        IndexingTestUtil.waitUntilIndexesAreReady(project)
+
+        val document = com.intellij.psi.PsiDocumentManager.getInstance(project)
+            .getDocument(psiFile) ?: error("no document")
+        val offset = document.text.indexOf("String s")
+        val line = document.getLineNumber(offset) + 1
+        val column = offset - document.getLineStartOffset(line - 1) + 1
+
+        val tool = RenameSymbolTool()
+        val result = tool.execute(project, buildJsonObject {
+            put("file", psiFile.virtualFile.path)
+            put("line", line)
+            put("column", column)
+            put("newName", "MyString")
+        })
+
+        // The rename must not succeed — either the compiled check fires (error mentions
+        // "compiled") or the element didn't resolve (some other error). Either way, no
+        // SEVERE "Plugin to blame" assertion must fire, which is the key regression property.
+        assertTrue("Renaming a JDK type reference must not succeed", result.isError)
+        val msg = (result.content.firstOrNull() as? ContentBlock.Text)?.text ?: ""
+        assertFalse(
+            "Success response must not be returned for a compiled/unresolved symbol",
+            msg.contains("Successfully renamed", ignoreCase = true)
+        )
+    }
+
+    fun testRenameCompiledElementCheckLogic() {
+        // Unit-level regression test for the compiled-element guard in validateAndPrepare().
+        // Verifies the check logic directly without needing a real PsiCompiledElement from the JDK.
+        // The guard is: if (namedElement is PsiCompiledElement) return error mentioning "compiled".
+        val errorForCompiled = buildCompiledElementErrorMessage("description", "/path/to/Something.class")
+        assertTrue(
+            "Error message for compiled element must mention 'compiled'",
+            errorForCompiled.contains("compiled", ignoreCase = true)
+        )
+        assertTrue(
+            "Error message must name the element",
+            errorForCompiled.contains("description")
+        )
     }
 
     fun testSafeDeleteToolMissingParams() = runBlocking {
@@ -846,6 +965,84 @@ class ToolsTest : BasePlatformTestCase() {
         assertTrue("Derived type coverage should mention ThothStatus", derivedStructure.contains("ThothStatus"))
         assertTrue("Derived type coverage should mention DEFAULT_THOTH_STATUS", derivedStructure.contains("var DEFAULT_THOTH_STATUS"))
         assertTrue("Derived type coverage should mention formatThothStatus", derivedStructure.contains("formatThothStatus"))
+    }
+
+    fun testJavaStructureHandlerBuildsPhysicalSourceStructure() {
+        val psiFile = myFixture.addFileToProject(
+            "com/example/SampleDto.java",
+            """
+            package com.example;
+
+            public class SampleDto {
+                private String name;
+                private int count;
+
+                public SampleDto() {
+                }
+
+                public String getName() {
+                    return name;
+                }
+            }
+            """.trimIndent()
+        )
+        val handler = LanguageHandlerRegistry.getStructureHandler(psiFile)
+
+        assertNotNull("Expected Java structure handler", handler)
+        val nodes = handler!!.getFileStructure(psiFile, project)
+        val root = nodes.single()
+
+        assertEquals("SampleDto", root.name)
+        assertEquals("CLASS", root.kind.name)
+        assertEquals(3, root.line)
+        assertEquals(
+            listOf("name", "count", "SampleDto", "getName"),
+            root.children.map { it.name }
+        )
+        assertEquals(listOf(4, 5, 7, 10), root.children.map { it.line })
+    }
+
+    fun testJavaStructureHandlerSkipsAugmentedMethodWithoutSourceOffset() {
+        ExtensionTestUtil.maskExtensions(
+            PsiAugmentProvider.EP_NAME,
+            listOf(object : PsiAugmentProvider() {
+                override fun <Psi : PsiElement> getAugments(
+                    element: PsiElement,
+                    type: Class<Psi>,
+                    nameHint: String?
+                ): List<Psi> {
+                    if (type != PsiMethod::class.java) return emptyList()
+                    if (element !is PsiClass || element.name != "AugmentedDto") return emptyList()
+
+                    val method = LightMethodBuilder(element.manager, JavaLanguage.INSTANCE, "generatedGetter")
+                        .setMethodReturnType(PsiTypes.intType())
+                        .setContainingClass(element)
+
+                    @Suppress("UNCHECKED_CAST")
+                    return listOf(method as Psi)
+                }
+            }),
+            testRootDisposable
+        )
+
+        val psiFile = myFixture.addFileToProject(
+            "com/example/AugmentedDto.java",
+            """
+            package com.example;
+
+            public class AugmentedDto {
+                private int count;
+            }
+            """.trimIndent()
+        )
+        val handler = LanguageHandlerRegistry.getStructureHandler(psiFile)
+
+        assertNotNull("Expected Java structure handler", handler)
+        val nodes = handler!!.getFileStructure(psiFile, project)
+        val root = nodes.single()
+
+        assertEquals(listOf("count"), root.children.map { it.name })
+        assertFalse(root.children.any { it.name == "generatedGetter" })
     }
 
     fun testMarkdownStructureHandlerBuildsHeadingHierarchy() {

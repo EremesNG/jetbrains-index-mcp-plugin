@@ -16,6 +16,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.FindFileResul
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.FindUsagesResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.models.ReadFileResult
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.project.GetIndexStatusTool
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.util.PluginDetectors
 import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.roots.ModuleRootModificationUtil
 import com.intellij.openapi.vfs.LocalFileSystem
@@ -463,7 +464,7 @@ class ToolExecutionIntegrationTest : BasePlatformTestCase() {
         val registry = ToolRegistry()
         registry.registerBuiltInTools()
 
-        val expectedTools = listOf(
+        val expectedTools = mutableListOf(
             // Navigation tools
             ToolNames.FIND_REFERENCES,
             ToolNames.FIND_DEFINITION,
@@ -490,11 +491,30 @@ class ToolExecutionIntegrationTest : BasePlatformTestCase() {
             ToolNames.REFACTOR_SAFE_DELETE,
             ToolNames.REFORMAT_CODE,
             ToolNames.OPTIMIZE_IMPORTS,
-            ToolNames.CONVERT_JAVA_TO_KOTLIN,
             // Editor tools
             ToolNames.GET_ACTIVE_FILE,
-            ToolNames.OPEN_FILE
+            ToolNames.OPEN_FILE,
+            // Plugin dev tools
+            ToolNames.INSTALL_PLUGIN,
+            ToolNames.RESTART_IDE,
+            // Project window management tools
+            ToolNames.CLOSE_PROJECT,
+            ToolNames.OPEN_PROJECT,
+            ToolNames.SET_POWER_SAVE_MODE,
+            // Lifecycle management tools
+            ToolNames.ENROLL_ALL_PROJECTS,
+            ToolNames.GET_PROJECT_MODES,
+            ToolNames.LIFECYCLE_LOG,
+            ToolNames.LIFECYCLE_LOG_FILE, // ide_set_lifecycle_log_file
+            ToolNames.PROJECT_STATUS,
+            ToolNames.RELEASE_ALL_PROJECTS,
+            ToolNames.RELEASE_PROJECT,
+            ToolNames.SET_ALL_PROJECT_MODES,
+            ToolNames.SET_PROJECT_MODE
         )
+        if (PluginDetectors.java.isAvailable && PluginDetectors.kotlin.isAvailable) {
+            expectedTools.add(ToolNames.CONVERT_JAVA_TO_KOTLIN)
+        }
 
         assertEquals("Should have correct number of tools", expectedTools.size, registry.getAllTools().size)
 

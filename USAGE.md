@@ -39,7 +39,7 @@ These tools activate based on available language plugins:
 | `ide_call_hierarchy` | Analyze method call relationships | Java, Kotlin, Python, JS/TS, Go, PHP, Rust |
 | `ide_find_implementations` | Find interface implementations | Java, Kotlin, Python, JS/TS, PHP, Rust |
 | `ide_find_super_methods` | Find overridden methods | Java, Kotlin, Python, JS/TS, PHP |
-| `ide_file_structure` | Hierarchical file structure *(disabled by default)* | Java, Kotlin, Python, JS/TS, Markdown |
+| `ide_file_structure` | Hierarchical file structure *(disabled by default)* | Java, Kotlin, Python, JS/TS, PHP, Markdown |
 
 ### Java-Specific Refactoring Tools
 
@@ -47,6 +47,26 @@ These tools activate based on available language plugins:
 |------|-------------|
 | `ide_convert_java_to_kotlin` | Convert Java files to Kotlin using the IDE converter *(disabled by default)* |
 | `ide_refactor_safe_delete` | Safely delete with usage check |
+
+### Project Lifecycle Management Tools
+
+These tools work in all supported JetBrains IDEs and are enabled by default.
+
+| Tool | Description | Default |
+|------|-------------|---------|
+| `ide_project_status` | Combined view of all open and managed projects with mode per row | Enabled |
+| `ide_set_project_mode` | Set a project's lifecycle mode (active/background/dormant/closed) | Disabled |
+| `ide_get_project_modes` | List all managed projects and their current modes | Disabled |
+| `ide_set_all_project_modes` | Set all managed open projects to the same mode | Disabled |
+| `ide_enroll_all_projects` | Enroll all currently open projects in lifecycle management | Disabled |
+| `ide_release_project` | Remove a project from lifecycle management | Disabled |
+| `ide_release_all_projects` | Release all managed projects from lifecycle management at once | Disabled |
+| `ide_lifecycle_log` | Query recent lifecycle events with trigger reasons | Disabled |
+| `ide_set_power_save_mode` | Toggle Power Save Mode directly | Enabled |
+| `ide_close_project` | Close a project window | Enabled |
+| `ide_open_project` | Open a project by path and wait for indexing | Enabled |
+| `ide_install_plugin` | Install a plugin zip into the IDE | Enabled |
+| `ide_restart` | Restart the IDE | Enabled |
 
 ---
 
@@ -67,6 +87,13 @@ These tools activate based on available language plugins:
   - [ide_read_file](#ide_read_file)
   - [ide_get_active_file](#ide_get_active_file)
   - [ide_open_file](#ide_open_file)
+- [Plugin Development](#plugin-development)
+  - [ide_install_plugin](#ide_install_plugin)
+  - [ide_restart](#ide_restart)
+- [Project Window Management](#project-window-management)
+  - [ide_set_power_save_mode](#ide_set_power_save_mode)
+  - [ide_close_project](#ide_close_project)
+  - [ide_open_project](#ide_open_project)
 - [Refactoring Tools](#refactoring-tools)
   - [ide_refactor_rename](#ide_refactor_rename)
   - [ide_move_file](#ide_move_file)
@@ -77,6 +104,20 @@ These tools activate based on available language plugins:
   - [ide_find_implementations](#ide_find_implementations)
   - [ide_find_super_methods](#ide_find_super_methods)
   - [ide_file_structure](#ide_file_structure)
+- [Project Lifecycle Management](#project-lifecycle-management)
+  - [ide_project_status](#ide_project_status)
+  - [ide_set_project_mode](#ide_set_project_mode)
+  - [ide_get_project_modes](#ide_get_project_modes)
+  - [ide_set_all_project_modes](#ide_set_all_project_modes)
+  - [ide_release_project](#ide_release_project)
+  - [ide_release_all_projects](#ide_release_all_projects)
+  - [ide_enroll_all_projects](#ide_enroll_all_projects)
+  - [ide_lifecycle_log](#ide_lifecycle_log)
+  - [ide_set_power_save_mode](#ide_set_power_save_mode)
+  - [ide_close_project](#ide_close_project)
+  - [ide_open_project](#ide_open_project)
+  - [ide_install_plugin](#ide_install_plugin)
+  - [ide_restart](#ide_restart)
 - [Java-Specific Refactoring Tools](#java-specific-refactoring-tools)
   - [ide_convert_java_to_kotlin](#ide_convert_java_to_kotlin)
   - [ide_refactor_safe_delete](#ide_refactor_safe_delete)
@@ -173,6 +214,7 @@ Finds all references to a symbol across the entire project using IntelliJ's sema
 | `language` | string | Conditional | Language of the symbol (e.g., `"Java"`). Required for symbol-based lookup. |
 | `symbol` | string | Conditional | Fully qualified symbol reference. Required for symbol-based lookup. |
 | `scope` | string | No | Built-in search scope. One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | No | Include references in generated sources (KSP/Dagger/annotation-processor output). **Default: true** — keeps valid runtime references from generated DI factories, MapStruct mappers, gRPC stubs, and serializers. Set `false` to drop generated call sites when they dominate results. |
 | `maxResults` | integer | No | Deprecated alias for `pageSize` (default: 100, max: 500) |
 | `cursor` | string | No | Pagination cursor from a previous response |
 | `pageSize` | integer | No | Number of results per page (default: 100, max: 500) |
@@ -342,6 +384,7 @@ Searches for classes and interfaces by name using the IDE's class index.
 | `query` | string | Yes | Search pattern |
 | `scope` | string | No | Built-in search scope. One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
 | `language` | string | No | Filter by language (e.g., `"Kotlin"`, `"Java"`, `"Python"`). Case-insensitive |
+| `includeGenerated` | boolean | No | Include classes from generated sources (KSP/Dagger/annotation-processor output). Default: false |
 | `matchMode` | string | No | `"substring"` (default), `"prefix"`, or `"exact"` |
 | `limit` | integer | No | Deprecated alias for `pageSize` (default: 25, max: 500) |
 | `cursor` | string | No | Pagination cursor from a previous response |
@@ -402,6 +445,7 @@ Searches for files by name using the IDE's file index.
 |-----------|------|----------|-------------|
 | `query` | string | Yes | File name pattern |
 | `scope` | string | No | Built-in search scope. One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | No | Include files under generated sources (KSP/Dagger/annotation-processor output). Default: false |
 | `limit` | integer | No | Deprecated alias for `pageSize` (default: 25, max: 500) |
 | `cursor` | string | No | Pagination cursor from a previous response |
 | `pageSize` | integer | No | Number of results per page (default: 25, max: 500) |
@@ -454,10 +498,11 @@ Searches for text using the IDE's pre-built word index. Significantly faster tha
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `query` | string | Yes | Exact word to search for (not a pattern/regex) |
+| `query` | string | Yes | Text to search for; treated as an exact word unless `regex` is `true` |
+| `regex` | boolean | No | Treat `query` as a regular expression (default: false) |
 | `context` | string | No | Where to search: `"code"`, `"comments"`, `"strings"`, or `"all"` (default) |
 | `caseSensitive` | boolean | No | Case sensitive search (default: true) |
-| `filePattern` | string | No | Glob pattern to filter files (e.g., `"*.kt"`, `"*.gradle.kts"`) |
+| `filePattern` | string | No | IntelliJ file mask to filter files by name (e.g., `"*.kt"`, `"*.gradle.kts"`, `"*.java,!*Test.java"`) |
 | `limit` | integer | No | Maximum results (default: 100, max: 500) |
 
 **Example Request:**
@@ -471,6 +516,23 @@ Searches for text using the IDE's pre-built word index. Significantly faster tha
       "query": "TODO",
       "context": "comments",
       "filePattern": "*.kt"
+    }
+  }
+}
+```
+
+Regex example:
+
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "ide_search_text",
+    "arguments": {
+      "query": "Runtime\\.getRuntime\\(\\)\\.exec\\(",
+      "regex": true,
+      "context": "code",
+      "filePattern": "*.java"
     }
   }
 }
@@ -705,7 +767,7 @@ Build the project using the IDE's build system (supports JPS, Gradle, Maven).
   "warnings": 2,
   "buildMessages": [
     {
-      "severity": "ERROR",
+      "category": "ERROR",
       "message": "Unresolved reference: fooBar",
       "file": "src/main/kotlin/com/example/App.kt",
       "line": 15,
@@ -889,6 +951,7 @@ Searches for code symbols (classes, interfaces, methods, fields, and functions) 
 | `query` | string | Yes | Search pattern. Matching follows IntelliJ's Go to Symbol popup. |
 | `scope` | string | No | Built-in search scope. One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
 | `language` | string | No | Filter by language (e.g., `"Kotlin"`, `"Java"`). Case-insensitive |
+| `includeGenerated` | boolean | No | Include symbols from generated sources (KSP/Dagger/annotation-processor output). Default: false |
 | `limit` | integer | No | Deprecated alias for `pageSize` (default: 25, max: 500) |
 | `cursor` | string | No | Pagination cursor from a previous response |
 | `pageSize` | integer | No | Number of results per page (default: 25, max: 500) |
@@ -976,6 +1039,207 @@ Searches for code symbols (classes, interfaces, methods, fields, and functions) 
 - `SYMBOL` - Generic symbol when the IDE contributor does not expose a more specific kind
 
 For Markdown heading outlines, use `ide_file_structure`.
+
+---
+
+## Plugin Development
+
+> **Note**: Both tools in this section are disabled by default. Enable them in Settings > Tools > Index MCP Server.
+
+### ide_install_plugin
+
+> **Default**: Disabled - enable in Settings > Tools > Index MCP Server
+
+Install a plugin zip into the IDE, replacing any existing version. When no path is given, auto-detects the most recently modified zip in `build/distributions/` of the active project — the output of `./gradlew buildPlugin`.
+
+A restart is required for the change to take effect. Call `ide_restart` after this tool returns.
+
+**Use when:**
+- Installing a freshly built plugin without leaving the MCP session
+- Iterating on plugin development: build → install → restart in one flow
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | No | Absolute path to the plugin zip. Defaults to auto-detection from `build/distributions/` |
+| `project_path` | string | No | Project path when multiple projects are open and `path` is omitted |
+
+**Example Request:**
+
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "ide_install_plugin",
+    "arguments": {}
+  }
+}
+```
+
+**Example Response:**
+
+```
+Plugin 'com.example.my-plugin' installed from my-plugin-1.0.0.zip. Restart the IDE to load the updated plugin (call ide_restart).
+```
+
+---
+
+### ide_restart
+
+> **Default**: Disabled - enable in Settings > Tools > Index MCP Server
+
+Restart the IDE. This terminates the MCP connection — the AI assistant will lose connectivity and must reconnect after the IDE comes back up.
+
+**Use when:**
+- Loading a freshly installed plugin after `ide_install_plugin`
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_path` | string | No | Project path when multiple projects are open |
+
+**Example Request:**
+
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "ide_restart",
+    "arguments": {}
+  }
+}
+```
+
+> **Note**: The MCP connection drops immediately after this call. Reconnect your AI assistant client before making further tool calls.
+
+---
+
+## Project Window Management
+
+> **Note**: All tools in this section are disabled by default. Enable them in Settings > Tools > Index MCP Server.
+
+### ide_set_power_save_mode
+
+> **Default**: Disabled - enable in Settings > Tools > Index MCP Server
+
+Enable or disable IDE Power Save Mode. When enabled, background inspections and code analysis are suspended, reducing CPU and memory pressure. The index and all code intelligence operations (find usages, refactoring, navigation) remain fully functional.
+
+The setting is IDE-wide: it affects every open project, regardless of which project serves as the JSON-RPC context.
+
+**Use when:**
+- Reducing resource usage on projects open for reference but not actively edited
+- Cutting background analysis cost while running searches or refactorings across multiple open projects
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `enabled` | boolean | Yes | `true` to enable Power Save Mode, `false` to disable |
+| `project_path` | string | No | Project path when multiple projects are open |
+
+**Example Request:**
+
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "ide_set_power_save_mode",
+    "arguments": {
+      "enabled": true
+    }
+  }
+}
+```
+
+**Example Response:**
+
+```
+Power Save Mode enabled (IDE-wide).
+```
+
+---
+
+### ide_close_project
+
+> **Default**: Disabled - enable in Settings > Tools > Index MCP Server
+
+Close an open project window and free its memory. The project can be reopened later via Recent Projects or `ide_open_project`.
+
+Non-blocking: the tool returns as soon as the close is scheduled. Refuses to close the last open project — the MCP server needs at least one open project to serve requests (including `ide_open_project`).
+
+**Use when:**
+- Freeing memory from a project that is no longer needed
+- Closing a project window programmatically
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_path` | string | No | Project path when multiple projects are open |
+
+**Example Request:**
+
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "ide_close_project",
+    "arguments": {
+      "project_path": "/Users/dev/myproject"
+    }
+  }
+}
+```
+
+**Example Response:**
+
+```
+Project 'myproject' is closing.
+```
+
+---
+
+### ide_open_project
+
+> **Default**: Disabled - enable in Settings > Tools > Index MCP Server
+
+Open a project by filesystem path and wait until indexing is complete, so subsequent MCP tool calls against the opened project succeed immediately. If the project is already open, returns successfully right away.
+
+Requires at least one project to already be open (needed as the JSON-RPC context). Opening a project the IDE has not seen before may show the modal "Trust project?" dialog, which only a human can answer; the call fails after `timeoutSeconds` if the project has not opened by then. If the project opens but indexing outlasts the timeout, the tool returns success with a note to check `ide_index_status`.
+
+**Use when:**
+- Opening a project that is not currently open in the IDE
+- Ensuring a project is indexed before running code intelligence tools
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | Yes | Absolute filesystem path of the project directory to open |
+| `timeoutSeconds` | integer | No | Maximum seconds to wait for opening + indexing. Default: 600 |
+| `project_path` | string | No | Selects the JSON-RPC context project when multiple are open |
+
+**Example Request:**
+
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "ide_open_project",
+    "arguments": {
+      "path": "/Users/dev/myproject"
+    }
+  }
+}
+```
+
+**Example Response:**
+
+```
+Project 'myproject' is open and ready.
+```
 
 ---
 
@@ -1226,7 +1490,7 @@ These tools activate based on available language plugins:
 - **Rust** - RustRover, IntelliJ Ultimate with Rust plugin, CLion
 - **Markdown** - heading outlines in file structure for IDEs with the bundled Markdown plugin
 
-Navigation tools appear according to installed language plugins. Markdown file structure can appear even in IDEs without a code-language handler when the bundled Markdown plugin is enabled.
+Navigation tools appear according to installed language plugins. PHP file structure requires the PHP plugin and is available in PhpStorm or IntelliJ IDEA Ultimate with the PHP plugin enabled. Markdown file structure can appear even in IDEs without a code-language handler when the bundled Markdown plugin is enabled.
 
 ### ide_type_hierarchy
 
@@ -1247,6 +1511,7 @@ Retrieves the complete type hierarchy for a class or interface.
 | `column` | integer | No* | 1-based column number |
 | `className` | string | No* | Fully qualified class name (alternative to position) |
 | `scope` | string | No | Built-in search scope. One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | No | Include supertypes/subtypes in generated sources (KSP/Dagger/annotation-processor output). Default: true — keeps generated types in the hierarchy |
 
 *Either `file`/`line`/`column` OR `className` must be provided.
 
@@ -1364,6 +1629,7 @@ Analyzes method call relationships to find callers or callees.
 | `direction` | string | Yes | `"callers"` or `"callees"` |
 | `depth` | integer | No | How deep to traverse (default: 3, max: 5) |
 | `scope` | string | No | Built-in search scope. One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | No | Include callers/callees in generated sources (KSP/Dagger/annotation-processor output). Default: true |
 
 **Example Request (position-based):**
 
@@ -1454,6 +1720,7 @@ Finds all concrete implementations of an interface, abstract class, or abstract 
 | `language` | string | Conditional | Language of the symbol (e.g., `"Java"`). Required for symbol-based lookup. |
 | `symbol` | string | Conditional | Fully qualified symbol reference. Required for symbol-based lookup. |
 | `scope` | string | No | Built-in search scope. One of `project_files` (default), `project_and_libraries`, `project_production_files`, `project_test_files` |
+| `includeGenerated` | boolean | No | Include implementations in generated sources (KSP/Dagger/annotation-processor output). Default: false |
 | `cursor` | string | No | Pagination cursor from a previous response |
 | `pageSize` | integer | No | Number of results per page (default: 100, max: 500) |
 
@@ -1636,10 +1903,12 @@ Finds the complete inheritance hierarchy for a method - all parent methods it ov
 
 Get the hierarchical structure of a source file, similar to the IDE's Structure view (<kbd>Cmd+7</kbd> / <kbd>Alt+7</kbd>).
 
-**Languages:** Java, Kotlin, Python, JavaScript, TypeScript, Markdown.
+**Languages:** Java, Kotlin, Python, JavaScript, TypeScript, PHP, Markdown.
+
+PHP support requires the PHP plugin and is available in PhpStorm or IntelliJ IDEA Ultimate with the PHP plugin enabled.
 
 **Use when:**
-- Getting an overview of a file's classes, methods, fields, or Markdown heading outline
+- Getting an overview of a file's classes, methods, fields, PHP namespaces/constants/enum cases, or Markdown heading outline
 - Understanding code organization without reading the full file
 - Navigating large files
 
@@ -1874,3 +2143,260 @@ Before calling index-dependent tools, you can check the index status:
 ```
 
 If `isDumbMode` is `true`, wait and retry later.
+
+---
+
+## Project Lifecycle Management
+
+When working across multiple projects simultaneously, idle ones consume memory unnecessarily. Lifecycle management automatically sleeps and wakes projects based on window focus and MCP activity. Projects enroll on first MCP use and auto-reopen when targeted by an MCP call — existing tools require no changes.
+
+**Lifecycle modes:**
+
+| Mode | Power Save | Editors | PSI Cache | Memory |
+|------|-----------|---------|-----------|--------|
+| `active` | off | open | loaded | full |
+| `background` | on | open | loaded | reduced |
+| `dormant` | on | closed | released via GC | low |
+| `closed` | — | — | freed | none (auto-reopens on next MCP call) |
+
+---
+
+### ide_project_status
+
+Combined snapshot of every open project and every managed project.
+
+**Parameters:** `project_path` (optional routing hint)
+
+**Returns:** `projects` array (name, path, open, managed, mode per row) and `summary` object (total, open, managed, open_not_managed, managed_closed counts).
+
+```json
+{ "name": "ide_project_status", "arguments": {} }
+```
+
+---
+
+### ide_set_project_mode
+
+Set a project's lifecycle mode explicitly.
+
+**Parameters:**
+- `mode` (required): `active`, `background`, `dormant`, or `closed`
+- `project_path` (optional)
+
+```json
+{ "name": "ide_set_project_mode", "arguments": { "mode": "background" } }
+```
+
+Setting `closed` fully closes the project window. The project auto-reopens on the next MCP call targeting it.
+
+---
+
+### ide_get_project_modes
+
+List all managed projects and their current modes.
+
+**Parameters:** `project_path` (optional)
+
+**Returns:** `managed_projects` array (name, path, mode) and `total` count. Includes projects currently closed by the lifecycle manager.
+
+```json
+{ "name": "ide_get_project_modes", "arguments": {} }
+```
+
+---
+
+### ide_set_all_project_modes
+
+Set all currently open managed projects to the same mode at once.
+
+**Parameters:**
+- `mode` (required): `active`, `background`, or `dormant` — `closed` is not accepted (closing all projects would make MCP unreachable)
+- `project_path` (optional)
+
+```json
+{ "name": "ide_set_all_project_modes", "arguments": { "mode": "background" } }
+```
+
+---
+
+### ide_release_project
+
+Remove a project from lifecycle management, restoring full IDE behaviour (Power Save off, no auto-close).
+
+**Parameters:** `project_path` (optional)
+
+```json
+{ "name": "ide_release_project", "arguments": {} }
+```
+
+Calling on an unmanaged project succeeds with a "not managed" note — safe to call idempotently.
+
+Accepts an optional `path` parameter to release a closed managed project without needing it to be open.
+
+---
+
+### ide_release_all_projects
+
+> **Default**: Disabled - enable in Settings > Tools > Index MCP Server
+
+Release every managed project (including closed ones) from lifecycle management at once. Also disables Power Save Mode globally.
+
+**Parameters:** `project_path` (optional routing hint)
+
+```json
+{ "name": "ide_release_all_projects", "arguments": {} }
+```
+
+---
+
+### ide_enroll_all_projects
+
+> **Default**: Disabled - enable in Settings > Tools > Index MCP Server
+
+Enroll every currently open project in lifecycle management. Projects already managed are skipped.
+
+**Parameters:** `project_path` (optional routing hint)
+
+```json
+{ "name": "ide_enroll_all_projects", "arguments": {} }
+```
+
+---
+
+### ide_lifecycle_log
+
+Query recent lifecycle events from the in-memory ring buffer (default 500 entries, configurable in Settings).
+
+**Parameters:**
+- `limit` (optional, default 50): how many events to return, newest first
+- `project` (optional): path substring filter — only events for matching projects
+- `project_path` (optional): routing hint
+
+**Returns:** `events` array, `log_file` path (always), `buffered` count.
+
+```json
+{ "name": "ide_lifecycle_log", "arguments": { "limit": 20, "project": "engine" } }
+```
+
+**Event fields:** `timestamp`, `project`, `path`, `event`, `from` (mode), `to` (mode), `trigger`.
+
+**Trigger values:**
+
+| Trigger | Meaning |
+|---------|---------|
+| `focus_gained` | User switched to this project window |
+| `focus_lost` | User switched away; focus timer started |
+| `timer:focus` | Focus timer fired → background |
+| `timer:inactivity` | Inactivity timer fired → dormant |
+| `timer:close` | Dormant timer fired → closed |
+| `mcp_call` | MCP tool call triggered this |
+| `auto_open` | Lifecycle manager reopened a closed project |
+| `user` | User action in the IDE |
+
+**Enabling file output:** The ring buffer is always active. File writes (`mcp-lifecycle.log` in the IDE log directory) require either using `ide_set_lifecycle_log_file` (see below) or enabling IntelliJ debug logging. No restart needed. The file is readable directly even when no project is open.
+
+---
+
+### ide_set_lifecycle_log_file
+
+> **Default**: Disabled - enable in Settings > Tools > Index MCP Server
+
+Enable or disable writing lifecycle events to the persistent log file on disk (`mcp-lifecycle.log`, written alongside `idea.log`). The in-memory ring buffer queried by `ide_lifecycle_log` is always active regardless of this setting.
+
+Use this for tail -f monitoring or post-mortem analysis when no MCP connection is available.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `enabled` | boolean | Yes | `true` to start writing to the log file, `false` to stop |
+| `project_path` | string | No | Routing hint when multiple projects are open |
+
+**Example:**
+
+```json
+{
+  "name": "ide_set_lifecycle_log_file",
+  "arguments": {
+    "enabled": true
+  }
+}
+```
+
+**Example Response:**
+
+```
+Lifecycle log file enabled. Events are being written to: /Users/you/Library/Logs/JetBrains/IntelliJIdea2026.1/mcp-lifecycle.log
+```
+
+---
+
+### ide_set_power_save_mode
+
+Toggle Power Save Mode directly.
+
+**Parameters:**
+- `enabled` (required): `true` or `false`
+- `project_path` (optional)
+
+```json
+{ "name": "ide_set_power_save_mode", "arguments": { "enabled": true } }
+```
+
+Power Save Mode suspends background inspections and code analysis while leaving the index and all MCP operations fully functional.
+
+---
+
+### ide_close_project
+
+Close an open project window and free its memory.
+
+**Parameters:** `project_path` (optional — defaults to the active project)
+
+```json
+{ "name": "ide_close_project", "arguments": {} }
+```
+
+The project can be reopened via Recent Projects or `ide_open_project`.
+
+---
+
+### ide_open_project
+
+Open a project by filesystem path and block until indexing completes, so subsequent MCP tool calls succeed immediately.
+
+**Parameters:**
+- `path` (required): filesystem path of the project directory
+- `project_path` (optional): routing hint — requires at least one project already open
+
+```json
+{ "name": "ide_open_project", "arguments": { "path": "/Users/dev/myproject" } }
+```
+
+---
+
+### ide_install_plugin
+
+Install a plugin zip into the IDE, replacing any existing version. A restart is required to load the updated plugin.
+
+**Parameters:**
+- `path` (optional): explicit path to a `.zip` file. If omitted, auto-detects `build/distributions/*.zip` in the current project — useful when developing the plugin itself.
+- `project_path` (optional)
+
+```json
+{ "name": "ide_install_plugin", "arguments": {} }
+```
+
+Typical workflow: `./gradlew buildPlugin` → `ide_install_plugin` → `ide_restart`.
+
+---
+
+### ide_restart
+
+Restart the IDE. Terminates the MCP connection immediately — no further tool calls should be made after calling this.
+
+**Parameters:** `project_path` (optional)
+
+```json
+{ "name": "ide_restart", "arguments": {} }
+```

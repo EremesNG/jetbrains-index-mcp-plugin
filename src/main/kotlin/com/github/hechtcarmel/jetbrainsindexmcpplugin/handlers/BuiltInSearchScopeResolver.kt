@@ -19,23 +19,47 @@ internal object BuiltInSearchScopeResolver {
         )
     }
 
-    fun resolveGlobalScope(project: Project, scope: BuiltInSearchScope): GlobalSearchScope = when (scope) {
-        BuiltInSearchScope.PROJECT_FILES -> GlobalSearchScope.projectScope(project)
-        BuiltInSearchScope.PROJECT_AND_LIBRARIES -> GlobalSearchScope.allScope(project)
-        BuiltInSearchScope.PROJECT_PRODUCTION_FILES -> {
-            val fileIndex = ProjectRootManager.getInstance(project).fileIndex
-            projectContentScope(project) { file ->
-                fileIndex.isInSourceContent(file) && !fileIndex.isInTestSourceContent(file)
+    /**
+     * Resolve [scope] to a [GlobalSearchScope].
+     *
+     * When [excludeGenerated] is true, the result additionally excludes IDE-recognized
+     * generated sources (KSP/Dagger/annotation-processor output). This keeps reference
+     * results — especially `ide_find_references` on heavily-injected symbols — focused on
+     * hand-written code instead of paginating through hundreds of generated DI factories.
+     *
+     * The default is false (include generated): each tool decides its own default through
+     * `includeGenerated`, so the shared resolver never silently drops generated sources.
+     * Reference and hierarchy tools include generated sources by default; name and
+     * implementation searches opt in to excluding them by default.
+     */
+    fun resolveGlobalScope(
+        project: Project,
+        scope: BuiltInSearchScope,
+        excludeGenerated: Boolean = false,
+    ): GlobalSearchScope {
+        val base = when (scope) {
+            BuiltInSearchScope.PROJECT_FILES -> GlobalSearchScope.projectScope(project)
+            BuiltInSearchScope.PROJECT_AND_LIBRARIES -> GlobalSearchScope.allScope(project)
+            BuiltInSearchScope.PROJECT_PRODUCTION_FILES -> {
+                val fileIndex = ProjectRootManager.getInstance(project).fileIndex
+                projectContentScope(project) { file ->
+                    fileIndex.isInSourceContent(file) && !fileIndex.isInTestSourceContent(file)
+                }
+            }
+            BuiltInSearchScope.PROJECT_TEST_FILES -> {
+                val fileIndex = ProjectRootManager.getInstance(project).fileIndex
+                projectContentScope(project) { file -> fileIndex.isInTestSourceContent(file) }
             }
         }
-        BuiltInSearchScope.PROJECT_TEST_FILES -> {
-            val fileIndex = ProjectRootManager.getInstance(project).fileIndex
-            projectContentScope(project) { file -> fileIndex.isInTestSourceContent(file) }
-        }
+        return GeneratedSourcesExcludingScope.wrap(project, base, excludeGenerated)
     }
 
-    fun resolveSearchScope(project: Project, scope: BuiltInSearchScope): SearchScope =
-        resolveGlobalScope(project, scope)
+    fun resolveSearchScope(
+        project: Project,
+        scope: BuiltInSearchScope,
+        excludeGenerated: Boolean = false,
+    ): SearchScope =
+        resolveGlobalScope(project, scope, excludeGenerated)
 
     private fun projectContentScope(
         project: Project,

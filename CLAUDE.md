@@ -342,11 +342,12 @@ Tests are split into two categories to optimize execution time:
 # Run all tests
 ./gradlew test
 
-# Run only fast unit tests (recommended for quick feedback)
+# Run only fast unit tests — use this locally (< 30s, no IDE needed)
 ./gradlew test --tests "*UnitTest*"
 
-# Run only platform tests
-./gradlew test --tests "*Test" --tests "!*UnitTest*"
+# Platform tests — DO NOT run locally; they require full IntelliJ Platform
+# initialization and hang on headless machines. Let CI run these.
+# ./gradlew test --tests "*Test" --tests "!*UnitTest*"
 
 # Run specific test class
 ./gradlew test --tests "McpPluginUnitTest"
@@ -363,7 +364,7 @@ Tests are split into two categories to optimize execution time:
 Tools are organized by IDE availability.
 
 **Universal Tools (All Supported JetBrains IDEs):**
-- `ide_find_references` - Find all usages of a symbol. Supports `language`+`symbol` as alternative to `file`+`line`+`column`.
+- `ide_find_references` - Find all usages of a symbol. Supports `language`+`symbol` as alternative to `file`+`line`+`column`. Includes generated sources by default (`includeGenerated: true`) so valid runtime references (Dagger/MapStruct/gRPC/serializers) aren't missed; set `includeGenerated: false` to drop generated DI factories/mappers/stubs when they dominate results.
 - `ide_find_definition` - Find symbol definition location. Supports `language`+`symbol` as alternative to `file`+`line`+`column`.
 - `ide_find_class` - Search for classes/interfaces by name with camelCase/substring/wildcard matching
 - `ide_find_file` - Search for files by name using IDE's file index
@@ -380,6 +381,11 @@ Tools are organized by IDE availability.
 - `ide_optimize_imports` - Optimize imports (remove unused, organize) without reformatting code. Equivalent to IDE's Ctrl+Alt+O. (disabled by default)
 - `ide_get_active_file` - Get the currently active file(s) in the editor (disabled by default)
 - `ide_open_file` - Open a file in the editor with optional line/column navigation (disabled by default)
+- `ide_set_power_save_mode` - Enable/disable IDE Power Save Mode (IDE-wide). Suspends background inspections and code analysis while keeping the index and code intelligence operational (disabled by default)
+- `ide_close_project` - Close an open project window and free its memory. Non-blocking; refuses to close the last open project so the MCP server keeps a JSON-RPC context (disabled by default)
+- `ide_open_project` - Open a project by absolute path and wait until indexing completes (`timeoutSeconds`, default 600). Idempotent for already-open projects (disabled by default)
+- `ide_install_plugin` - Install a plugin zip into the IDE, replacing any existing version; auto-detects `build/distributions/*.zip` when no path is given (disabled by default)
+- `ide_restart` - Restart the IDE; terminates the MCP connection. Call after `ide_install_plugin` (disabled by default)
 
 **Extended Navigation Tools (Language-Aware):**
 
@@ -522,17 +528,21 @@ VirtualFileManager   // Virtual file system
 
 ## Contributing / PR Checklist
 
-Every PR **must** include:
+**Every PR — without exception — must comply with [CONTRIBUTING.md](CONTRIBUTING.md).**
+Read it before writing a single line of code. It is the authoritative guide for this repo.
 
-1. **Version bump** — Update `pluginVersion` in `gradle.properties` following [SemVer](https://semver.org):
-   - **Patch** (3.x.**Y**): Bug fixes, internal refactoring with no behavior change
-   - **Minor** (3.**Y**.0): New features, new tools, protocol improvements
-   - **Major** (**Y**.0.0): Breaking changes to tool schemas, transport, or client configuration
-2. **CHANGELOG.md update** — Add an entry under `## [Unreleased]` following [Keep a Changelog](https://keepachangelog.com) format. Use sections: `Added`, `Changed`, `Fixed`, `Removed`, `Breaking`
-3. Follow existing code patterns and use `SchemaBuilder` for new tool schemas
-4. Add tests for new functionality
-5. Update this documentation (`CLAUDE.md`) for any structural or architectural changes
-6. Run `./gradlew test` to verify all tests pass (do NOT run platform tests yourself)
+Before pushing, run the pre-push validation script to catch common mistakes automatically:
+
+```bash
+./scripts/check-pr.sh
+```
+
+Quick summary of the non-negotiables:
+1. `CHANGELOG.md` — empty `[Unreleased]` section (maintainer adds the release entry)
+2. No `.idea/gradle.xml`, no `scripts/build-install.sh`, no `docs/pr-*.md`
+3. New tools: registered in `ToolNames`, `McpSettings.disabledTools`, `ToolRegistry`, and all six doc locations (`README.md`, `USAGE.md`, `CLAUDE.md`, `SKILL.md`, `tools-reference.md`, `ToolNames.ALL` sorted)
+4. No `@Internal` API, no `ModalityState.NON_MODAL` (deprecated)
+5. Unit tests pass: `./gradlew test --tests "*UnitTest*"` (never run full `./gradlew test` locally)
 
 ---
 

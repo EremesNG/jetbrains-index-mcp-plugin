@@ -20,6 +20,7 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.options.ShowSettingsUtil
+import com.intellij.util.Alarm
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
@@ -46,6 +47,21 @@ class McpServerService(
     private var ktorServer: KtorMcpServer? = null
     private var serverError: ServerError? = null
 
+    // Watchdog: restarts the server if it stops unexpectedly.
+    // The reactive path (ApplicationStopped event) fires immediately; the safety-net
+    // alarm is a backup in case the reactive signal is missed.
+    @Volatile private var isShuttingDown = false
+    @Volatile private var restartAttempts = 0
+    private val watchdogAlarm = Alarm(Alarm.ThreadToUse.POOLED_THREAD, this)
+
+    companion object {
+        private val LOG = logger<McpServerService>()
+        private const val WATCHDOG_INTERVAL_MS = 30_000
+        private val RESTART_BACKOFF_MS = listOf(5_000, 15_000, 30_000)
+
+        fun getInstance(): McpServerService = service()
+    }
+
     /**
      * Represents a server error state.
      */
@@ -58,19 +74,17 @@ class McpServerService(
     var isInitialized: Boolean = false
         private set
 
-    companion object {
-        private val LOG = logger<McpServerService>()
-
-        fun getInstance(): McpServerService = service()
-    }
-
     init {
         LOG.info("Initializing MCP Server Service (Protocol: ${McpConstants.MCP_PROTOCOL_VERSION})")
         jsonRpcHandler = JsonRpcHandler(toolRegistry)
         // Self-initialize asynchronously so the server starts even if postStartupActivity
         // doesn't fire (see issue #73). initialize() is idempotent (@Synchronized + isInitialized
         // guard), so the redundant call from McpServerStartupActivity is a safe no-op.
-        coroutineScope.launch { initialize() }
+        if (shouldStartServer()) {
+            coroutineScope.launch { initialize() }
+        } else {
+            LOG.info("Skipping MCP Server auto-start in unit/headless environment")
+        }
     }
 
     @Synchronized
@@ -81,13 +95,22 @@ class McpServerService(
 
         toolRegistry.registerBuiltInTools()
 
-        val settings = McpSettings.getInstance()
-        val port = settings.serverPort
-        val host = settings.serverHost
         isInitialized = true
-        startServer(host, port)
+        val startServer = shouldStartServer()
+        if (startServer) {
+            val settings = McpSettings.getInstance()
+            val port = settings.serverPort
+            val host = settings.serverHost
+            startServer(host, port)
+            LOG.info("MCP Server Service initialized with Ktor CIO server")
+        } else {
+            LOG.info("Initialized MCP tool metadata without starting server in unit/headless environment")
+        }
+    }
 
-        LOG.info("MCP Server Service initialized with Ktor CIO server")
+    private fun shouldStartServer(): Boolean {
+        val application = ApplicationManager.getApplication()
+        return !application.isUnitTestMode && !application.isHeadlessEnvironment
     }
 
     /**
@@ -98,7 +121,7 @@ class McpServerService(
      * @return The result of the start operation
      */
     fun startServer(host: String, port: Int): KtorMcpServer.StartResult {
-        // Stop existing server if running
+        watchdogAlarm.cancelAllRequests()
         stopServer()
 
         LOG.info("Starting MCP Server on $host:$port")
@@ -108,7 +131,8 @@ class McpServerService(
             host = host,
             jsonRpcHandler = jsonRpcHandler,
             sseSessionManager = sseSessionManager,
-            coroutineScope = coroutineScope
+            coroutineScope = coroutineScope,
+            onUnexpectedStop = { scheduleRestart() }
         )
 
         val result = when (val startResult = server.start()) {
@@ -116,6 +140,7 @@ class McpServerService(
                 ktorServer = server
                 serverError = null
                 LOG.info("MCP Server started successfully on $host:$port")
+                scheduleWatchdog()
                 startResult
             }
             is KtorMcpServer.StartResult.PortInUse -> {
@@ -266,8 +291,45 @@ class McpServerService(
         }, ModalityState.any())
     }
 
+    private fun scheduleRestart() {
+        if (isShuttingDown) return
+        val delayMs = RESTART_BACKOFF_MS.getOrElse(restartAttempts) { RESTART_BACKOFF_MS.last() }.toLong()
+        restartAttempts++
+        LOG.warn("Scheduling MCP Server restart in ${delayMs}ms (attempt $restartAttempts)")
+        watchdogAlarm.addRequest({
+            if (!isShuttingDown) {
+                val settings = McpSettings.getInstance()
+                val result = startServer(settings.serverHost, settings.serverPort)
+                if (result is KtorMcpServer.StartResult.Success) {
+                    restartAttempts = 0
+                    LOG.info("watchdog: MCP Server restarted successfully")
+                    scheduleWatchdog()
+                } else {
+                    LOG.warn("watchdog: MCP Server restart failed ($result) — will retry")
+                    scheduleRestart()
+                }
+            }
+        }, delayMs)
+    }
+
+    private fun scheduleWatchdog() {
+        if (isShuttingDown) return
+        watchdogAlarm.addRequest({
+            if (!isShuttingDown && isInitialized) {
+                if (!isServerRunning()) {
+                    LOG.warn("watchdog: MCP Server not running — triggering restart")
+                    scheduleRestart()
+                } else {
+                    scheduleWatchdog()
+                }
+            }
+        }, WATCHDOG_INTERVAL_MS.toLong())
+    }
+
     override fun dispose() {
         LOG.info("Disposing MCP Server Service")
+        isShuttingDown = true
+        watchdogAlarm.cancelAllRequests()
         stopServer()
         sseSessionManager.closeAllSessions()
     }

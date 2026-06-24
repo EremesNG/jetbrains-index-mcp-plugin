@@ -1,6 +1,7 @@
 import org.jetbrains.changelog.Changelog
 import org.jetbrains.changelog.markdownToHTML
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
+import org.jetbrains.intellij.platform.gradle.tasks.VerifyPluginTask
 
 plugins {
     id("java") // Java support
@@ -75,7 +76,7 @@ dependencies {
     intellijPlatform {
         pluginVerifier()
         
-        create(providers.gradleProperty("platformType"), providers.gradleProperty("platformVersion"))
+        intellijIdea(providers.gradleProperty("platformVersion"))
 
         // Plugin Dependencies. Uses `platformBundledPlugins` property from the gradle.properties file for bundled IntelliJ Platform plugins.
         bundledPlugins(providers.gradleProperty("platformBundledPlugins").map { it.split(',') })
@@ -144,6 +145,12 @@ intellijPlatform {
     }
 
     pluginVerification {
+        // Marketplace review rejects internal API usage; fail CI on it too
+        // (the default failure level covers only compatibility problems).
+        failureLevel = listOf(
+            VerifyPluginTask.FailureLevel.COMPATIBILITY_PROBLEMS,
+            VerifyPluginTask.FailureLevel.INTERNAL_API_USAGES,
+        )
         ides {
             recommended()
             // Keep the explicitly supported compatibility range under verifier coverage.

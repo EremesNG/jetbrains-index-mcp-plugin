@@ -54,10 +54,13 @@ class KtorMcpServer(
     private val host: String = McpConstants.DEFAULT_SERVER_HOST,
     private val jsonRpcHandler: JsonRpcHandler,
     private val sseSessionManager: KtorSseSessionManager,
-    private val coroutineScope: CoroutineScope
+    private val coroutineScope: CoroutineScope,
+    private val onUnexpectedStop: (() -> Unit)? = null
 ) : Disposable {
 
     private var server: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
+    @Volatile private var intentionallyStopped = false
+    @Volatile private var engineRunning = false
 
     companion object {
         private val LOG = logger<KtorMcpServer>()
@@ -83,10 +86,22 @@ class KtorMcpServer(
      * @return StartResult indicating success or failure with details
      */
     fun start(): StartResult {
+        intentionallyStopped = false
         return try {
-            server = embeddedServer(CIO, port = port, host = host) {
+            val embeddedServer = embeddedServer(CIO, port = port, host = host) {
                 configureRouting()
             }
+            embeddedServer.environment.monitor.subscribe(ApplicationStarted) {
+                engineRunning = true
+            }
+            embeddedServer.environment.monitor.subscribe(ApplicationStopped) {
+                engineRunning = false
+                if (!intentionallyStopped) {
+                    LOG.warn("MCP Server stopped unexpectedly on $host:$port")
+                    onUnexpectedStop?.invoke()
+                }
+            }
+            server = embeddedServer
             server?.start(wait = false)
 
             LOG.info("MCP Server started on http://$host:$port")
@@ -112,6 +127,8 @@ class KtorMcpServer(
      * Stops the server gracefully.
      */
     fun stop() {
+        intentionallyStopped = true
+        engineRunning = false
         try {
             server?.stop(1000, 2000)
             server = null
@@ -124,8 +141,11 @@ class KtorMcpServer(
 
     /**
      * Returns whether the server is currently running.
+     * Tracks actual engine lifecycle via ApplicationStarted/ApplicationStopped events —
+     * `server != null` alone is insufficient because the Ktor engine can die internally
+     * while the server reference stays set.
      */
-    fun isRunning(): Boolean = server != null
+    fun isRunning(): Boolean = server != null && engineRunning
 
     override fun dispose() = stop()
 
@@ -332,6 +352,8 @@ class KtorMcpServer(
             } else {
                 call.respond(HttpStatusCode.Accepted)
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             LOG.error("Error processing MCP request (Streamable HTTP)", e)
             call.respondText(
@@ -387,6 +409,8 @@ class KtorMcpServer(
                         protocolVersion = McpConstants.STREAMABLE_HTTP_MCP_PROTOCOL_VERSION
                     )
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 LOG.error("Error processing MCP batch message (Streamable HTTP)", e)
                 createJsonRpcError(parsed?.get("id"), -32603, e.message ?: "Internal error")
@@ -424,6 +448,8 @@ class KtorMcpServer(
             } else {
                 call.respond(HttpStatusCode.InternalServerError)
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             LOG.error("Error processing initialize (Streamable HTTP)", e)
             call.respondText(
@@ -469,6 +495,8 @@ class KtorMcpServer(
             } else {
                 call.respond(HttpStatusCode.Accepted)
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             LOG.error("Error processing MCP request (Streamable HTTP)", e)
             call.respondText(
@@ -518,6 +546,8 @@ class KtorMcpServer(
                         LOG.warn("Failed to send response to session $sessionId - session may have closed")
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 LOG.error("Error processing MCP request (SSE)", e)
                 sseSessionManager.sendEvent(
